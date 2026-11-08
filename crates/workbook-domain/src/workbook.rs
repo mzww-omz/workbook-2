@@ -269,6 +269,45 @@ impl Question {
             .unwrap_or_default()
     }
 
+    /// Every bundled image referenced by this question, including rich
+    /// content (prompt, options, hint, explanation) and the Hotspot/Labeling
+    /// image. The service uses this to serve all images the current view needs.
+    pub fn referenced_asset_ids(&self) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        for content in [
+            self.prompt.as_ref(),
+            self.hint.as_ref(),
+            Some(&self.explanation),
+            self.front.as_ref(),
+            self.back.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            content.referenced_asset_ids(&mut ids);
+        }
+        if let Some(options) = &self.options {
+            for option in options {
+                option.content.referenced_asset_ids(&mut ids);
+            }
+        }
+        if let Some(matching) = &self.matching {
+            for item in matching.left.iter().chain(&matching.right) {
+                item.content.referenced_asset_ids(&mut ids);
+            }
+        }
+        if let Some(labeling) = &self.labeling {
+            ids.insert(labeling.asset.clone());
+            for label in &labeling.labels {
+                label.content.referenced_asset_ids(&mut ids);
+            }
+        }
+        if let Some(hotspot) = &self.hotspot {
+            ids.insert(hotspot.asset.clone());
+        }
+        ids
+    }
+
     pub fn answer_summary(&self) -> String {
         match self.kind {
             QuestionType::SingleChoice => self
@@ -469,6 +508,19 @@ impl Workbook {
         self.notes.iter().map(|note| note.questions.len()).sum()
     }
 
+    /// All bundled asset IDs referenced anywhere in the workbook. Used by the
+    /// linter to report unused assets without duplicating the content walk.
+    pub fn referenced_asset_ids(&self) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        for note in &self.notes {
+            note.knowledge_card.referenced_asset_ids(&mut ids);
+            for question in &note.questions {
+                ids.extend(question.referenced_asset_ids());
+            }
+        }
+        ids
+    }
+
     pub fn find_question(&self, note_id: &str, question_id: &str) -> Option<(&Note, &Question)> {
         let note = self.notes.iter().find(|note| note.id == note_id)?;
         let question = note
@@ -572,8 +624,11 @@ impl Workbook {
                 ));
             }
             validate_required_text(&note.title, &format!("{path}.title"))?;
-            note.knowledge_card
-                .validate(&format!("{path}.knowledgeCard"))?;
+            note.knowledge_card.validate_with_assets(
+                &format!("{path}.knowledgeCard"),
+                self.schema_version,
+                &asset_ids,
+            )?;
             if note.questions.is_empty() {
                 return Err(ValidationError::new(
                     format!("{path}.questions"),
@@ -673,15 +728,23 @@ impl Question {
             ensure_absent(self.labeling.as_ref(), &format!("{path}.labeling"))?;
         }
         if let Some(hint) = &self.hint {
-            hint.validate(&format!("{path}.hint"))?;
+            hint.validate_with_assets(&format!("{path}.hint"), schema_version, asset_ids)?;
         }
-        self.explanation.validate(&format!("{path}.explanation"))?;
+        self.explanation.validate_with_assets(
+            &format!("{path}.explanation"),
+            schema_version,
+            asset_ids,
+        )?;
         match self.kind {
             QuestionType::SingleChoice | QuestionType::MultipleChoice => {
                 let prompt = self.prompt.as_ref().ok_or_else(|| {
                     ValidationError::new(format!("{path}.prompt"), "問題文が必要です")
                 })?;
-                prompt.validate(&format!("{path}.prompt"))?;
+                prompt.validate_with_assets(
+                    &format!("{path}.prompt"),
+                    schema_version,
+                    asset_ids,
+                )?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
                 let options = self.options.as_ref().ok_or_else(|| {
@@ -702,9 +765,11 @@ impl Question {
                             "選択肢IDが重複しています",
                         ));
                     }
-                    option
-                        .content
-                        .validate(&format!("{path}.options[{oi}].content"))?;
+                    option.content.validate_with_assets(
+                        &format!("{path}.options[{oi}].content"),
+                        schema_version,
+                        asset_ids,
+                    )?;
                 }
                 if self.kind == QuestionType::SingleChoice {
                     let answer = self.answer.as_ref().ok_or_else(|| {
@@ -776,7 +841,11 @@ impl Question {
                 let prompt = self.prompt.as_ref().ok_or_else(|| {
                     ValidationError::new(format!("{path}.prompt"), "問題文が必要です")
                 })?;
-                prompt.validate(&format!("{path}.prompt"))?;
+                prompt.validate_with_assets(
+                    &format!("{path}.prompt"),
+                    schema_version,
+                    asset_ids,
+                )?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
                 ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
@@ -791,7 +860,11 @@ impl Question {
                 let prompt = self.prompt.as_ref().ok_or_else(|| {
                     ValidationError::new(format!("{path}.prompt"), "問題文が必要です")
                 })?;
-                prompt.validate(&format!("{path}.prompt"))?;
+                prompt.validate_with_assets(
+                    &format!("{path}.prompt"),
+                    schema_version,
+                    asset_ids,
+                )?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
                 ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
@@ -873,11 +946,11 @@ impl Question {
                 let back = self.back.as_ref().ok_or_else(|| {
                     ValidationError::new(format!("{path}.back"), "裏面が必要です")
                 })?;
-                front.validate(&format!("{path}.front"))?;
-                back.validate(&format!("{path}.back"))?;
+                front.validate_with_assets(&format!("{path}.front"), schema_version, asset_ids)?;
+                back.validate_with_assets(&format!("{path}.back"), schema_version, asset_ids)?;
             }
             QuestionType::Numeric => {
-                require_prompt(self, path)?;
+                require_prompt(self, path, schema_version, asset_ids)?;
                 ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
@@ -885,7 +958,7 @@ impl Question {
                 spec.validate(&format!("{path}.answer"))?;
             }
             QuestionType::Ordering => {
-                require_prompt(self, path)?;
+                require_prompt(self, path, schema_version, asset_ids)?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
                 let options = self.options.as_ref().ok_or_else(|| {
@@ -909,9 +982,11 @@ impl Question {
                             "選択肢IDが重複しています",
                         ));
                     }
-                    option
-                        .content
-                        .validate(&format!("{path}.options[{index}].content"))?;
+                    option.content.validate_with_assets(
+                        &format!("{path}.options[{index}].content"),
+                        schema_version,
+                        asset_ids,
+                    )?;
                 }
                 if let Some(initial) = self.initial_order.as_ref()
                     && (initial.len() != ids.len()
@@ -927,7 +1002,7 @@ impl Question {
                 spec.validate(&format!("{path}.answer"), &ids)?;
             }
             QuestionType::Matching => {
-                require_prompt(self, path)?;
+                require_prompt(self, path, schema_version, asset_ids)?;
                 ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
@@ -953,8 +1028,11 @@ impl Question {
                                 "項目IDが重複しています",
                             ));
                         }
-                        item.content
-                            .validate(&format!("{path}.matching.{side}[{index}].content"))?;
+                        item.content.validate_with_assets(
+                            &format!("{path}.matching.{side}[{index}].content"),
+                            schema_version,
+                            asset_ids,
+                        )?;
                     }
                 }
                 let left: BTreeSet<String> =
@@ -965,7 +1043,7 @@ impl Question {
                 spec.validate(&format!("{path}.answer"), &left, &right)?;
             }
             QuestionType::Hotspot => {
-                require_prompt(self, path)?;
+                require_prompt(self, path, schema_version, asset_ids)?;
                 ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
@@ -1006,7 +1084,7 @@ impl Question {
                 spec.validate(&format!("{path}.answer"), &ids)?;
             }
             QuestionType::Labeling => {
-                require_prompt(self, path)?;
+                require_prompt(self, path, schema_version, asset_ids)?;
                 ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
                 ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
                 ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
@@ -1065,7 +1143,11 @@ impl Question {
                             "ラベルIDが重複しています",
                         ));
                     }
-                    label.content.validate(&format!("{label_path}.content"))?;
+                    label.content.validate_with_assets(
+                        &format!("{label_path}.content"),
+                        schema_version,
+                        asset_ids,
+                    )?;
                 }
                 let spec: LabelingAnswerSpec = parse_answer_spec(self, path)?;
                 spec.validate(&format!("{path}.answer"), &target_ids, &label_ids)?;
@@ -1075,12 +1157,17 @@ impl Question {
     }
 }
 
-fn require_prompt(question: &Question, path: &str) -> Result<(), ValidationError> {
+fn require_prompt(
+    question: &Question,
+    path: &str,
+    schema_version: u32,
+    asset_ids: &BTreeSet<String>,
+) -> Result<(), ValidationError> {
     let prompt = question
         .prompt
         .as_ref()
         .ok_or_else(|| ValidationError::new(format!("{path}.prompt"), "問題文が必要です"))?;
-    prompt.validate(&format!("{path}.prompt"))?;
+    prompt.validate_with_assets(&format!("{path}.prompt"), schema_version, asset_ids)?;
     Ok(())
 }
 
@@ -1188,7 +1275,10 @@ fn has_malformed_cloze(prompt: &str) -> bool {
     rest.contains("{{blank:")
 }
 
-pub fn parse_workbook(raw: &str) -> Result<Workbook, ValidationError> {
+/// Deserializes a workbook without running semantic validation. The linter
+/// uses this to keep examining quality problems after the first validation
+/// error; importers must use [`parse_workbook`].
+pub fn parse_workbook_value(raw: &str) -> Result<Workbook, ValidationError> {
     if raw.len() > MAX_JSON_BYTES {
         return Err(ValidationError::new(
             "$",
@@ -1199,7 +1289,7 @@ pub fn parse_workbook(raw: &str) -> Result<Workbook, ValidationError> {
         ));
     }
     let deserializer = &mut serde_json::Deserializer::from_str(raw);
-    let workbook: Workbook = serde_path_to_error::deserialize(deserializer).map_err(|error| {
+    serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let path = error.path().to_string();
         let path = if path.is_empty() {
             "$".to_string()
@@ -1207,7 +1297,11 @@ pub fn parse_workbook(raw: &str) -> Result<Workbook, ValidationError> {
             path
         };
         ValidationError::new(path, format!("JSON形式: {}", error.inner()))
-    })?;
+    })
+}
+
+pub fn parse_workbook(raw: &str) -> Result<Workbook, ValidationError> {
+    let workbook = parse_workbook_value(raw)?;
     workbook.validate()?;
     Ok(workbook)
 }

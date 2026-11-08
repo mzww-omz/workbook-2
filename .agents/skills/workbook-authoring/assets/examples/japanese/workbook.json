@@ -1,0 +1,69 @@
+{
+  "format": "workbook",
+  "schemaVersion": 2,
+  "id": "sample-japanese",
+  "revision": 1,
+  "title": "中2国語・漢字と古文",
+  "description": "漢字の読み、空欄補充、古文単語の対応を確認します。",
+  "language": "ja",
+  "tags": ["中2", "国語", "漢字", "古文"],
+  "assets": [],
+  "notes": [
+    {
+      "id": "kanji-reading",
+      "title": "漢字の読み",
+      "knowledgeCard": "## 読みの確認\n文脈に合う読みを選びます。「鑑賞」は作品を味わうこと、「観察」はよく見て調べることです。",
+      "questions": [
+        {
+          "id": "japanese-kanji-short",
+          "revision": 1,
+          "type": "short_text",
+          "prompt": "「鑑賞」の読みをひらがなで書きなさい。",
+          "answer": { "accepted": ["かんしょう"] },
+          "explanation": "「鑑賞」は「かんしょう」と読みます。美術作品や音楽を味わうときに使います。"
+        },
+        {
+          "id": "japanese-cloze",
+          "revision": 1,
+          "type": "cloze",
+          "prompt": "私は毎朝、{{blank:newspaper}}を読んでから学校へ行く。",
+          "answer": { "blanks": { "newspaper": ["新聞"] } },
+          "explanation": "「新聞」を読むという文脈です。漢字の形と送り仮名に注意して書きましょう。"
+        }
+      ]
+    },
+    {
+      "id": "classical-words",
+      "title": "古文単語",
+      "knowledgeCard": "## 古文の情感\n「をかし」は趣がある、「あはれ」はしみじみと心が動く、「いと」はとても、という意味です。",
+      "questions": [
+        {
+          "id": "japanese-classical-matching",
+          "revision": 1,
+          "type": "matching",
+          "prompt": "古文単語と現代語の意味を対応付けなさい。",
+          "matching": {
+            "left": [
+              { "id": "wokashi", "content": "をかし" },
+              { "id": "aware", "content": "あはれ" },
+              { "id": "ito", "content": "いと" }
+            ],
+            "right": [
+              { "id": "tasteful", "content": "趣がある" },
+              { "id": "moving", "content": "しみじみと心が動く" },
+              { "id": "very", "content": "とても" }
+            ]
+          },
+          "answer": {
+            "pairs": [
+              { "left": "wokashi", "right": "tasteful" },
+              { "left": "aware", "right": "moving" },
+              { "left": "ito", "right": "very" }
+            ]
+          },
+          "explanation": "「をかし」は趣がある、「あはれ」はしみじみと心が動く、「いと」はとても、という意味です。"
+        }
+      ]
+    }
+  ]
+}

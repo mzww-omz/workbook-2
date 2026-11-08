@@ -19,8 +19,8 @@ Near Miss の補助情報を追加します。
 }
 ```
 
-- `schemaVersion: 1` は v1 の6形式だけを受け付けます。v2 の形式や `assets` を含むと
-  インポートを拒否します。
+- `schemaVersion: 1` は v1 の6形式だけを受け付けます。v2 の形式や `assets`、Content の
+  `asset` 参照を含むとインポートを拒否します。
 - `schemaVersion: 2` は v1 の6形式もそのまま受け付けます。
 - 未知のフィールド、未知の `type`、重複 ID、回答仕様の不整合はインポート時に拒否します。
 
@@ -260,6 +260,46 @@ expected_base = expected_value × expected_unit_factor
   配置先にもコンパクト表示し、キーボード向けの配置先ボタンには読み上げ用ラベルを
   付けます。保存形式は ID のままです。
 
+## Content内の画像
+
+Markdown / Math / Code / Image は `Content` のブロックとして混在できます。画像は
+HTTPS URL と教材同梱アセットのどちらかを、型として明示して指定します。文字列の
+接頭辞や拡張子で判別しません。
+
+```json
+{
+  "type": "image",
+  "asset": "cell-diagram",
+  "alt": "動物細胞の模式図",
+  "caption": "図1 細胞のつくり",
+  "fit": "contain"
+}
+```
+
+```json
+{
+  "type": "image",
+  "url": "https://example.org/diagram.png",
+  "alt": "外部の図",
+  "fit": "cover"
+}
+```
+
+- `asset` と `url` は**どちらか一方だけ**。両方または両方なしは JSON 検証で拒否します。
+- `asset` は `assets` に存在する ID でなければなりません。存在しない ID はインポート時に
+  拒否します。`asset` は `schemaVersion: 2` でのみ使用できます。
+- `url` は既存 v1 互換の HTTPS URL です。Workbook 2 は外部取得を行わないため、表示は
+  オフラインのプレースホルダになります。教材画像には `asset` を使ってください。
+- `alt` は必須です。空文字は拒否します。`caption` は任意、`fit` は `contain`（既定）と
+  `cover` に対応します。
+- 同梱画像はインポート時に SQLite の `assets` へ保存され、学習時はファイルパスや
+  ネットワークを参照しません。バックアップ／復元にも含まれます。
+- 共通レンダラーが問題文・選択肢・Ordering・Matching・Labeling・解説・Knowledge Card の
+  すべてで同じ Content を描画します。画像はアスペクト比を維持し、`contain` / `cover` を
+  尊重します。デコード結果はワークブック ID とアセット ID 単位でキャッシュします。
+- 画像の読み込みに失敗した場合は、alt を含むテキストのフォールバックを表示します。
+  正常に表示できる画像を alt だけで置き換えることはしません。
+
 ## 画像アセット
 
 ```json
@@ -286,7 +326,8 @@ expected_base = expected_value × expected_unit_factor
   SVGはスクリプト・外部参照・`<foreignObject>`・`<use>`・`<image>`・`style`・
   イベントハンドラ・未知の要素を含まない静的SVGだけを受け付けます。GIF/WebPは拒否。
 - 1ファイル最大 5MB、合計 50MB、最大 50個。PNG/JPEGはヘッダ、SVGはルート要素から
-  実サイズを検証。
+  実サイズを検証します。デコード後のメモリを抑えるため、1画像あたり最大 2,400万画素
+  （例: 6000×4000）を上限とします。
 - インポート時に画像バイトを SQLite の `assets` テーブルへ保存する。学習時はファイル
   パスを読まない。バックアップ／復元にも画像が含まれる。
 - 既存の Content の HTTPS 画像ブロックは従来どおり変更しない（外部取得はしない）。
@@ -338,8 +379,8 @@ Near Miss のとき:
   `regions` の配列順で正誤は変わりません。
 - 画像の内容（何が描かれているか）の自動検証はしない。PNG/JPEG/静的SVGとしての安全性と
   サイズだけを検証する。
-- Content の `image` ブロックは HTTPS URL の外部取得を行わない既存方針を維持し、
-  alt・caption・URL をオフライン表示します。教材同梱画像は Hotspot / Labeling の
-  `assets` 参照で表示します。
+- Content の `image` は `url`（HTTPS・外部取得なし）と `asset`（教材同梱）の両方に対応
+  します。教材同梱画像は Content、Hotspot、Labeling のどこからでも同じ `assets` ID を
+  参照します。外部 URL の取得は行いません。
 - 拡張サンプルの地図は「地球地図日本（国土地理院）」を加工したものです。
   `assets/japan-regions.NOTICE.md` を参照してください。

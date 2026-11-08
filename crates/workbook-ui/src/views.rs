@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -10,8 +9,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, FontWeight, Image, ImageFormat, ImageSource, IntoElement,
-    ObjectFit, ParentElement, Render, SharedString, Styled, div, img, px, relative,
+    AnyElement, ClickEvent, Context, FontWeight, IntoElement, ParentElement, Render, SharedString,
+    Styled, div, px, relative,
 };
 use workbook_domain::{
     Content, GradeStatus, Mode, Phase, Question, QuestionType, Rating, RatingSource, ThemeSetting,
@@ -63,6 +62,7 @@ fn rich_option_body(
     content: &Content,
     trailing: Option<(&str, &Content)>,
     theme: &gpui_kit::component::Theme,
+    images: &crate::content::ContentImages<'_>,
 ) -> AnyElement {
     let mut row = div().flex().items_center().gap_2().flex_1().min_w(px(0.0));
     if let Some(leading) = leading {
@@ -75,7 +75,7 @@ fn rich_option_body(
         );
     }
     row = row.child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(
-        crate::content::render_content_compact(prefix, content, theme),
+        crate::content::render_content_compact(prefix, content, theme, images),
     ));
     if let Some((arrow, trailing_content)) = trailing {
         row = row
@@ -95,6 +95,7 @@ fn rich_option_body(
                         &format!("{prefix}-trailing"),
                         trailing_content,
                         theme,
+                        images,
                     )),
             );
     }
@@ -280,6 +281,21 @@ impl WorkbookApp {
                     .child(shortcut),
             )
             .into_any_element()
+    }
+
+    /// Bundled assets and the shared decode cache for the current study view.
+    fn content_images(&self) -> crate::content::ContentImages<'_> {
+        let assets = self
+            .study
+            .as_ref()
+            .map(|view| view.assets.as_slice())
+            .unwrap_or(&[]);
+        let workbook_id = self
+            .study
+            .as_ref()
+            .and_then(|view| view.workbook_id.as_deref())
+            .unwrap_or("");
+        crate::content::ContentImages::new(assets, &self.image_cache, workbook_id)
     }
 
     pub(crate) fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1643,6 +1659,7 @@ impl WorkbookApp {
                 "intro-card",
                 &intro.content,
                 &theme,
+                &self.content_images(),
             ))
             .child(
                 div()
@@ -1700,26 +1717,36 @@ impl WorkbookApp {
                     }),
             );
         }
-        page = page.child(
-            div()
+        let statement = if question.kind == QuestionType::Flashcard {
+            question.front.as_ref()
+        } else {
+            question.prompt.as_ref()
+        };
+        page = page.child(match statement {
+            Some(Content::Text(text)) => div()
                 .text_size(px(28.0))
                 .font_weight(FontWeight::LIGHT)
                 .line_height(px(36.0))
-                .child(if question.kind == QuestionType::Flashcard {
-                    question
-                        .front
-                        .as_ref()
-                        .map(Content::plain_text)
-                        .unwrap_or_default()
-                } else {
-                    question.prompt_text()
-                }),
-        );
+                .child(text.clone())
+                .into_any_element(),
+            Some(content) => crate::content::render_content(
+                "question-prompt",
+                content,
+                &theme,
+                &self.content_images(),
+            ),
+            None => div().into_any_element(),
+        });
 
         if question.kind == QuestionType::Flashcard {
             if view.revealed {
                 if let Some(back) = question.back.as_ref() {
-                    page = page.child(crate::content::render_content("flash-back", back, &theme));
+                    page = page.child(crate::content::render_content(
+                        "flash-back",
+                        back,
+                        &theme,
+                        &self.content_images(),
+                    ));
                 }
                 page = page.child(
                     div()
@@ -1773,7 +1800,12 @@ impl WorkbookApp {
                                 .text_color(theme.muted_foreground)
                                 .child("ヒント"),
                         )
-                        .child(crate::content::render_content("hint", hint, &theme)),
+                        .child(crate::content::render_content(
+                            "hint",
+                            hint,
+                            &theme,
+                            &self.content_images(),
+                        )),
                 );
             } else {
                 page = page.child(
@@ -1839,10 +1871,17 @@ impl WorkbookApp {
                 for option in options {
                     let id = option.id.clone();
                     let selected = self.single_choice.as_deref() == Some(option.id.as_str());
-                    let label = option.content.plain_text();
+                    let body = rich_option_body(
+                        &format!("choice-body-{}", option.id),
+                        None,
+                        &option.content,
+                        None,
+                        &theme,
+                        &self.content_images(),
+                    );
                     list = list.child(
                         Button::new(format!("choice-{}", option.id))
-                            .label(label)
+                            .child(body)
                             .when(selected, |button| button.primary())
                             .when(!selected, |button| button.secondary())
                             .w_full()
@@ -1861,14 +1900,17 @@ impl WorkbookApp {
                 for option in options {
                     let id = option.id.clone();
                     let selected = self.multiple_choice.contains(&option.id);
-                    let label = option.content.plain_text();
+                    let body = rich_option_body(
+                        &format!("multi-body-{}", option.id),
+                        Some(if selected { "✓" } else { "　" }),
+                        &option.content,
+                        None,
+                        &theme,
+                        &self.content_images(),
+                    );
                     list = list.child(
                         Button::new(format!("multi-{}", option.id))
-                            .label(if selected {
-                                format!("✓ {label}")
-                            } else {
-                                label
-                            })
+                            .child(body)
                             .when(selected, |button| button.primary())
                             .when(!selected, |button| button.secondary())
                             .w_full()
@@ -2023,9 +2065,14 @@ impl WorkbookApp {
                         .child(format!("{}", index + 1)),
                 )
                 .child(match content {
-                    Some(content) => {
-                        rich_option_body(&format!("order-{id}"), None, content, None, &theme)
-                    }
+                    Some(content) => rich_option_body(
+                        &format!("order-{id}"),
+                        None,
+                        content,
+                        None,
+                        &theme,
+                        &self.content_images(),
+                    ),
                     None => div()
                         .flex_1()
                         .min_w(px(0.0))
@@ -2127,6 +2174,7 @@ impl WorkbookApp {
                 &item.content,
                 assigned.map(|right| ("→", &right.content)),
                 &theme,
+                &self.content_images(),
             );
             left_list = left_list.child(
                 Button::new(format!("match-left-{}", item.id))
@@ -2171,6 +2219,7 @@ impl WorkbookApp {
                 &item.content,
                 assigned_left.map(|left| ("←", &left.content)),
                 &theme,
+                &self.content_images(),
             );
             right_list = right_list.child(
                 Button::new(format!("match-right-{}", item.id))
@@ -2436,6 +2485,7 @@ impl WorkbookApp {
                                 &format!("label-target-content-{}", target.id),
                                 content,
                                 &theme,
+                                &self.content_images(),
                             ))
                             .into_any_element(),
                         None => div().text_size(px(12.0)).child("＋").into_any_element(),
@@ -2487,6 +2537,7 @@ impl WorkbookApp {
                 &label.content,
                 None,
                 &theme,
+                &self.content_images(),
             );
             chips = chips.child(
                 div()
@@ -2554,6 +2605,7 @@ impl WorkbookApp {
                             &format!("label-target-alt-content-{}", target.id),
                             content,
                             &theme,
+                            &self.content_images(),
                         ))
                         .into_any_element(),
                     None => div()
@@ -2597,58 +2649,13 @@ impl WorkbookApp {
         crate::ui_logic::assign_pair(&mut self.labeling, target, label);
     }
 
-    fn render_question_image(&self, asset: &AssetView, cx: &Context<Self>) -> gpui_kit::Div {
-        let theme = cx.theme().clone();
-        let (width, height) = crate::ui_logic::fit_image(asset.width, asset.height, 640.0, 380.0);
-        let format = if asset.media_type == "image/jpeg" {
-            ImageFormat::Jpeg
-        } else if asset.media_type == "image/svg+xml" {
-            ImageFormat::Svg
-        } else {
-            ImageFormat::Png
-        };
-        let key = format!(
-            "{}:{}",
-            self.study
-                .as_ref()
-                .and_then(|view| view.workbook_id.as_deref())
-                .unwrap_or(""),
-            asset.id
-        );
-        let image = {
-            let mut cache = self.image_cache.borrow_mut();
-            cache
-                .entry(key)
-                .or_insert_with(|| {
-                    Arc::new(Image::from_bytes(format, asset.bytes.as_ref().clone()))
-                })
-                .clone()
-        };
-        let alt = asset.alt.clone();
-        div()
-            .relative()
-            .w(px(width))
-            .h(px(height))
-            .max_w_full()
-            .border_1()
-            .border_color(theme.border)
-            .child(
-                img(ImageSource::Image(image))
-                    .w_full()
-                    .h_full()
-                    .object_fit(ObjectFit::Contain)
-                    .with_fallback(move || {
-                        div()
-                            .flex()
-                            .size_full()
-                            .items_center()
-                            .justify_center()
-                            .p_4()
-                            .text_size(px(13.0))
-                            .child(format!("画像を表示できません: {alt}"))
-                            .into_any_element()
-                    }),
-            )
+    fn render_question_image(&self, asset: &AssetView, _cx: &Context<Self>) -> gpui_kit::Div {
+        self.content_images().render_asset_div(
+            asset,
+            workbook_domain::ImageFit::Contain,
+            640.0,
+            380.0,
+        )
     }
 
     fn render_feedback(
@@ -2803,6 +2810,7 @@ impl WorkbookApp {
                 "feedback-explanation",
                 &feedback.explanation,
                 &theme,
+                &self.content_images(),
             ));
 
         if feedback.committed {

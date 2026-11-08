@@ -33,6 +33,9 @@
 - schemaVersion 2 の5形式: 数値入力（分数・単位・許容誤差・有効数字）、並べ替え、対応付け、画像領域選択、図のラベル付け
 - Near Miss（おしい回答）: 構造化された理由、再回答、補助後のHard、未確定のままFSRSを書かない
 - 教材同梱画像（PNG/JPEG、制限付き静的SVG。base64または相対ファイル）をSQLiteへ取り込み、バックアップ／復元に含める
+- Content の画像を `asset`（教材同梱）と `url`（HTTPS・オフライン表示）で型安全に指定し、問題文・選択肢・Ordering・Matching・Labeling・解説・Knowledge Card の共通レンダラーで表示
+- GUI不要の `workbook-lint` CLI。Domain検証を再利用し、Numeric/Hotspot/Content/教材品質の診断、JSON出力、`--strict`、CI向け終了コードを提供
+- AI向け `workbook-authoring` Skill と、5教科＋基本のインポート可能なサンプル
 - 拡張サンプル教材（数学・英語・社会・理科の5形式、画像2枚）をアプリから追加可能
 - 旧 Electron v1 DB の読み取り専用ステージング検査と移行
 - 完全バックアップ、7世代の日次バックアップ、復元前/削除前/移行前/リセット前の安全バックアップ
@@ -40,7 +43,7 @@
 
 ### 意図的な制約
 
-- 外部画像は取得しません。教材に同梱した PNG/JPEG/静的SVG だけを SQLite に取り込み、Hotspot / Labeling で表示します。既存の HTTPS 画像ブロックは代替テキストとURLを表示します（オフライン優先）
+- 外部画像は取得しません。教材に同梱した PNG/JPEG/静的SVG だけを SQLite に取り込み、Content・Hotspot・Labeling で表示します。既存の HTTPS 画像ブロックは代替テキストとURLを表示します（オフライン優先）
 - Markdown は GPUI の rich text で表示します。KaTeX 相当の数式組版は行わず、math ブロックは等幅テキストで表示します
 - VoiceOver を使った全画面手動監査、日本語IMEの実機手動確認、Developer ID署名・公証は未実施です。実装は GPUI Kit の AccessKit / IME 対応に依存しています
 - Windows / Linux は設計上分離していますが、ビルド・実機検証はしていません
@@ -111,6 +114,17 @@ open "dist/Workbook 2.app"
 Near Miss は正解・不正解とは別の未確定状態です。数値の有効数字・単位・形式、並べ替えや対応付けの未完成などを構造化して返し、正解や解説を表示せず再回答を促します。Near Miss の時点では Attempt も FSRS 状態も書きません。再回答で正解した場合は Hard、不正解なら Again です。
 
 問題形式のデータ仕様は [docs/QUESTION-FORMATS.md](docs/QUESTION-FORMATS.md) を参照してください。拡張サンプルは Today / Library の「拡張サンプル（5形式）」から追加できます。
+
+### 教材の検証
+
+インポート前に Linter で Error を確認できます。
+
+```sh
+cargo run -p workbook-lint -- ./my-workbook/
+cargo run -p workbook-lint -- ./my-workbook/ --format json --strict
+```
+
+診断コードと JSON 仕様は [docs/WORKBOOK-LINTER.md](docs/WORKBOOK-LINTER.md) を参照してください。AI に教材を生成させる場合の手順と5教科のサンプルは [`.agents/skills/workbook-authoring/SKILL.md`](.agents/skills/workbook-authoring/SKILL.md) にあります。
 
 詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) と [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 

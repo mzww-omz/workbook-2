@@ -8206,6 +8206,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "workbook-lint"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "workbook-domain",
+ "workbook-import",
+]
+
+[[package]]
 name = "workbook-scheduler"
 version = "0.1.0"
 dependencies = [

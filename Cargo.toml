@@ -5,6 +5,7 @@ members = [
     "crates/workbook-scheduler",
     "crates/workbook-import",
     "crates/workbook-storage",
+    "crates/workbook-lint",
     "crates/workbook-service",
     "crates/workbook-ui",
     "crates/workbook-app",

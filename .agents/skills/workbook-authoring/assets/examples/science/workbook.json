@@ -1,0 +1,79 @@
+{
+  "format": "workbook",
+  "schemaVersion": 2,
+  "id": "sample-science",
+  "revision": 1,
+  "title": "中2理科・電流と回路",
+  "description": "回路図を使った計算とラベル付けの教材です。",
+  "language": "ja",
+  "tags": ["中2", "理科", "電流", "回路"],
+  "assets": [
+    {
+      "id": "series-circuit",
+      "alt": "電池と抵抗が1本の導線でつながった直列回路の模式図",
+      "mediaType": "image/svg+xml",
+      "file": "assets/series-circuit.svg"
+    }
+  ],
+  "notes": [
+    {
+      "id": "ohm-law",
+      "title": "オームの法則",
+      "knowledgeCard": [
+        { "type": "markdown", "text": "## オームの法則\n電圧 V、電流 I、抵抗 R の関係は **V = RI** です。単位は V、A、Ω を使います。" },
+        { "type": "image", "asset": "series-circuit", "alt": "電池と抵抗が1本の導線でつながった直列回路の模式図", "caption": "図1 直列回路", "fit": "contain" },
+        { "type": "math", "text": "I = V / R" }
+      ],
+      "questions": [
+        {
+          "id": "science-current-numeric",
+          "revision": 1,
+          "type": "numeric",
+          "prompt": [
+            { "type": "markdown", "text": "図のように、電圧 6V の電池に抵抗 3Ω をつなぎました。回路に流れる電流を求めなさい。" },
+            { "type": "image", "asset": "series-circuit", "alt": "電池と抵抗が1本の導線でつながった直列回路の模式図", "fit": "contain" }
+          ],
+          "answer": {
+            "value": 2,
+            "unit": "A",
+            "tolerance": 0.001,
+            "acceptedUnits": { "mA": 0.001 },
+            "requireUnit": true
+          },
+          "explanation": "オームの法則 I = V / R に代入すると、I = 6V / 3Ω = 2A です。単位を付けて答えます。"
+        }
+      ]
+    },
+    {
+      "id": "circuit-parts",
+      "title": "回路図の部品",
+      "knowledgeCard": "## 回路図\n電池は長い線と短い線の組、抵抗は長方形で表されます。記号の形を確認しましょう。",
+      "questions": [
+        {
+          "id": "science-circuit-labeling",
+          "revision": 1,
+          "type": "labeling",
+          "prompt": "回路図の部品に正しい名前を配置しなさい。",
+          "labeling": {
+            "asset": "series-circuit",
+            "targets": [
+              { "id": "target-battery", "x": 0.15, "y": 0.55, "alt": "左側の電池記号" },
+              { "id": "target-resistor", "x": 0.72, "y": 0.5, "alt": "右側の長方形の記号" }
+            ],
+            "labels": [
+              { "id": "label-battery", "content": "電池" },
+              { "id": "label-resistor", "content": "抵抗" }
+            ]
+          },
+          "answer": {
+            "pairs": {
+              "target-battery": "label-battery",
+              "target-resistor": "label-resistor"
+            }
+          },
+          "explanation": "左の長い線と短い線の組は電池、右の長方形は抵抗を表します。導線は部品をつなぐ線です。"
+        }
+      ]
+    }
+  ]
+}

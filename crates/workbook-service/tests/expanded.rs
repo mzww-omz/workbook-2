@@ -340,6 +340,72 @@ fn backup_and_restore_keep_assets_and_assist_history() {
     assert_eq!(workbook.assets.len(), 2);
 }
 
+const CONTENT_IMAGE_WORKBOOK: &str = r##"{
+  "format":"workbook","schemaVersion":2,"id":"content-image","revision":1,
+  "title":"Content画像","description":"","language":"ja","tags":[],
+  "assets":[{"id":"diagram","alt":"二色の小さな図","mediaType":"image/png",
+    "data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII="}],
+  "notes":[{"id":"n","title":"図のNote","knowledgeCard":[
+      {"type":"markdown","text":"図の確認"},
+      {"type":"image","asset":"diagram","alt":"二色の小さな図","caption":"図1"}],
+    "questions":[{"id":"q","revision":1,"type":"true_false",
+      "prompt":[{"type":"markdown","text":"図は表示されていますか。"},
+        {"type":"image","asset":"diagram","alt":"二色の小さな図"}],
+      "answer":true,"explanation":"図は教材に同梱された画像です。"}]}]
+}"##;
+
+#[test]
+fn content_assets_survive_restart_and_restore() {
+    let mut h = Harness::new();
+    let book = h
+        .service()
+        .import_workbook_json(CONTENT_IMAGE_WORKBOOK)
+        .unwrap();
+    let view = h.start(Mode::New, &book);
+    assert!(
+        view.assets.iter().any(|asset| asset.id == "diagram"),
+        "knowledge-card image must be served"
+    );
+    let view = h.begin(&view);
+    assert_eq!(
+        view.question.as_ref().unwrap().kind,
+        QuestionType::TrueFalse
+    );
+    assert!(
+        view.assets.iter().any(|asset| asset.id == "diagram"),
+        "prompt image must be served"
+    );
+    let evaluated = h.evaluate(&view, Answer::Bool(true));
+    assert!(evaluated.feedback.as_ref().unwrap().committed);
+
+    h.reopen();
+    let resumed = h.service().active_view().unwrap().unwrap();
+    assert!(
+        resumed.assets.iter().any(|asset| asset.id == "diagram"),
+        "image must survive restart"
+    );
+    let workbook = h.service().workbook(&book).unwrap();
+    assert_eq!(workbook.assets.len(), 1);
+
+    let backup = h.dir.path().join("content-image.sqlite");
+    h.service().backup_to(&backup).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FixedClock::new(
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+    ));
+    let restored = WorkbookService::open(target.path(), clock).unwrap();
+    restored.restore_from(&backup).unwrap();
+    let restored_view = restored.active_view().unwrap().unwrap();
+    assert!(
+        restored_view
+            .assets
+            .iter()
+            .any(|asset| asset.id == "diagram"),
+        "image must survive backup restore"
+    );
+    assert_eq!(restored.workbook(&book).unwrap().assets.len(), 1);
+}
+
 #[test]
 fn matching_diagnostic_is_persisted_with_the_attempt() {
     let mut h = Harness::new();

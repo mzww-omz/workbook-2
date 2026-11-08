@@ -1,4 +1,8 @@
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+use serde::de::Error as _;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use url::Url;
 
@@ -20,20 +24,140 @@ pub enum ImageFit {
     Cover,
 }
 
+/// Where an image block gets its pixels from.
+///
+/// The two variants are explicit in the data model instead of being inferred
+/// from a string prefix. `url` keeps the schema-v1 HTTPS form; `asset` refers
+/// to an image bundled with the workbook and stored in SQLite at import time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageSource {
+    Url(String),
+    Asset(String),
+}
+
+impl ImageSource {
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Url(url) => Some(url),
+            Self::Asset(_) => None,
+        }
+    }
+
+    pub fn asset(&self) -> Option<&str> {
+        match self {
+            Self::Asset(id) => Some(id),
+            Self::Url(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageBlock {
+    pub source: ImageSource,
+    pub alt: String,
+    pub caption: Option<String>,
+    pub fit: ImageFit,
+}
+
+impl ImageBlock {
+    pub fn url(url: impl Into<String>, alt: impl Into<String>) -> Self {
+        Self {
+            source: ImageSource::Url(url.into()),
+            alt: alt.into(),
+            caption: None,
+            fit: ImageFit::Contain,
+        }
+    }
+
+    pub fn asset(asset: impl Into<String>, alt: impl Into<String>) -> Self {
+        Self {
+            source: ImageSource::Asset(asset.into()),
+            alt: alt.into(),
+            caption: None,
+            fit: ImageFit::Contain,
+        }
+    }
+
+    pub fn with_caption(mut self, caption: impl Into<String>) -> Self {
+        self.caption = Some(caption.into());
+        self
+    }
+
+    pub fn with_fit(mut self, fit: ImageFit) -> Self {
+        self.fit = fit;
+        self
+    }
+}
+
+impl Serialize for ImageBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(4))?;
+        match &self.source {
+            ImageSource::Url(url) => map.serialize_entry("url", url)?,
+            ImageSource::Asset(asset) => map.serialize_entry("asset", asset)?,
+        }
+        map.serialize_entry("alt", &self.alt)?;
+        if let Some(caption) = &self.caption {
+            map.serialize_entry("caption", caption)?;
+        }
+        map.serialize_entry("fit", &self.fit)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawImage {
+            #[serde(default)]
+            url: Option<String>,
+            #[serde(default)]
+            asset: Option<String>,
+            alt: String,
+            #[serde(default)]
+            caption: Option<String>,
+            #[serde(default)]
+            fit: ImageFit,
+        }
+
+        let raw = RawImage::deserialize(deserializer)?;
+        let source = match (raw.url, raw.asset) {
+            (Some(url), None) => ImageSource::Url(url),
+            (None, Some(asset)) => ImageSource::Asset(asset),
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "image ブロックの url と asset はどちらか一方だけを指定してください",
+                ));
+            }
+            (None, None) => {
+                return Err(D::Error::custom(
+                    "image ブロックには url または asset が必要です",
+                ));
+            }
+        };
+        Ok(Self {
+            source,
+            alt: raw.alt,
+            caption: raw.caption,
+            fit: raw.fit,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentBlock {
     Markdown {
         text: String,
     },
-    Image {
-        url: String,
-        alt: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        caption: Option<String>,
-        #[serde(default)]
-        fit: ImageFit,
-    },
+    Image(ImageBlock),
     Math {
         text: String,
     },
@@ -61,7 +185,27 @@ impl ContentError {
 }
 
 impl Content {
+    /// Structural validation. Image asset references are checked for syntax
+    /// here; [`Self::validate_with_assets`] additionally verifies the schema
+    /// version and that the referenced asset exists in the workbook.
     pub fn validate(&self, path: &str) -> Result<(), ContentError> {
+        self.validate_inner(path, None)
+    }
+
+    pub fn validate_with_assets(
+        &self,
+        path: &str,
+        schema_version: u32,
+        asset_ids: &BTreeSet<String>,
+    ) -> Result<(), ContentError> {
+        self.validate_inner(path, Some((schema_version, asset_ids)))
+    }
+
+    fn validate_inner(
+        &self,
+        path: &str,
+        assets: Option<(u32, &BTreeSet<String>)>,
+    ) -> Result<(), ContentError> {
         match self {
             Content::Text(text) => validate_text(text, path),
             Content::Blocks(blocks) => {
@@ -75,9 +219,24 @@ impl Content {
                     ));
                 }
                 for (i, block) in blocks.iter().enumerate() {
-                    block.validate(&format!("{path}[{i}]"))?;
+                    block.validate(&format!("{path}[{i}]"), assets)?;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Collects every bundled asset ID referenced by this content.
+    pub fn referenced_asset_ids(&self, output: &mut BTreeSet<String>) {
+        if let Content::Blocks(blocks) = self {
+            for block in blocks {
+                if let ContentBlock::Image(ImageBlock {
+                    source: ImageSource::Asset(asset),
+                    ..
+                }) = block
+                {
+                    output.insert(asset.clone());
+                }
             }
         }
     }
@@ -103,27 +262,29 @@ impl Content {
 }
 
 impl ContentBlock {
-    fn validate(&self, path: &str) -> Result<(), ContentError> {
+    fn validate(
+        &self,
+        path: &str,
+        assets: Option<(u32, &BTreeSet<String>)>,
+    ) -> Result<(), ContentError> {
         match self {
             ContentBlock::Markdown { text } | ContentBlock::Math { text } => {
                 validate_text(text, path)
             }
-            ContentBlock::Image {
-                url, alt, caption, ..
-            } => {
-                if alt.trim().is_empty() {
+            ContentBlock::Image(image) => {
+                if image.alt.trim().is_empty() {
                     return Err(ContentError::new(
                         format!("{path}.alt"),
                         "代替テキストが必要です",
                     ));
                 }
-                if alt.chars().count() > MAX_CONTENT_CHARS {
+                if image.alt.chars().count() > MAX_CONTENT_CHARS {
                     return Err(ContentError::new(
                         format!("{path}.alt"),
                         "代替テキストが長すぎます",
                     ));
                 }
-                if let Some(caption) = caption
+                if let Some(caption) = &image.caption
                     && caption.chars().count() > MAX_CONTENT_CHARS
                 {
                     return Err(ContentError::new(
@@ -131,7 +292,28 @@ impl ContentBlock {
                         "説明が長すぎます",
                     ));
                 }
-                validate_https_url(url, &format!("{path}.url"))
+                match &image.source {
+                    ImageSource::Url(url) => validate_https_url(url, &format!("{path}.url")),
+                    ImageSource::Asset(asset) => {
+                        crate::question_format::validate_asset_id(asset, &format!("{path}.asset"))
+                            .map_err(|error| ContentError::new(error.path, error.message))?;
+                        if let Some((schema_version, asset_ids)) = assets {
+                            if schema_version < 2 {
+                                return Err(ContentError::new(
+                                    format!("{path}.asset"),
+                                    "教材同梱画像は schemaVersion 2 でのみ使用できます",
+                                ));
+                            }
+                            if !asset_ids.contains(asset) {
+                                return Err(ContentError::new(
+                                    format!("{path}.asset"),
+                                    "assets に存在しない画像IDです",
+                                ));
+                            }
+                        }
+                        Ok(())
+                    }
+                }
             }
             ContentBlock::Code { text, language } => {
                 validate_text(text, path)?;
@@ -151,9 +333,9 @@ impl ContentBlock {
     pub fn plain_text(&self) -> String {
         match self {
             ContentBlock::Markdown { text } => markdown_to_plain(text),
-            ContentBlock::Image { alt, caption, .. } => match caption {
-                Some(caption) => format!("{alt}\n{caption}"),
-                None => alt.clone(),
+            ContentBlock::Image(image) => match &image.caption {
+                Some(caption) => format!("{}\n{caption}", image.alt),
+                None => image.alt.clone(),
             },
             ContentBlock::Math { text } => text.clone(),
             ContentBlock::Code { text, .. } => text.clone(),
@@ -241,5 +423,72 @@ mod tests {
             markdown_to_plain("## 見出し\n**強い** `code`"),
             "見出し\n強い code"
         );
+    }
+
+    #[test]
+    fn image_blocks_distinguish_url_and_asset_sources() {
+        let url: ContentBlock =
+            serde_json::from_str(r#"{"type":"image","url":"https://example.com/a.png","alt":"A"}"#)
+                .unwrap();
+        let ContentBlock::Image(url) = url else {
+            panic!("image block expected");
+        };
+        assert_eq!(url.source.asset(), None);
+        assert_eq!(url.source.url(), Some("https://example.com/a.png"));
+
+        let asset: ContentBlock =
+            serde_json::from_str(r#"{"type":"image","asset":"cell-diagram","alt":"細胞"}"#)
+                .unwrap();
+        let ContentBlock::Image(asset) = asset else {
+            panic!("image block expected");
+        };
+        assert_eq!(asset.source.asset(), Some("cell-diagram"));
+        assert_eq!(asset.source.url(), None);
+
+        let serialized = serde_json::to_value(ContentBlock::Image(asset)).unwrap();
+        assert_eq!(serialized["asset"], "cell-diagram");
+        assert!(serialized.get("url").is_none());
+    }
+
+    #[test]
+    fn image_blocks_reject_both_or_neither_source() {
+        for raw in [
+            r#"{"type":"image","url":"https://example.com/a.png","asset":"x","alt":"A"}"#,
+            r#"{"type":"image","alt":"A"}"#,
+        ] {
+            assert!(serde_json::from_str::<ContentBlock>(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn asset_references_require_schema_two_and_an_existing_asset() {
+        let content: Content =
+            serde_json::from_str(r#"[{"type":"image","asset":"cell","alt":"細胞"}]"#).unwrap();
+        let mut assets = BTreeSet::new();
+        assets.insert("cell".to_string());
+
+        content.validate("content").unwrap();
+        content.validate_with_assets("content", 2, &assets).unwrap();
+        let error = content
+            .validate_with_assets("content", 1, &assets)
+            .unwrap_err();
+        assert!(error.message.contains("schemaVersion 2"), "{error}");
+
+        let error = content
+            .validate_with_assets("content", 2, &BTreeSet::new())
+            .unwrap_err();
+        assert!(error.message.contains("存在しない"), "{error}");
+    }
+
+    #[test]
+    fn referenced_asset_ids_include_nested_blocks_only() {
+        let content: Content = serde_json::from_str(
+            r#"[{"type":"image","asset":"a","alt":"A"},{"type":"markdown","text":"x"},
+                {"type":"image","url":"https://example.com/b.png","alt":"B"}]"#,
+        )
+        .unwrap();
+        let mut ids = BTreeSet::new();
+        content.referenced_asset_ids(&mut ids);
+        assert_eq!(ids, BTreeSet::from(["a".to_string()]));
     }
 }

@@ -15,6 +15,9 @@ pub const MAX_ASSET_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_TOTAL_ASSET_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_ASSETS: usize = 50;
 pub const MAX_ORDERING_ITEMS: usize = 12;
+/// Guard against a highly compressed image that would decode into an
+/// unreasonable amount of RGBA memory. Educational diagrams do not need more.
+pub const MAX_IMAGE_PIXELS: u64 = 24_000_000;
 
 // ---------------------------------------------------------------------------
 // Bundled image assets
@@ -170,6 +173,15 @@ pub fn inspect_image(
     if width == 0 || height == 0 || width > 20_000 || height > 20_000 {
         return Err(ValidationError::new(path, "画像サイズが不正です"));
     }
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(ValidationError::new(
+            path,
+            format!(
+                "画像の画素数が上限を超えています（最大{}万画素）",
+                MAX_IMAGE_PIXELS / 10_000
+            ),
+        ));
+    }
     Ok((width, height))
 }
 
@@ -293,7 +305,17 @@ fn inspect_svg(bytes: &[u8], path: &str) -> Result<(u32, u32), ValidationError> 
     {
         return Err(ValidationError::new(path, "SVGのサイズが不正です"));
     }
-    Ok((width.round() as u32, height.round() as u32))
+    let (width, height) = (width.round() as u32, height.round() as u32);
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(ValidationError::new(
+            path,
+            format!(
+                "SVGの画素数が上限を超えています（最大{}万画素）",
+                MAX_IMAGE_PIXELS / 10_000
+            ),
+        ));
+    }
+    Ok((width, height))
 }
 
 fn svg_dimension(tag: &str, name: &str) -> Option<f64> {
@@ -899,6 +921,143 @@ impl HotspotShape {
             }
         }
     }
+
+    /// A proven interior point for keyboard and screen-reader alternatives.
+    /// Circles and rectangles use their centre; polygons try the area centroid
+    /// and then a scanline through the widest interior interval. The result is
+    /// always checked with [`Self::contains`], and `None` means no point could
+    /// be proven rather than an invented coordinate.
+    pub fn representative_point(&self) -> Option<(f64, f64)> {
+        match self {
+            HotspotShape::Circle { cx, cy, r } => {
+                if !cx.is_finite()
+                    || !cy.is_finite()
+                    || !r.is_finite()
+                    || *r <= 0.0
+                    || !(0.0..=1.0).contains(cx)
+                    || !(0.0..=1.0).contains(cy)
+                {
+                    return None;
+                }
+                let point = (*cx, *cy);
+                self.contains(point.0, point.1).then_some(point)
+            }
+            HotspotShape::Rect { x, y, w, h } => {
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || !w.is_finite()
+                    || !h.is_finite()
+                    || *w <= 0.0
+                    || *h <= 0.0
+                    || *x < 0.0
+                    || *y < 0.0
+                    || x + w > 1.000_001
+                    || y + h > 1.000_001
+                {
+                    return None;
+                }
+                let point = (x + w / 2.0, y + h / 2.0);
+                if !(0.0..=1.0).contains(&point.0) || !(0.0..=1.0).contains(&point.1) {
+                    return None;
+                }
+                self.contains(point.0, point.1).then_some(point)
+            }
+            HotspotShape::Polygon { points } => polygon_interior_point(points),
+        }
+    }
+}
+
+fn polygon_interior_point(points: &[[f64; 2]]) -> Option<(f64, f64)> {
+    if points.len() < 3
+        || points.iter().any(|point| {
+            !point[0].is_finite()
+                || !point[1].is_finite()
+                || !(0.0..=1.0).contains(&point[0])
+                || !(0.0..=1.0).contains(&point[1])
+        })
+    {
+        return None;
+    }
+    if polygon_area(points).abs() < 1e-12 {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(centroid) = polygon_centroid(points) {
+        candidates.push(centroid);
+    }
+    let count = points.len() as f64;
+    candidates.push((
+        points.iter().map(|point| point[0]).sum::<f64>() / count,
+        points.iter().map(|point| point[1]).sum::<f64>() / count,
+    ));
+
+    let mut heights: Vec<f64> = points.iter().map(|point| point[1]).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    heights.dedup();
+    for pair in heights.windows(2) {
+        let y = (pair[0] + pair[1]) / 2.0;
+        if let Some(point) = widest_interval_midpoint(points, y) {
+            candidates.push(point);
+        }
+    }
+
+    candidates.into_iter().find(|(x, y)| {
+        point_in_unit_square(*x, *y)
+            && HotspotShape::Polygon {
+                points: points.to_vec(),
+            }
+            .contains(*x, *y)
+    })
+}
+
+fn point_in_unit_square(x: f64, y: f64) -> bool {
+    x.is_finite() && y.is_finite() && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)
+}
+
+fn polygon_centroid(points: &[[f64; 2]]) -> Option<(f64, f64)> {
+    let mut twice_area = 0.0;
+    let mut x_sum = 0.0;
+    let mut y_sum = 0.0;
+    let mut j = points.len() - 1;
+    for (i, point) in points.iter().enumerate() {
+        let cross = points[j][0] * point[1] - point[0] * points[j][1];
+        twice_area += cross;
+        x_sum += (points[j][0] + point[0]) * cross;
+        y_sum += (points[j][1] + point[1]) * cross;
+        j = i;
+    }
+    if twice_area.abs() < 1e-12 {
+        return None;
+    }
+    let x = x_sum / (3.0 * twice_area);
+    let y = y_sum / (3.0 * twice_area);
+    point_in_unit_square(x, y).then_some((x, y))
+}
+
+fn widest_interval_midpoint(points: &[[f64; 2]], y: f64) -> Option<(f64, f64)> {
+    let mut crossings = Vec::new();
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let (xi, yi) = (points[i][0], points[i][1]);
+        let (xj, yj) = (points[j][0], points[j][1]);
+        if (yi > y) != (yj > y) {
+            let x = xj + (y - yj) * (xi - xj) / (yi - yj);
+            if x.is_finite() {
+                crossings.push(x);
+            }
+        }
+        j = i;
+    }
+    crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    crossings
+        .chunks_exact(2)
+        .filter_map(|pair| {
+            let width = pair[1] - pair[0];
+            (width > 0.0).then_some((width, (pair[0] + pair[1]) / 2.0))
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, x)| (x, y))
 }
 
 fn unit_interval(value: f64, path: &str) -> Result<(), ValidationError> {
@@ -921,7 +1080,7 @@ fn polygon_area(points: &[[f64; 2]]) -> f64 {
     area / 2.0
 }
 
-fn validate_asset_id(value: &str, path: &str) -> Result<(), ValidationError> {
+pub(crate) fn validate_asset_id(value: &str, path: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() || value.chars().count() > 160 {
         return Err(ValidationError::new(
             path,
@@ -1253,6 +1412,18 @@ mod tests {
         assert!((parsed.value - 5.0).abs() < 1e-12);
         assert_eq!(parsed.significant_figures, 1);
         assert!(parsed.fraction);
+    }
+
+    #[test]
+    fn images_with_an_excessive_pixel_count_are_rejected() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&20_000u32.to_be_bytes());
+        bytes.extend_from_slice(&20_000u32.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let error = inspect_image(&bytes, "image/png", "asset").unwrap_err();
+        assert!(error.message.contains("画素数"), "{error}");
     }
 
     #[test]

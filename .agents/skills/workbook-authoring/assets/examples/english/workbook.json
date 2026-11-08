@@ -1,0 +1,85 @@
+{
+  "format": "workbook",
+  "schemaVersion": 2,
+  "id": "sample-english",
+  "revision": 1,
+  "title": "中2英語・語順と単語",
+  "description": "現在完了の語順、単語の意味、短い英単語を確認します。",
+  "language": "ja",
+  "tags": ["中2", "英語", "語順", "単語"],
+  "assets": [],
+  "notes": [
+    {
+      "id": "present-perfect",
+      "title": "現在完了の語順",
+      "knowledgeCard": "## have + 過去分詞\n現在完了は **have/has + 過去分詞** の語順です。never は have と過去分詞の間に置きます。",
+      "questions": [
+        {
+          "id": "english-ordering",
+          "revision": 1,
+          "type": "ordering",
+          "prompt": "次の語を並べ替えて「私はこの映画を一度も見たことがありません」という英文にしなさい。",
+          "options": [
+            { "id": "i", "content": "I" },
+            { "id": "have", "content": "have" },
+            { "id": "never", "content": "never" },
+            { "id": "seen", "content": "seen" },
+            { "id": "this", "content": "this" },
+            { "id": "movie", "content": "movie" }
+          ],
+          "initialOrder": ["never", "i", "movie", "have", "this", "seen"],
+          "answer": {
+            "orders": [
+              ["i", "have", "never", "seen", "this", "movie"]
+            ]
+          },
+          "explanation": "I have never seen this movie. の語順です。never は have と過去分詞 seen の間に入ります。"
+        }
+      ]
+    },
+    {
+      "id": "vocabulary",
+      "title": "基本単語",
+      "knowledgeCard": "## 動詞と名詞\nimprove は改善する、borrow は借りる、decide は決める、arrive は到着するという意味です。",
+      "questions": [
+        {
+          "id": "english-matching",
+          "revision": 1,
+          "type": "matching",
+          "prompt": "英単語と日本語の意味を対応付けなさい。",
+          "matching": {
+            "left": [
+              { "id": "improve", "content": "improve" },
+              { "id": "borrow", "content": "borrow" },
+              { "id": "decide", "content": "decide" },
+              { "id": "arrive", "content": "arrive" }
+            ],
+            "right": [
+              { "id": "improve-ja", "content": "改善する" },
+              { "id": "borrow-ja", "content": "借りる" },
+              { "id": "decide-ja", "content": "決める" },
+              { "id": "arrive-ja", "content": "到着する" }
+            ]
+          },
+          "answer": {
+            "pairs": [
+              { "left": "improve", "right": "improve-ja" },
+              { "left": "borrow", "right": "borrow-ja" },
+              { "left": "decide", "right": "decide-ja" },
+              { "left": "arrive", "right": "arrive-ja" }
+            ]
+          },
+          "explanation": "improve は改善する、borrow は借りる、decide は決める、arrive は到着するという意味です。"
+        },
+        {
+          "id": "english-short",
+          "revision": 1,
+          "type": "short_text",
+          "prompt": "「図書館」を英語で書きなさい。",
+          "answer": { "accepted": ["library", "Library"] },
+          "explanation": "「図書館」は library です。複数形は libraries になります。"
+        }
+      ]
+    }
+  ]
+}

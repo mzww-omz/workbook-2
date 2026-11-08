@@ -1,0 +1,76 @@
+{
+  "format": "workbook",
+  "schemaVersion": 2,
+  "id": "sample-social-studies",
+  "revision": 1,
+  "title": "中2社会・日本地理と歴史",
+  "description": "都道府県と地方の対応、時代の順序を確認します。",
+  "language": "ja",
+  "tags": ["中2", "社会", "地理", "歴史"],
+  "assets": [],
+  "notes": [
+    {
+      "id": "prefecture-region",
+      "title": "都道府県と地方",
+      "knowledgeCard": "## 地方区分\n日本は北海道、東北、関東、中部、近畿、中国、四国、九州・沖縄などの地方に分けられます。",
+      "questions": [
+        {
+          "id": "social-prefecture-matching",
+          "revision": 1,
+          "type": "matching",
+          "prompt": "都道府県と、それが属する地方を対応付けなさい。",
+          "matching": {
+            "left": [
+              { "id": "tokyo", "content": "東京都" },
+              { "id": "osaka", "content": "大阪府" },
+              { "id": "hokkaido", "content": "北海道" },
+              { "id": "okinawa", "content": "沖縄県" }
+            ],
+            "right": [
+              { "id": "kanto", "content": "関東地方" },
+              { "id": "kinki", "content": "近畿地方" },
+              { "id": "hokkaido-region", "content": "北海道地方" },
+              { "id": "kyushu-okinawa", "content": "九州・沖縄地方" }
+            ]
+          },
+          "answer": {
+            "pairs": [
+              { "left": "tokyo", "right": "kanto" },
+              { "left": "osaka", "right": "kinki" },
+              { "left": "hokkaido", "right": "hokkaido-region" },
+              { "left": "okinawa", "right": "kyushu-okinawa" }
+            ]
+          },
+          "explanation": "東京都は関東地方、大阪府は近畿地方、北海道は北海道地方、沖縄県は九州・沖縄地方に属します。"
+        }
+      ]
+    },
+    {
+      "id": "era-order",
+      "title": "時代の順序",
+      "knowledgeCard": "## 政治の中心\n鎌倉幕府、室町幕府、安土桃山時代、江戸幕府、明治維新の順に進みます。",
+      "questions": [
+        {
+          "id": "social-era-ordering",
+          "revision": 1,
+          "type": "ordering",
+          "prompt": "次の時代・出来事を古い順に並べ替えなさい。",
+          "options": [
+            { "id": "kamakura", "content": "鎌倉幕府の成立" },
+            { "id": "muromachi", "content": "室町幕府の成立" },
+            { "id": "azuchi", "content": "安土桃山時代" },
+            { "id": "edo", "content": "江戸幕府の成立" },
+            { "id": "meiji", "content": "明治維新" }
+          ],
+          "initialOrder": ["edo", "kamakura", "meiji", "azuchi", "muromachi"],
+          "answer": {
+            "orders": [
+              ["kamakura", "muromachi", "azuchi", "edo", "meiji"]
+            ]
+          },
+          "explanation": "鎌倉幕府（1192年ごろ）、室町幕府（1336年）、安土桃山時代、江戸幕府（1603年）、明治維新（1868年）の順です。"
+        }
+      ]
+    }
+  ]
+}

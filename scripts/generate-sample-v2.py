@@ -251,7 +251,19 @@ def build():
             note(
                 "science-cell",
                 "植物細胞",
-                "## 植物細胞のつくり\n植物細胞には細胞壁、細胞膜、核、液胞、葉緑体があります。",
+                [
+                    {
+                        "type": "markdown",
+                        "text": "## 植物細胞のつくり\n植物細胞には細胞壁、細胞膜、核、液胞、葉緑体があります。",
+                    },
+                    {
+                        "type": "image",
+                        "asset": "plant-cell",
+                        "alt": "植物細胞の模式図。核・細胞壁・葉緑体・液胞が描かれている",
+                        "caption": "図1 植物細胞",
+                        "fit": "contain",
+                    },
+                ],
                 [
                     question(
                         "q-labeling",

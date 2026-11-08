@@ -1,0 +1,52 @@
+{
+  "format": "workbook",
+  "schemaVersion": 2,
+  "id": "sample-mathematics",
+  "revision": 1,
+  "title": "中2数学・一次関数",
+  "description": "一次関数の値と傾きを確認する小規模な教材です。",
+  "language": "ja",
+  "tags": ["中2", "数学", "一次関数"],
+  "assets": [],
+  "notes": [
+    {
+      "id": "linear-value",
+      "title": "一次関数の値",
+      "knowledgeCard": [
+        { "type": "markdown", "text": "## 一次関数\n一次関数は **y = ax + b** の形で表されます。x に値を代入して y を求めます。" },
+        { "type": "math", "text": "y = 2x + 1" }
+      ],
+      "questions": [
+        {
+          "id": "math-numeric-value",
+          "revision": 1,
+          "type": "numeric",
+          "prompt": "一次関数 y = 2x + 1 で、x = 3 のときの y の値を求めなさい。",
+          "answer": { "value": 7, "tolerance": 0.001 },
+          "explanation": "y = 2 × 3 + 1 = 6 + 1 = 7 です。x の値を代入して計算します。"
+        }
+      ]
+    },
+    {
+      "id": "linear-slope",
+      "title": "傾きの読み取り",
+      "knowledgeCard": "## 傾き\n一次関数 y = ax + b の a が傾きです。x が1増えると y は a だけ増えます。",
+      "questions": [
+        {
+          "id": "math-slope-choice",
+          "revision": 1,
+          "type": "single_choice",
+          "prompt": "一次関数 y = 2x - 3 のグラフの傾きを選びなさい。",
+          "options": [
+            { "id": "slope-2", "content": [{ "type": "math", "text": "2" }] },
+            { "id": "slope-minus-2", "content": [{ "type": "math", "text": "-2" }] },
+            { "id": "slope-half", "content": [{ "type": "math", "text": "1/2" }] },
+            { "id": "slope-minus-3", "content": [{ "type": "math", "text": "-3" }] }
+          ],
+          "answer": { "optionId": "slope-2" },
+          "explanation": "y = ax + b の a が傾きなので、y = 2x - 3 の傾きは 2 です。-3 は切片です。"
+        }
+      ]
+    }
+  ]
+}

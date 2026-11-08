@@ -1,0 +1,19 @@
+[package]
+name = "workbook-lint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "workbook-lint"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+workbook-domain = { path = "../workbook-domain" }
+workbook-import = { path = "../workbook-import" }
+
+[dev-dependencies]
+tempfile = "3"

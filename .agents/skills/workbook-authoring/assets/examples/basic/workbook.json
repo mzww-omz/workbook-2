@@ -1,0 +1,36 @@
+{
+  "format": "workbook",
+  "schemaVersion": 2,
+  "id": "sample-basic",
+  "revision": 1,
+  "title": "基本形式サンプル",
+  "description": "正誤問題と短答問題の最小構成です。",
+  "language": "ja",
+  "tags": ["サンプル", "基本"],
+  "assets": [],
+  "notes": [
+    {
+      "id": "basic-note",
+      "title": "基本の確認",
+      "knowledgeCard": "## 基本問題\n用語を思い出し、短い答えを書く練習をします。",
+      "questions": [
+        {
+          "id": "basic-true-false",
+          "revision": 1,
+          "type": "true_false",
+          "prompt": "水は 100℃、1気圧で沸騰する。",
+          "answer": true,
+          "explanation": "1気圧では水の沸点は約100℃です。気圧が低いと沸点も下がります。"
+        },
+        {
+          "id": "basic-short-text",
+          "revision": 1,
+          "type": "short_text",
+          "prompt": "「観察」の読みをひらがなで書きなさい。",
+          "answer": { "accepted": ["かんさつ"] },
+          "explanation": "「観察」は「かんさつ」と読みます。よく見て調べるという意味です。"
+        }
+      ]
+    }
+  ]
+}

@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Duration, Utc};
@@ -1261,12 +1260,9 @@ impl WorkbookService {
         });
         let mut assets = Vec::new();
         if let (Some(workbook_id), Some(question)) = (workbook_id.as_deref(), question.as_ref()) {
-            let mut ids = BTreeSet::new();
-            if let Some(hotspot) = question.hotspot.as_ref() {
-                ids.insert(hotspot.asset.clone());
-            }
-            if let Some(labeling) = question.labeling.as_ref() {
-                ids.insert(labeling.asset.clone());
+            let mut ids = question.referenced_asset_ids();
+            if let Some(note) = note {
+                note.knowledge_card.referenced_asset_ids(&mut ids);
             }
             for id in ids {
                 if let Some(asset) = storage.asset(workbook_id, &id)? {

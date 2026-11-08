@@ -8,6 +8,8 @@ workbook-app     macOS起動、データディレクトリ、メニュー
             ├─ workbook-import     JSON v1/v2・画像アセット / 旧DB v1 の検証・移行計画
             ├─ workbook-storage    SQLite schema / attempts / assets / backup / restore
             └─ workbook-domain     Content / Question / grading / Settings / 4時カレンダー
+
+workbook-lint    単体CLI。workbook-domain の検証と workbook-import のアセット読込を再利用
 ```
 
 - `workbook-domain` は GPUI / SQLite / FSRS に依存しない
@@ -97,9 +99,16 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
   グリッドは使わない。保存形式は従来どおり `Answer::Hotspot { x, y }`。
 - 座標変換、多角形の代表点、並べ替え、割当ては `workbook-ui/src/ui_logic.rs` の
   純粋関数に置き、ディスプレイなしで単体テストする。
-- Ordering / Matching / Labeling の選択肢は `workbook-ui/src/content.rs` の共通
+- Ordering / Matching / Labeling / 選択肢は `workbook-ui/src/content.rs` の共通
   レンダラーを使い、Text / Markdown / Image / Math / Code を ID ベースの回答形式を
   変えずに表示する。問題形式ごとの専用レンダラーは作らない。
+- Content の画像は `ImageSource::Url`（HTTPS・外部取得なし）と
+  `ImageSource::Asset`（教材同梱）を型で区別する。アセットは `StudyView.assets` として
+  Service が SQLite から読み、UI はアセット ID で参照する。UI は SQLite を直接触らない。
+- 画像は `workbook-ui/src/content.rs` でワークブック ID + アセット ID をキーに
+  `Arc<Image>` をキャッシュし、毎フレームのデコードを避ける。表示サイズは
+  `ui_logic::fit_image` でアスペクト比を維持して計算する。Hotspot のクリック座標も
+  同じ表示矩形を使う。
 - UI は採点しない。採点と Near Miss の判定は `workbook-domain::grading` が持つ。
 
 ## SQLite

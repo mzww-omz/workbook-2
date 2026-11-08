@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="240" viewBox="0 0 480 240" role="img">
+  <title>電池と抵抗の直列回路</title>
+  <desc>左に電池、右に抵抗があり、導線で一周つながっている。</desc>
+  <rect x="0" y="0" width="480" height="240" fill="#f7f8f9"/>
+  <g fill="none" stroke="#1f2933" stroke-width="4">
+    <path d="M110 80 L110 110"/>
+    <path d="M110 130 L110 170 L370 170 L370 140"/>
+    <path d="M370 110 L370 80 L110 80"/>
+  </g>
+  <g stroke="#1f2933" stroke-width="5">
+    <line x1="92" y1="100" x2="128" y2="100"/>
+    <line x1="100" y1="112" x2="120" y2="112"/>
+    <line x1="92" y1="124" x2="128" y2="124"/>
+    <line x1="100" y1="136" x2="120" y2="136"/>
+  </g>
+  <rect x="340" y="105" width="60" height="40" fill="#ffffff" stroke="#1f2933" stroke-width="4"/>
+</svg>
