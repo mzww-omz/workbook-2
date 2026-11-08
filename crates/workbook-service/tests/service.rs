@@ -1132,3 +1132,131 @@ fn daily_new_limit_counts_commits_and_resets_after_four_am() {
     assert_eq!(h.service().snapshot().unwrap().today.new_remaining_today, 1);
     h.service().start_session(Mode::New, Some(&book)).unwrap();
 }
+
+fn pre_import_backups(h: &Harness) -> Vec<std::path::PathBuf> {
+    let directory = h._dir.path().join("backups");
+    let mut files: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("pre-import-"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn normal_import_creates_a_valid_pre_import_backup() {
+    let h = Harness::new();
+    assert!(pre_import_backups(&h).is_empty());
+    h.import(&one_question("first"));
+    let backups = pre_import_backups(&h);
+    assert_eq!(backups.len(), 1);
+    WorkbookService::validate_backup(&backups[0]).unwrap();
+}
+
+#[test]
+fn invalid_workbooks_do_not_create_a_backup() {
+    let h = Harness::new();
+    assert!(
+        h.service()
+            .import_workbook_json("{ definitely not json")
+            .is_err()
+    );
+    assert!(pre_import_backups(&h).is_empty());
+}
+
+#[test]
+fn a_missing_asset_file_does_not_create_a_backup() {
+    let h = Harness::new();
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("workbook.json");
+    std::fs::write(
+        &path,
+        r#"{
+          "format":"workbook","schemaVersion":2,"id":"missing-asset","revision":1,
+          "title":"T","description":"","language":"ja","tags":[],
+          "assets":[{"id":"img","alt":"図の説明","mediaType":"image/png","file":"missing.png"}],
+          "notes":[{"id":"n","title":"N","knowledgeCard":"card","questions":[
+            {"id":"q","revision":1,"type":"true_false","prompt":"true?","answer":true,"explanation":"yes"}
+          ]}]
+        }"#,
+    )
+    .unwrap();
+    assert!(h.service().import_workbook_file(&path).is_err());
+    assert!(pre_import_backups(&h).is_empty());
+}
+
+#[test]
+fn backup_failure_aborts_the_import_without_changing_the_database() {
+    let h = Harness::new();
+    h.import(&one_question("existing"));
+    let before = h.service().snapshot().unwrap().books.len();
+
+    let backups = h._dir.path().join("backups");
+    std::fs::remove_dir_all(&backups).unwrap();
+    std::fs::write(&backups, b"not a directory").unwrap();
+
+    assert!(
+        h.service()
+            .import_workbook_json(&one_question("never-imported"))
+            .is_err()
+    );
+    assert_eq!(h.service().snapshot().unwrap().books.len(), before);
+    assert!(
+        h.service()
+            .snapshot()
+            .unwrap()
+            .books
+            .iter()
+            .all(|book| !book.title.contains("never-imported"))
+    );
+}
+
+#[test]
+fn consecutive_imports_at_the_same_instant_never_overwrite_a_backup() {
+    let h = Harness::new();
+    for index in 0..3 {
+        h.import(&one_question(&format!("same-instant-{index}")));
+    }
+    let backups = pre_import_backups(&h);
+    assert_eq!(backups.len(), 3);
+    for backup in &backups {
+        WorkbookService::validate_backup(backup).unwrap();
+    }
+}
+
+#[test]
+fn an_unrelated_existing_backup_file_is_not_overwritten() {
+    let h = Harness::new();
+    let existing = h._dir.path().join("backups").join("keep-me.sqlite");
+    std::fs::write(&existing, b"do not overwrite").unwrap();
+    h.import(&one_question("protect-existing"));
+    assert_eq!(std::fs::read(&existing).unwrap(), b"do not overwrite");
+    assert_eq!(pre_import_backups(&h).len(), 1);
+}
+
+#[test]
+fn import_backup_can_be_restored_and_survives_a_restart() {
+    let mut h = Harness::new();
+    h.import(&one_question("first"));
+    let before_second = pre_import_backups(&h);
+    h.import(&one_question("second"));
+    assert_eq!(h.service().snapshot().unwrap().books.len(), 2);
+
+    let mut after_second = pre_import_backups(&h);
+    after_second.retain(|path| !before_second.contains(path));
+    assert_eq!(after_second.len(), 1);
+    let backup = after_second.remove(0);
+
+    h.reopen();
+    assert_eq!(h.service().snapshot().unwrap().books.len(), 2);
+
+    h.service().restore_from(&backup).unwrap();
+    let snapshot = h.service().snapshot().unwrap();
+    assert_eq!(snapshot.books.len(), 1);
+    assert!(snapshot.books[0].title.contains("first"));
+}

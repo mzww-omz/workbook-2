@@ -44,11 +44,14 @@
 
 ## バックアップと復元
 
-- 移行前: `backups/pre-import-<timestamp>.sqlite`
-- 削除前: `backups/pre-delete-<timestamp>.sqlite`
-- 復元前: `backups/pre-restore-<timestamp>.sqlite`
-- リセット前: `backups/pre-reset-<timestamp>.sqlite`
+- 教材Import前 / 旧データ移行前: `backups/pre-import-<timestamp>-<unique>.sqlite`
+- 削除前: `backups/pre-delete-<timestamp>-<unique>.sqlite`
+- 復元前: `backups/pre-restore-<timestamp>-<unique>.sqlite`
+- リセット前: `backups/pre-reset-<timestamp>-<unique>.sqlite`
 - 日次: `backups/daily-YYYY-MM-DD.sqlite` を7世代
+
+操作前バックアップは一意名で作成し、既存ファイルを上書きしません。日次以外は自動削除せず、
+ユーザーが不要になった時点で削除します。
 
 復元は新アプリの完全バックアップのみ受け付けます。旧WorkbookのDBや教材JSONは復元対象ではありません。
 

@@ -1154,4 +1154,65 @@ mod tests {
         let report = lint(&raw);
         assert!(report.diagnostics.iter().any(|d| d.code == "WB-HOT-004"));
     }
+
+    fn file_workbook(media_type: &str, file: &str) -> String {
+        format!(
+            r#"{{
+              "format":"workbook","schemaVersion":2,"id":"w1","revision":1,
+              "title":"テスト","description":"","language":"ja","tags":[],
+              "assets":[{{"id":"img","alt":"画像の説明","mediaType":"{media_type}","file":"{file}"}}],
+              "notes":[{{"id":"n1","title":"N","knowledgeCard":"カード","questions":[
+                {{"id":"q1","revision":1,"type":"true_false","prompt":"選ぶ","answer":true,"explanation":"説明です。"}}
+              ]}}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn linter_rejects_a_truncated_png_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let header_only = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+        ];
+        std::fs::write(dir.path().join("figure.png"), header_only).unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(&path, file_workbook("image/png", "figure.png")).unwrap();
+
+        let report = lint_path(&path);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "WB-ASSET-002" && d.severity == Severity::Error),
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.exit_code(false), 1);
+    }
+
+    #[test]
+    fn linter_rejects_svg_with_whitespace_obfuscated_href() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("figure.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+                <rect href = "https://example.invalid/a.svg"/>
+              </svg>"#,
+        )
+        .unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(&path, file_workbook("image/svg+xml", "figure.svg")).unwrap();
+
+        let report = lint_path(&path);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "WB-ASSET-002" && d.severity == Severity::Error),
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.exit_code(false), 1);
+    }
 }

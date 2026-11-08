@@ -27,8 +27,10 @@ description: Create or revise Workbook 2 study material in the repository's work
 6. **解説** — 正解の理由、間違えやすい点、次に使う考え方を書く。答えの言い換えだけにしない。
 7. **図表** — 正確性が重要な図は SVG など再現可能な形式で同梱する。外部 URL を増やさない。
 8. **JSON 生成** — `schemaVersion: 2`。同梱画像は `assets` に置き、Content から `asset` で参照する。
-9. **Linter** — `cargo run -p workbook-lint -- <path>` を実行する。
-10. **Error 修正** — Error が残った教材は完成品として渡さない。
+9. **Linter** — `cargo run -p workbook-lint -- <path> --strict` を実行する。
+   Error には `WB-ASSET-002`（画像の破損・MIME不一致・SVG安全性）も含まれる。
+10. **Error 修正** — Error が残った教材は完成品として渡さない。画像を差し替えたら
+   必ず Linter を再実行する。
 11. **Warning 評価** — `--strict` でも確認し、意図的に残す Warning は理由を添える。
 12. **受け渡し** — workbook JSON と `assets/` を同じディレクトリに置き、インポート可能な状態で渡す。
 
@@ -56,8 +58,16 @@ description: Create or revise Workbook 2 study material in the repository's work
 
 - 理科・社会・数学では、必要なら図を使う。装飾のための画像は入れない。
 - 地図・回路図・グラフは、見た目と正解データ（座標・ラベル・値）を照合する。
-- SVG は静的な図形だけにする。`script`、外部 `href`、`<foreignObject>`、`style`、
-  イベントハンドラは Linter と Importer が拒否する。
+- SVG は静的な図形だけにする。許可される主な要素は `svg`、`g`、`path`、`rect`、
+  `circle`、`ellipse`、`line`、`polygon`、`polyline`、`defs`、`linearGradient`、
+  `radialGradient`、`clipPath`、`stop`、`title`、`desc`。それ以外は Linter が Error にする。
+- `script`、`foreignObject`、`iframe`、`object`、`embed`、`image`、`use`、`style`、
+  イベントハンドラ属性、`href` / `xlink:href`、外部 URL、DTD、ENTITY、未知の名前空間は
+  禁止。`href = "..."` のような空白挿入も XML 属性として検出される。
+  `url(...)` は `url(#gradient)` のような同一 SVG 内の参照だけにする。
+- PNG/JPEG はヘッダーだけのファイルや途中で切れたファイルを渡さない。Linter は全体を
+  デコードし、MIME とバイト列の不一致、CRC 不正、IEND 欠落を `WB-ASSET-002` にする。
+- 画像サイズは 1ファイル 5MB、合計 50MB、1画像 2,400万画素以下。SVG は 2MB 以下。
 - AI 画像生成だけで正確な地図や回路を済ませない。再現可能な SVG を優先する。
 - 出典・ライセンスを記録できる場合は Knowledge Card か別ファイルに残す。
 

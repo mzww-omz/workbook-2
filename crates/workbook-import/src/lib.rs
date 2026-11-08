@@ -1076,4 +1076,72 @@ mod tests {
         let error = load_workbook_file(&path).unwrap_err();
         assert!(error.to_string().contains("教材フォルダの外"));
     }
+
+    #[test]
+    fn a_header_only_png_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("figure.png"), &PNG_2X2[..24]).unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(&path, file_workbook("figure.png")).unwrap();
+        let error = load_workbook_file(&path).unwrap_err();
+        assert!(error.to_string().contains("画像"), "{error}");
+    }
+
+    #[test]
+    fn a_truncated_png_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("figure.png"),
+            &PNG_2X2[..PNG_2X2.len() - 12],
+        )
+        .unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(&path, file_workbook("figure.png")).unwrap();
+        assert!(load_workbook_file(&path).is_err());
+    }
+
+    #[test]
+    fn a_file_whose_bytes_disagree_with_the_media_type_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // The extension and mediaType agree (JPEG), but the bytes are a PNG.
+        std::fs::write(dir.path().join("figure.jpg"), PNG_2X2).unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(
+            &path,
+            file_workbook("figure.jpg").replace("image/png", "image/jpeg"),
+        )
+        .unwrap();
+        let error = load_workbook_file(&path).unwrap_err();
+        assert!(error.to_string().contains("形式が一致しません"), "{error}");
+    }
+
+    #[test]
+    fn an_oversized_asset_file_is_rejected_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("figure.png"),
+            vec![0u8; workbook_domain::MAX_ASSET_BYTES + 1],
+        )
+        .unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(&path, file_workbook("figure.png")).unwrap();
+        let error = load_workbook_file(&path).unwrap_err();
+        assert!(error.to_string().contains("5MB"), "{error}");
+    }
+
+    #[test]
+    fn an_embedded_header_only_png_is_rejected() {
+        let raw = r#"{
+          "format":"workbook","schemaVersion":2,"id":"w","revision":1,
+          "title":"T","description":"","language":"ja","tags":[],
+          "assets":[{"id":"img","alt":"図の説明","mediaType":"image/png",
+            "data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAAC"}],
+          "notes":[{"id":"n","title":"N","knowledgeCard":"c","questions":[
+            {"id":"q","revision":1,"type":"true_false","prompt":"p","answer":true,"explanation":"e"}
+          ]}]
+        }"#;
+        let workbook = parse_workbook(raw).unwrap();
+        let error = workbook.embedded_assets().unwrap_err();
+        assert!(error.message.contains("画像"), "{error}");
+    }
 }

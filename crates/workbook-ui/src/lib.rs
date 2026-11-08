@@ -112,6 +112,10 @@ pub struct WorkbookApp {
     /// pixels: `(x, y, width, height)`. Refreshed on every prepaint so clicks
     /// do not depend on scroll position or window placement.
     pub(crate) hotspot_image_bounds: Rc<Cell<Option<HotspotImageBounds>>>,
+    /// Measured bounds of the Labeling image element. Targets are placed with
+    /// the same `contain` mapping as Hotspot clicks, so letterboxing and window
+    /// resizing cannot shift a label away from its image coordinate.
+    pub(crate) labeling_image_bounds: Rc<Cell<Option<HotspotImageBounds>>>,
     pub(crate) hotspot_list_open: bool,
     pub(crate) labeling: BTreeMap<String, String>,
     pub(crate) labeling_label: Option<String>,
@@ -201,6 +205,7 @@ impl WorkbookApp {
             labeling_label: None,
             image_cache: Rc::new(RefCell::new(ImageCache::default())),
             hotspot_image_bounds: Rc::new(Cell::new(None)),
+            labeling_image_bounds: Rc::new(Cell::new(None)),
             rating_picker_open: false,
             notice: None,
             modal: None,
@@ -874,9 +879,11 @@ impl WorkbookApp {
         self.matching.clear();
         self.matching_left = None;
         self.hotspot_point = None;
+        self.hotspot_image_bounds.set(None);
         self.hotspot_list_open = false;
         self.labeling.clear();
         self.labeling_label = None;
+        self.labeling_image_bounds.set(None);
         // Images are intentionally not cleared here: the LRU cache is keyed by
         // workbook, asset and content fingerprint, so switching questions
         // reuses decoded textures. Only the next question's asset bytes are

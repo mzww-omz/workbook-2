@@ -538,6 +538,112 @@ mod tests {
         );
     }
 
+    fn assert_round_trip(
+        container_width: f32,
+        container_height: f32,
+        image_width: u32,
+        image_height: u32,
+        points: &[(f64, f64)],
+    ) {
+        let (rect_x, rect_y, rect_width, rect_height) =
+            contained_image_rect(container_width, container_height, image_width, image_height)
+                .unwrap();
+        for (normalized_x, normalized_y) in points {
+            let (x, y) = image_point_to_container(
+                *normalized_x,
+                *normalized_y,
+                container_width,
+                container_height,
+                image_width,
+                image_height,
+            )
+            .unwrap();
+            assert!(close(x, rect_x + *normalized_x as f32 * rect_width));
+            assert!(close(y, rect_y + *normalized_y as f32 * rect_height));
+            let (back_x, back_y) = normalize_image_point(
+                x,
+                y,
+                container_width,
+                container_height,
+                image_width,
+                image_height,
+            )
+            .unwrap();
+            assert!((back_x - normalized_x).abs() < 1e-5);
+            assert!((back_y - normalized_y).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn annotation_points_share_one_contain_mapping_for_square_wide_and_tall_images() {
+        let points = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)];
+        // Square image in a wide container: horizontal letterbox.
+        assert_round_trip(640.0, 380.0, 100, 100, &points);
+        // Wide image in a narrow container: vertical letterbox.
+        assert_round_trip(320.0, 380.0, 1000, 200, &points);
+        // Tall image in a short container: horizontal letterbox.
+        assert_round_trip(640.0, 300.0, 200, 1000, &points);
+    }
+
+    #[test]
+    fn annotation_points_survive_decimal_coordinates_and_window_resizes() {
+        let points = [(0.1234, 0.5678), (0.422, 0.45), (0.999, 0.001)];
+        for (width, height) in [(320.0, 380.0), (640.0, 380.0), (1120.0, 380.0)] {
+            assert_round_trip(width, height, 800, 300, &points);
+        }
+    }
+
+    #[test]
+    fn clicks_in_the_contain_letterbox_are_not_answers() {
+        // Square image in a 640x380 box leaves 130px on each side.
+        assert_eq!(
+            normalize_image_point(10.0, 190.0, 640.0, 380.0, 100, 100),
+            None
+        );
+        assert_eq!(
+            normalize_image_point(630.0, 190.0, 640.0, 380.0, 100, 100),
+            None
+        );
+        // Wide image in a 320x380 box leaves vertical padding above/below.
+        assert_eq!(
+            normalize_image_point(160.0, 10.0, 320.0, 380.0, 1000, 200),
+            None
+        );
+        assert_eq!(
+            normalize_image_point(160.0, 370.0, 320.0, 380.0, 1000, 200),
+            None
+        );
+    }
+
+    #[test]
+    fn annotation_mapping_is_resolution_and_scroll_independent() {
+        // GPUI reports logical pixels, so Retina backing scale is not part of
+        // this math. Scrolling changes the window origin, not the local point.
+        let local = (123.0, 200.0);
+        let expected = normalize_image_point(local.0, local.1, 640.0, 380.0, 1000, 200);
+        let scroll_offset = (517.0, 321.0);
+        let window_point = (local.0 + scroll_offset.0, local.1 + scroll_offset.1);
+        let from_window = normalize_image_point(
+            window_point.0 - scroll_offset.0,
+            window_point.1 - scroll_offset.1,
+            640.0,
+            380.0,
+            1000,
+            200,
+        );
+        assert_eq!(expected, from_window);
+        let (x, y) = image_point_to_container(
+            expected.unwrap().0,
+            expected.unwrap().1,
+            640.0,
+            380.0,
+            1000,
+            200,
+        )
+        .unwrap();
+        assert!(close(x, local.0) && close(y, local.1));
+    }
+
     #[test]
     fn image_boxes_reject_invalid_dimensions() {
         assert_eq!(

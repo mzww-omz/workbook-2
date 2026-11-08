@@ -1176,6 +1176,34 @@ impl Storage {
         result
     }
 
+    /// Creates a uniquely named safety backup and refuses to reuse an existing
+    /// path. The empty reservation file is created with `create_new`, so two
+    /// imports at the same millisecond cannot overwrite one another.
+    pub fn backup_to_unique(&self, directory: &Path, prefix: &str) -> Result<PathBuf> {
+        ensure_private_dir(directory)?;
+        for _ in 0..32 {
+            let stamp = Utc::now().timestamp_millis();
+            let unique = Uuid::new_v4().simple().to_string();
+            let path = directory.join(format!("{prefix}-{stamp}-{}.sqlite", &unique[..12]));
+            let reservation = match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            };
+            drop(reservation);
+            match self.backup_to(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) => {
+                    let _ = fs::remove_file(&path);
+                    return Err(error);
+                }
+            }
+        }
+        Err(StorageError::Conflict(
+            "一意なバックアップ名を作成できませんでした".to_string(),
+        ))
+    }
+
     pub fn daily_backup(
         &self,
         calendar: &StudyCalendar,
@@ -1393,11 +1421,7 @@ impl Storage {
         Self::validate_backup(source)?;
         let directory = self.data_dir.join("backups");
         ensure_private_dir(&directory)?;
-        let safety = directory.join(format!(
-            "pre-restore-{}.sqlite",
-            Utc::now().timestamp_millis()
-        ));
-        self.backup_to(&safety)?;
+        self.backup_to_unique(&directory, "pre-restore")?;
         let old = live.with_extension("pre-restore-old.sqlite");
         let staging = live.with_extension(format!("restore-{}.sqlite", Uuid::new_v4()));
         fs::copy(source, &staging)?;
@@ -2060,8 +2084,9 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
     }
     ensure_private_dir(backups)?;
     let backup = backups.join(format!(
-        "pre-migration-v{from}-{}.sqlite",
-        Utc::now().timestamp_millis()
+        "pre-migration-v{from}-{}-{}.sqlite",
+        Utc::now().timestamp_millis(),
+        &Uuid::new_v4().simple().to_string()[..12]
     ));
     let temp = backup.with_extension(format!("{}.partial", Uuid::new_v4()));
     if temp.exists() {

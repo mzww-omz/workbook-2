@@ -259,6 +259,10 @@ expected_base = expected_value × expected_unit_factor
   配置先をクリックする操作の両方を維持し、配置済みは `✓` で示します。画像上の
   配置先にもコンパクト表示し、キーボード向けの配置先ボタンには読み上げ用ラベルを
   付けます。保存形式は ID のままです。
+- 画像上の配置先は、Hotspot と同じく実測した画像表示矩形へ正規化座標を変換して
+  置きます。`contain` のレターボックス（左右または上下の余白）、ウィンドウの
+  拡大縮小、スクロール、Retina/HiDPI のいずれでも位置は変わりません。外側要素の
+  単純な `%` 指定で配置しないため、画像とラベルがずれません。
 
 ## Content内の数式
 
@@ -378,12 +382,24 @@ HTTPS URL と教材同梱アセットのどちらかを、型として明示し�
 - `file` は教材 JSON からの相対パス。`..`、絶対パス、ドライブ文字、空要素を拒否。
   インポート時に canonicalize し、教材フォルダの外へ出る symlink を拒否。
 - `data` は base64。`file` と `data` はどちらか一方だけ。
-- `mediaType` は `image/png`、`image/jpeg`、`image/svg+xml` のいずれか。
-  SVGはスクリプト・外部参照・`<foreignObject>`・`<use>`・`<image>`・`style`・
-  イベントハンドラ・未知の要素を含まない静的SVGだけを受け付けます。GIF/WebPは拒否。
-- 1ファイル最大 5MB、合計 50MB、最大 50個。PNG/JPEGはヘッダ、SVGはルート要素から
-  実サイズを検証します。デコード後のメモリを抑えるため、1画像あたり最大 2,400万画素
-  （例: 6000×4000）を上限とします。
+- `mediaType` は `image/png`、`image/jpeg`、`image/svg+xml` のいずれか。GIF/WebPは拒否。
+- PNG/JPEG はヘッダーだけでなく全体をデコードして検証します。宣言された
+  `mediaType` とバイト列の形式が一致しないファイル、24バイトの PNG ヘッダーだけ、
+  IEND 欠落、CRC 不正、不正チャンク、途中で切れた JPEG、不正セグメントは
+  Import / Linter の両方で拒否されます。デコード前に寸法と画素数を確認し、
+  デコーダーにも割当量の上限を渡します。
+- SVG は XML として解析し、要素・属性の許可リストで検証します。文字列検索では
+  ありません。`script`、`foreignObject`、`iframe`、`object`、`embed`、`image`、
+  `use`、`style`、外部画像/SVG/スタイルシート参照、JavaScript URL、イベント
+  ハンドラ属性、DTD、外部エンティティ、未知の名前空間を拒否します。`href` /
+  `xlink:href` は属性として扱うため、`href = "..."` のような空白挿入でも回避
+  できません。`url(...)` は同一 SVG 内の `#fragment` だけを許可します。
+- 許可する主な要素は `svg`、`g`、`path`、`rect`、`circle`、`ellipse`、`line`、
+  `polygon`、`polyline`、`defs`、`linearGradient`、`radialGradient`、`clipPath`、
+  `stop`、`title`、`desc` です。それ以外の要素・属性は拒否されます。
+- 1ファイル最大 5MB、合計 50MB、最大 50個。デコード後のメモリを抑えるため、
+  1画像あたり最大 2,400万画素（例: 6000×4000）を上限とします。SVG は 2MB、
+  要素数・ネスト深さにも上限があります。
 - インポート時に画像バイトを SQLite の `assets` テーブルへ保存する。学習時はファイル
   パスを読まない。バックアップ／復元にも画像が含まれる。
 - 既存の Content の HTTPS 画像ブロックは従来どおり変更しない（外部取得はしない）。

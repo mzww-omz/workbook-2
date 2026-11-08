@@ -411,10 +411,15 @@ impl WorkbookService {
         Ok(workbook)
     }
 
+    /// Imports a validated workbook. Validation (including image decoding) runs
+    /// before the safety backup, so a broken workbook never causes a useless
+    /// backup or a partially changed database. The backup itself is produced
+    /// with the SQLite backup API and must succeed before the import starts.
     pub fn import_workbook_json(&self, raw: &str) -> Result<String> {
         let workbook = parse_workbook(raw)?;
         let assets = workbook.embedded_assets()?;
         let mut storage = self.storage()?;
+        self.write_action_backup(&storage, "pre-import")?;
         let now = self.clock.now();
         Ok(storage.import_workbook(&workbook, &assets, now)?)
     }
@@ -422,17 +427,20 @@ impl WorkbookService {
     pub fn import_workbook_file(&self, path: &std::path::Path) -> Result<String> {
         let (workbook, assets) = workbook_import::load_workbook_file(path)?;
         let mut storage = self.storage()?;
+        self.write_action_backup(&storage, "pre-import")?;
         let now = self.clock.now();
         Ok(storage.import_workbook(&workbook, &assets, now)?)
     }
 
+    fn write_action_backup(&self, storage: &Storage, prefix: &str) -> Result<()> {
+        let directory = storage.data_dir().join("backups");
+        storage.backup_to_unique(&directory, prefix)?;
+        Ok(())
+    }
+
     pub fn delete_workbook(&self, local_id: &str) -> Result<()> {
         let mut storage = self.storage()?;
-        let backup = storage.data_dir().join("backups").join(format!(
-            "pre-delete-{}.sqlite",
-            Utc::now().timestamp_millis()
-        ));
-        storage.backup_to(&backup)?;
+        self.write_action_backup(&storage, "pre-delete")?;
         storage.delete_workbook(local_id)?;
         Ok(())
     }
@@ -1549,11 +1557,7 @@ impl WorkbookService {
         let plan: LegacyPlan = workbook_import::read_legacy(path)?;
         let preview = workbook_import::preview_of(&plan);
         let mut storage = self.storage()?;
-        let backup = storage.data_dir().join("backups").join(format!(
-            "pre-import-{}.sqlite",
-            Utc::now().timestamp_millis()
-        ));
-        storage.backup_to(&backup)?;
+        self.write_action_backup(&storage, "pre-import")?;
         storage.apply_legacy_plan(&plan)?;
         drop(storage);
         self.recover_active()?;
@@ -1592,11 +1596,7 @@ impl WorkbookService {
                 "学習中のセッションを終了してからリセットしてください".to_string(),
             ));
         }
-        let backup = storage.data_dir().join("backups").join(format!(
-            "pre-reset-{}.sqlite",
-            Utc::now().timestamp_millis()
-        ));
-        storage.backup_to(&backup)?;
+        self.write_action_backup(&storage, "pre-reset")?;
         storage.reset_history()?;
         Ok(())
     }

@@ -113,7 +113,10 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
 - 画像の表示領域は `ui_logic::image_box` で求める。`contain` は画像全体を
   アスペクト比維持で shrink-wrap し、`cover` は 4:3 のビューポートを画像で埋めて
   中央基準で切り抜く。Hotspot / Labeling は座標精度のため常に `contain`。
-  Hotspot のクリック座標は実測 bounds と同じ表示矩形を使う。
+  Hotspot のクリック座標と Labeling の配置先は、同じ実測 bounds と
+  `ui_logic::contained_image_rect` / `image_point_to_container` を使う。これにより
+  レターボックス、ウィンドウ拡縮、スクロール、Retina/HiDPI で正規化座標の意味が
+  変わらない。Labeling のターゲットを外側要素の `%` で置かない。
 - 数式は `workbook-ui/src/math.rs` で LaTeX サブセットを解析し、分数・根号・
   上下付き・大型演算子・括弧・本文テキストのレイアウトツリーへ変換して GPUI の
   flex / text 要素で描画する。WebView やブラウザエンジンは使わない。解析不能な
@@ -173,10 +176,33 @@ v1/v2のバックアップも復元時に同じ移行を行う。
 
 短期再学習が残っている場合は「完了」と表示せず、バナーと「今すぐ再開」を出す。通常の期限候補がない場合、Reviewセッション開始時に Learn Ahead 対象を候補へ含める。
 
+## 画像アセット検証
+
+- 画像アセットは `workbook-domain::inspect_image` が Import と Linter の共通入口。
+- PNG/JPEG は宣言された `mediaType` とバイト列のマジックを照合したうえで、
+  ヘッダー読取 → 寸法・画素数の上限確認 → 完全デコードの順に検証する。
+  24バイトの PNG ヘッダーだけ、IEND 欠落、CRC 不正、途中で切れた JPEG、
+  不正セグメント、MIME 不一致はすべて拒否する。
+- デコードは `image` crate の PNG/JPEG のみを有効化し、幅・高さ 20,000、
+  画素 2,400万、割当量の上限をデコーダーにも渡す。破損データで panic しない。
+- SVG は `roxmltree` で XML として解析し、要素・属性の許可リストで検証する。
+  文字列検索は使わない。DTD・外部エンティティ・未知の名前空間・`script` /
+  `foreignObject` / `iframe` / `object` / `embed` / `image` / `use` / `style`、
+  イベントハンドラ、外部 URL を拒否する。`url(...)` は `#fragment` のみ許可。
+- 不正な画像は SQLite へ書き込む前に拒否する。Linter は `WB-ASSET-002` として
+  Error を返す。
+
 ## バックアップ
 
 - SQLite backup API で一貫したコピー
 - 日次 `daily-YYYY-MM-DD.sqlite` を7世代
 - pre-import / pre-delete / pre-restore / pre-reset の安全バックアップ
+- 通常の `import_workbook_json` / `import_workbook_file` も、教材と全アセットの
+  検証成功後に `pre-import-*.sqlite` を作成する。検証失敗時はバックアップを作らない。
+  バックアップ作成に失敗した場合は Import を開始しない。
+- 安全バックアップ名は時刻 + ランダムUUID。`create_new` で名前を予約するため、
+  同時刻の連続Importでも既存バックアップを上書きしない。
+- バックアップは `<data>/backups/` に 0600 で保存する。日次だけ7世代で自動削除し、
+  操作前バックアップはユーザーが明示的に削除するまで保持する。
 - 復元は別DBで application_id / user_version / スキーマ / trigger / integrity / FK / 教材JSON / settings / review_states を検証
 - 復元失敗時は旧DBへ戻す

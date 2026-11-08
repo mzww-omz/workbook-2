@@ -2446,8 +2446,49 @@ impl WorkbookApp {
             .collect();
         let mut column = div().flex().flex_col().gap_3();
         if let Some(asset) = asset {
-            let mut canvas_box = self.render_question_image(&asset, cx);
+            let entity = cx.entity();
+            let bounds_slot = self.labeling_image_bounds.clone();
+            let mut canvas_box = self
+                .render_question_image(&asset, cx)
+                .on_children_prepainted(move |children, _, cx| {
+                    if let Some(bounds) = children.first() {
+                        let next = (
+                            f32::from(bounds.origin.x),
+                            f32::from(bounds.origin.y),
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        );
+                        let changed = bounds_slot.get().is_none_or(|(_, _, width, height)| {
+                            (width - next.2).abs() > 0.5 || (height - next.3).abs() > 0.5
+                        });
+                        bounds_slot.set(Some(next));
+                        if changed {
+                            let entity = entity.clone();
+                            cx.defer(move |cx| cx.notify(entity.entity_id()));
+                        }
+                    }
+                });
+            // Use the measured `contain` box. The fallback matches the requested
+            // layout for the first frame; the prepaint listener re-renders once
+            // the real window width is known.
+            let (container_width, container_height) = self
+                .labeling_image_bounds
+                .get()
+                .map(|(_, _, width, height)| (width, height))
+                .unwrap_or_else(|| {
+                    crate::ui_logic::fit_image(asset.width, asset.height, 640.0, 380.0)
+                });
             for target in &labeling.targets {
+                let Some((target_x, target_y)) = crate::ui_logic::image_point_to_container(
+                    target.x,
+                    target.y,
+                    container_width,
+                    container_height,
+                    asset.width,
+                    asset.height,
+                ) else {
+                    continue;
+                };
                 let assigned = self
                     .labeling
                     .get(&target.id)
@@ -2457,10 +2498,8 @@ impl WorkbookApp {
                 let target_button = div()
                     .id(SharedString::from(format!("label-target-{}", target.id)))
                     .absolute()
-                    .left(relative(target.x as f32))
-                    .top(relative(target.y as f32))
-                    .ml(px(-30.0))
-                    .mt(px(-18.0))
+                    .left(px(target_x - 30.0))
+                    .top(px(target_y - 18.0))
                     .min_w(px(60.0))
                     .h(px(36.0))
                     .px(px(6.0))

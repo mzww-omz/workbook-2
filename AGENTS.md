@@ -51,8 +51,11 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 ## Data Safety
 
 - New app id `1463962418`; legacy id `1463962443`. Never write to the legacy DB.
-- Back up before import, delete, restore, or history reset.
-- Never copy a live SQLite file directly; use the backup API.
+- Back up before import, delete, restore, or history reset. A normal workbook import is included: validate the workbook and all assets first, then create a uniquely named `pre-import-*.sqlite`, and abort if the backup fails.
+- Never copy a live SQLite file directly; use the backup API. Action backups use `create_new` names so simultaneous imports cannot overwrite one another.
+- `seed_demo` may only modify a directory carrying its exact marker file. Never call `remove_dir_all` on an arbitrary path.
+- SVG safety is decided on a parsed XML tree with element/attribute allowlists; never substring or regex scans. Reject DTD/entities, foreign namespaces, scripts, event handlers, external references, and `style`.
+- PNG/JPEG assets must decode completely. A header-only, truncated, wrong-CRC, or MIME-mismatched file is an import error; do not trust dimensions read from a header alone.
 - Do not print user data, secrets, or tokens.
 - Do not push, release, notarize, or upload without an explicit request.
 
@@ -66,6 +69,7 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 - Math blocks are typeset by `workbook-ui/src/math.rs` (LaTeX subset -> layout tree -> GPUI flex/text). Do not render raw LaTeX as the normal path and do not add a WebView. Unknown syntax must fall back to readable source text plus a reason, with the LaTeX exposed as the accessibility label. Keep the parser and layout decisions in pure functions with tests.
 - Rich-content images use the typed `asset` source; do not infer bundled assets from URL prefixes. Serve bundled images from `StudyView.assets` and cache decoded images by workbook + asset + content fingerprint in the bounded LRU in `workbook-ui/src/image_cache.rs`. Do not clear the cache merely because the question changed. Invalidate on import, asset content change, workbook delete, and restore, and free evicted textures with `Image::remove_asset`.
 - Image display boxes come from `workbook-ui/src/ui_logic.rs::image_box`. `contain` shows the whole image; `cover` fills a 4:3 viewport and crops. Hotspot and Labeling must keep using `contain` so normalized coordinates cannot shift under cropping.
+- Both Hotspot clicks and Labeling target placement use the measured image bounds plus `ui_logic::contained_image_rect` / `image_point_to_container`. Do not position Labeling targets with percentages of the outer element.
 - Do not bind rating digits while a text input is focused; keep IME input usable.
 - Do not fabricate screenshots or claim VoiceOver, IME, Windows, or Linux verification without an actual run.
 - Screenshots live in `docs/screenshots/`; regenerate with `./scripts/capture-screenshots.sh`.

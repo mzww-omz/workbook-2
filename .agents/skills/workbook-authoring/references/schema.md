@@ -99,8 +99,12 @@
 - `file` は workbook JSON からの相対パス。`..`、絶対パス、ドライブ文字は拒否。
 - `data` は base64。`file` と `data` はどちらか一方。
 - `mediaType` は `image/png` / `image/jpeg` / `image/svg+xml`。
-- 1ファイル 5MB、合計 50MB、最大50個。PNG/JPEG は実サイズ、SVG は静的要素を検証。
-- SVG は `script`、外部参照、`foreignObject`、`use`、`image`、`style`、イベント属性を拒否。
+- 1ファイル 5MB、合計 50MB、最大50個。PNG/JPEG は全体をデコードして実サイズと
+  完全性を検証。ヘッダーだけ、IEND 欠落、CRC 不正、途中で切れた JPEG、MIME 不一致は拒否。
+- SVG は XML として解析し、要素・属性の許可リストで検証する。`script`、外部参照、
+  `foreignObject`、`iframe`、`object`、`embed`、`use`、`image`、`style`、`href` /
+  `xlink:href`、イベント属性、DTD/ENTITY、未知の名前空間を拒否。`url(...)` は
+  `#fragment` のみ許可。SVG は 2MB、最大 2,400万画素。
 - 学習時はファイルパスを読まず、インポート時に SQLite へ保存したバイト列を使う。
   バックアップ／復元にも含まれる。
 

@@ -32,6 +32,12 @@ url = "2.5.8"
 fsrs = { git = "https://github.com/open-spaced-repetition/fsrs-rs", rev = "65224f1de57c538385ecb5e4df0f2564ee6f0fb8" }
 gpui-kit = "=0.9.0"
 rfd = "0.17.2"
+# Read-only XML parser for the static SVG subset. No DTD/entity expansion by
+# default; MIT/Apache-2.0 licensed and already present in the lock file.
+roxmltree = "0.21"
+# Raster decoding for PNG/JPEG integrity checks. Only the two decoders the
+# workbook format supports are enabled. MIT/Apache-2.0 licensed.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 
 [profile.release]
 opt-level = 2

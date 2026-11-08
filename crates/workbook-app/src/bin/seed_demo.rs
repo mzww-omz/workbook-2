@@ -9,13 +9,301 @@
 //! v2-math.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use workbook_domain::{Answer, Mode, Phase, Question, QuestionType, Rating};
 use workbook_scheduler::FixedClock;
 use workbook_service::{StudyView, WorkbookService};
+
+/// Marker file that proves a directory belongs to this development seeder.
+/// A directory without this marker is never modified.
+const SEED_MARKER: &str = ".workbook2-demo-seed";
+const SEED_MARKER_CONTENT: &[u8] = b"workbook2-demo-seed-v1\n";
+
+/// Only these Seeder-owned entries are removed when re-seeding. Anything else
+/// in the directory (including user files) is left untouched.
+const SEED_MANAGED_FILES: &[&str] = &[
+    "workbook.sqlite",
+    "workbook.sqlite-wal",
+    "workbook.sqlite-shm",
+];
+const SEED_MANAGED_DIRS: &[&str] = &["backups"];
+
+/// Absolute locations that must never be used as a seed directory, even if a
+/// marker file happens to exist there.
+const PROTECTED_ROOTS: &[&str] = &[
+    "/Users",
+    "/Applications",
+    "/System",
+    "/Library",
+    "/tmp",
+    "/private",
+    "/private/tmp",
+    "/var",
+    "/private/var",
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/opt",
+    "/dev",
+    "/Volumes",
+];
+
+#[derive(Clone, Debug)]
+struct SeedPaths {
+    cwd: PathBuf,
+    home: Option<PathBuf>,
+}
+
+impl SeedPaths {
+    fn current() -> Self {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|path| path.canonicalize().ok());
+        Self { cwd, home }
+    }
+}
+
+fn validate_profile(profile: &str) -> anyhow::Result<()> {
+    let simple = matches!(
+        profile,
+        "today" | "library" | "history" | "settings" | "study" | "feedback" | "result" | "upcoming"
+    );
+    let expanded = profile.strip_prefix("v2-").is_some_and(|target| {
+        matches!(
+            target,
+            "numeric" | "near-miss" | "ordering" | "matching" | "hotspot" | "labeling" | "math"
+        )
+    });
+    if !simple && !expanded {
+        anyhow::bail!("unknown profile: {profile}");
+    }
+    Ok(())
+}
+
+/// Prepares a Seeder-only directory without ever deleting an arbitrary path.
+///
+/// * A new directory is created and marked.
+/// * An existing directory is accepted only when it contains the exact Seeder
+///   marker. Then only the SQLite database and `backups/` are removed.
+/// * Relative paths, `..`, symlinks, the project root/home, their ancestors,
+///   and system directories are rejected before anything is written.
+fn prepare_seed_directory(directory: &Path) -> anyhow::Result<()> {
+    prepare_seed_directory_with(directory, &SeedPaths::current())
+}
+
+fn prepare_seed_directory_with(directory: &Path, paths: &SeedPaths) -> anyhow::Result<()> {
+    validate_seed_path(directory, paths)?;
+    if directory.exists() {
+        verify_seed_marker(directory)?;
+        clear_seed_data(directory)?;
+    } else {
+        std::fs::create_dir_all(directory)?;
+        // Re-check after creation: an ancestor may have been a symlink.
+        let canonical = directory.canonicalize()?;
+        validate_seed_path(&canonical, paths)?;
+        write_seed_marker(directory)?;
+    }
+    Ok(())
+}
+
+fn validate_seed_path(directory: &Path, paths: &SeedPaths) -> anyhow::Result<()> {
+    if directory.as_os_str().is_empty() {
+        anyhow::bail!("保存先を指定してください");
+    }
+    if !directory.is_absolute() {
+        anyhow::bail!(
+            "保存先は絶対パスで指定してください（例: /tmp/workbook2-demo）: {}",
+            directory.display()
+        );
+    }
+    if directory
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        anyhow::bail!(
+            "保存先に . や .. を含めることはできません: {}",
+            directory.display()
+        );
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(directory) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "保存先をシンボリックリンクにすることはできません: {}",
+                directory.display()
+            );
+        }
+        if !metadata.is_dir() {
+            anyhow::bail!(
+                "保存先がディレクトリではありません: {}",
+                directory.display()
+            );
+        }
+    }
+
+    let normalized = normalize_existing_prefix(directory)?;
+    reject_sensitive_path(&normalized, paths)?;
+    reject_sensitive_path(directory, paths)?;
+    Ok(())
+}
+
+/// Canonicalizes the longest existing prefix and appends the missing
+/// components. This resolves macOS aliases such as `/tmp -> /private/tmp`
+/// without requiring the final directory to exist yet.
+fn normalize_existing_prefix(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
+            anyhow::bail!("保存先を解決できません: {}", path.display());
+        };
+        suffix.push(name);
+        if !existing.pop() {
+            anyhow::bail!("保存先を解決できません: {}", path.display());
+        }
+    }
+    let mut normalized = existing.canonicalize()?;
+    for component in suffix.into_iter().rev() {
+        normalized.push(component);
+    }
+    Ok(normalized)
+}
+
+fn reject_sensitive_path(path: &Path, paths: &SeedPaths) -> anyhow::Result<()> {
+    if path.parent().is_none() {
+        anyhow::bail!("ルートディレクトリは保存先にできません");
+    }
+    if path == paths.cwd || paths.cwd.starts_with(path) {
+        anyhow::bail!(
+            "プロジェクトルートやその親ディレクトリは保存先にできません: {}",
+            path.display()
+        );
+    }
+    if let Some(home) = paths.home.as_ref()
+        && (path == home || home.starts_with(path))
+    {
+        anyhow::bail!(
+            "ホームディレクトリやその親は保存先にできません: {}",
+            path.display()
+        );
+    }
+    if PROTECTED_ROOTS
+        .iter()
+        .any(|protected| path == Path::new(protected))
+    {
+        anyhow::bail!(
+            "システムディレクトリは保存先にできません: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn verify_seed_marker(directory: &Path) -> anyhow::Result<()> {
+    let marker = directory.join(SEED_MARKER);
+    let metadata = std::fs::symlink_metadata(&marker).map_err(|_| {
+        anyhow::anyhow!(
+            "既存ディレクトリはSeeder管理下ではありません（マーカー {} がありません）。データを変更せず終了しました: {}",
+            SEED_MARKER,
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "Seederマーカーが安全なファイルではありません: {}",
+            marker.display()
+        );
+    }
+    let content = std::fs::read(&marker)?;
+    if content != SEED_MARKER_CONTENT {
+        anyhow::bail!(
+            "Seederマーカーの内容が一致しません。データを変更せず終了しました: {}",
+            marker.display()
+        );
+    }
+    Ok(())
+}
+
+fn write_seed_marker(directory: &Path) -> anyhow::Result<()> {
+    let marker = directory.join(SEED_MARKER);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            file.write_all(SEED_MARKER_CONTENT)?;
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another invocation claimed the directory. Accept it only when it
+            // wrote the same marker.
+            let content = std::fs::read(&marker)?;
+            if content == SEED_MARKER_CONTENT {
+                Ok(())
+            } else {
+                anyhow::bail!("Seederマーカーの内容が一致しません: {}", marker.display())
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn clear_seed_data(directory: &Path) -> anyhow::Result<()> {
+    // Validate every managed entry before removing anything. A symlink or an
+    // unexpected file type must abort without a partial reset.
+    let mut files = Vec::new();
+    for name in SEED_MANAGED_FILES {
+        let path = directory.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || metadata.is_dir() {
+                    anyhow::bail!(
+                        "Seeder管理ファイルが通常ファイルではありません: {}",
+                        path.display()
+                    );
+                }
+                files.push(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut dirs = Vec::new();
+    for name in SEED_MANAGED_DIRS {
+        let path = directory.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!(
+                        "Seeder管理ディレクトリが通常ディレクトリではありません: {}",
+                        path.display()
+                    );
+                }
+                dirs.push(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    for path in files {
+        std::fs::remove_file(&path)?;
+    }
+    for path in dirs {
+        std::fs::remove_dir_all(&path)?;
+    }
+    Ok(())
+}
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -24,9 +312,8 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "/tmp/workbook2-demo".to_string()),
     );
     let profile = args.next().unwrap_or_else(|| "today".to_string());
-    if directory.exists() {
-        std::fs::remove_dir_all(&directory)?;
-    }
+    validate_profile(&profile)?;
+    prepare_seed_directory(&directory)?;
     let start = if profile == "upcoming" {
         Utc::now()
     } else {
@@ -396,6 +683,181 @@ fn correct_answer(question: &Question) -> (Option<Answer>, Option<bool>) {
         QuestionType::Labeling => {
             let labels = question.labeling_spec().map(|spec| spec.pairs);
             (labels.map(|labels| Answer::Labels { labels }), None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn fake_paths(base: &Path) -> SeedPaths {
+        SeedPaths {
+            cwd: base.join("project"),
+            home: Some(base.join("home")),
+        }
+    }
+
+    #[test]
+    fn a_new_directory_is_created_and_marked() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let seed = root.path().join("demo");
+        prepare_seed_directory_with(&seed, &paths).unwrap();
+        assert!(seed.is_dir());
+        assert_eq!(
+            std::fs::read(seed.join(SEED_MARKER)).unwrap(),
+            SEED_MARKER_CONTENT
+        );
+    }
+
+    #[test]
+    fn an_owned_directory_is_reseeded_without_deleting_user_files() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let seed = root.path().join("demo");
+        prepare_seed_directory_with(&seed, &paths).unwrap();
+
+        std::fs::write(seed.join("workbook.sqlite"), b"old database").unwrap();
+        std::fs::write(seed.join("notes.txt"), b"user data").unwrap();
+        std::fs::create_dir(seed.join("backups")).unwrap();
+        std::fs::write(seed.join("backups").join("daily.sqlite"), b"backup").unwrap();
+
+        prepare_seed_directory_with(&seed, &paths).unwrap();
+
+        assert!(!seed.join("workbook.sqlite").exists());
+        assert!(!seed.join("workbook.sqlite-wal").exists());
+        assert!(!seed.join("backups").exists());
+        assert_eq!(std::fs::read(seed.join("notes.txt")).unwrap(), b"user data");
+        assert!(seed.join(SEED_MARKER).is_file());
+    }
+
+    #[test]
+    fn a_directory_without_the_marker_is_never_modified() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let seed = root.path().join("user-data");
+        std::fs::create_dir(&seed).unwrap();
+        std::fs::write(seed.join("important.txt"), b"keep me").unwrap();
+
+        let error = prepare_seed_directory_with(&seed, &paths).unwrap_err();
+        assert!(error.to_string().contains("Seeder管理下ではありません"));
+        assert_eq!(
+            std::fs::read(seed.join("important.txt")).unwrap(),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn an_empty_unmarked_directory_is_not_claimed() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let seed = root.path().join("empty");
+        std::fs::create_dir(&seed).unwrap();
+        assert!(prepare_seed_directory_with(&seed, &paths).is_err());
+        assert!(seed.is_dir());
+        assert!(!seed.join(SEED_MARKER).exists());
+    }
+
+    #[test]
+    fn the_project_root_and_its_ancestors_are_rejected() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(project.join("Cargo.toml"), b"keep").unwrap();
+        let paths = SeedPaths {
+            cwd: nested,
+            home: Some(root.path().join("home")),
+        };
+
+        assert!(prepare_seed_directory_with(&project, &paths).is_err());
+        assert!(prepare_seed_directory_with(root.path(), &paths).is_err());
+        assert_eq!(std::fs::read(project.join("Cargo.toml")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn relative_and_unsafe_paths_are_rejected() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        for path in [
+            PathBuf::from("relative-demo"),
+            PathBuf::from(""),
+            PathBuf::from("/"),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/../etc"),
+        ] {
+            assert!(
+                prepare_seed_directory_with(&path, &paths).is_err(),
+                "should reject {}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_seed_directory_is_rejected_without_touching_the_target() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let real = root.path().join("real");
+        prepare_seed_directory_with(&real, &paths).unwrap();
+        std::fs::write(real.join("notes.txt"), b"keep").unwrap();
+
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = prepare_seed_directory_with(&link, &paths).unwrap_err();
+        assert!(error.to_string().contains("シンボリックリンク"));
+        assert_eq!(std::fs::read(real.join("notes.txt")).unwrap(), b"keep");
+        assert!(real.join(SEED_MARKER).is_file());
+    }
+
+    #[test]
+    fn a_tampered_marker_blocks_reseeding() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let seed = root.path().join("demo");
+        prepare_seed_directory_with(&seed, &paths).unwrap();
+        std::fs::write(seed.join("workbook.sqlite"), b"old").unwrap();
+        std::fs::write(seed.join(SEED_MARKER), b"not ours").unwrap();
+
+        assert!(prepare_seed_directory_with(&seed, &paths).is_err());
+        assert_eq!(std::fs::read(seed.join("workbook.sqlite")).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_directory_symlink_aborts_before_removing_the_database() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let seed = root.path().join("demo");
+        prepare_seed_directory_with(&seed, &paths).unwrap();
+        std::fs::write(seed.join("workbook.sqlite"), b"old").unwrap();
+        let target = root.path().join("backup-target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, seed.join("backups")).unwrap();
+
+        assert!(prepare_seed_directory_with(&seed, &paths).is_err());
+        assert_eq!(std::fs::read(seed.join("workbook.sqlite")).unwrap(), b"old");
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn a_managed_file_symlink_blocks_reseeding() {
+        let root = tempdir().unwrap();
+        let paths = fake_paths(root.path());
+        let seed = root.path().join("demo");
+        prepare_seed_directory_with(&seed, &paths).unwrap();
+        let target = root.path().join("target.sqlite");
+        std::fs::write(&target, b"keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, seed.join("workbook.sqlite")).unwrap();
+
+        #[cfg(unix)]
+        {
+            assert!(prepare_seed_directory_with(&seed, &paths).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep");
         }
     }
 }

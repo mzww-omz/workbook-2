@@ -155,21 +155,31 @@ pub fn validate_relative_asset_path(value: &str, path: &str) -> Result<(), Valid
 
 /// Verifies that bytes match the declared media type and returns the intrinsic
 /// size. SVG is accepted only through a strict static subset (no scripts,
-/// external references, stylesheets, or embedded images).
+/// external references, stylesheets, or embedded images). PNG/JPEG files must
+/// decode completely; a plausible header alone is not enough.
 pub fn inspect_image(
     bytes: &[u8],
     media_type: &str,
     path: &str,
 ) -> Result<(u32, u32), ValidationError> {
     let (width, height) = match media_type {
-        "image/png" => png_size(bytes),
-        "image/jpeg" => jpeg_size(bytes),
+        "image/png" => inspect_raster(bytes, image::ImageFormat::Png, path)?,
+        "image/jpeg" => inspect_raster(bytes, image::ImageFormat::Jpeg, path)?,
         "image/svg+xml" => {
             return inspect_svg(bytes, path);
         }
-        _ => None,
-    }
-    .ok_or_else(|| ValidationError::new(path, "画像データを読み取れません（PNG/JPEGのみ対応）"))?;
+        _ => {
+            return Err(ValidationError::new(
+                path,
+                "画像の形式は PNG / JPEG / SVG のいずれかに対応しています",
+            ));
+        }
+    };
+    validate_image_dimensions(width, height, path)?;
+    Ok((width, height))
+}
+
+fn validate_image_dimensions(width: u32, height: u32, path: &str) -> Result<(), ValidationError> {
     if width == 0 || height == 0 || width > 20_000 || height > 20_000 {
         return Err(ValidationError::new(path, "画像サイズが不正です"));
     }
@@ -182,109 +192,277 @@ pub fn inspect_image(
             ),
         ));
     }
+    Ok(())
+}
+
+/// Decodes PNG/JPEG completely and returns the real dimensions.
+///
+/// The format is guessed from the bytes and compared with the declared media
+/// type, so a PNG renamed to `.jpg` (or a JPEG served as `image/png`) is
+/// rejected. Dimensions are read before the pixel buffer is allocated, and the
+/// decoder receives hard allocation limits so a decompression bomb cannot
+/// exhaust memory. A truncated file, a bad CRC, or an invalid segment makes the
+/// decoder fail; callers never receive a header-only "valid" result.
+fn inspect_raster(
+    bytes: &[u8],
+    expected: image::ImageFormat,
+    path: &str,
+) -> Result<(u32, u32), ValidationError> {
+    if bytes.is_empty() {
+        return Err(ValidationError::new(path, "画像データが空です"));
+    }
+    let guessed = image::guess_format(bytes).map_err(|_| {
+        ValidationError::new(
+            path,
+            "画像データを読み取れません。PNG/JPEGの完全なファイルを指定してください",
+        )
+    })?;
+    if guessed != expected {
+        return Err(ValidationError::new(
+            path,
+            format!(
+                "mediaType と画像データの形式が一致しません（宣言: {}、実際: {}）",
+                media_label(expected),
+                media_label(guessed)
+            ),
+        ));
+    }
+    if expected == image::ImageFormat::Jpeg && !jpeg_has_eoi(bytes) {
+        return Err(ValidationError::new(
+            path,
+            "JPEGが途中で切れています（終端のEOIマーカーがありません）",
+        ));
+    }
+
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(20_000);
+    limits.max_image_height = Some(20_000);
+    // RGBA output for the largest allowed image, with headroom for the
+    // decoder's own row buffers.
+    limits.max_alloc = Some(MAX_IMAGE_PIXELS * 4 + 16 * 1024 * 1024);
+    let mut header_reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), expected);
+    header_reader.limits(limits.clone());
+    let (width, height) = header_reader.into_dimensions().map_err(|error| {
+        ValidationError::new(
+            path,
+            format!("画像データが壊れているか途中で切れています: {error}"),
+        )
+    })?;
+    validate_image_dimensions(width, height, path)?;
+
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), expected);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|error| {
+        ValidationError::new(
+            path,
+            format!("画像データをデコードできません（破損または未対応の形式）: {error}"),
+        )
+    })?;
+    if image.width() != width || image.height() != height {
+        return Err(ValidationError::new(
+            path,
+            "画像のヘッダーとデコード結果のサイズが一致しません",
+        ));
+    }
     Ok((width, height))
 }
 
-/// Safe, static SVG subset used for bundled diagrams. The renderer never sees
-/// scripts, external URLs, `<use>`/`<image>` references, or CSS.
+/// JPEG decoders may accept a stream that ends before the EOI marker once all
+/// scan data is present. Treat that as a truncated file: every complete JPEG we
+/// accept ends with `FF D9` (optionally followed by ASCII whitespace/NUL).
+fn jpeg_has_eoi(bytes: &[u8]) -> bool {
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], 0x00 | b'\n' | b'\r' | b' ' | b'\t') {
+        end -= 1;
+    }
+    end >= 2 && bytes[end - 2] == 0xFF && bytes[end - 1] == 0xD9
+}
+
+fn media_label(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Png => "PNG",
+        image::ImageFormat::Jpeg => "JPEG",
+        _ => "その他",
+    }
+}
+
+const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+const MAX_SVG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SVG_NODES: u32 = 10_000;
+const MAX_SVG_ELEMENTS: usize = 4_000;
+const MAX_SVG_DEPTH: usize = 64;
+
+/// Elements that the static diagram subset may use. Names are matched exactly:
+/// XML is case-sensitive, so `<SCRIPT>` or `<foreignobject>` cannot slip through
+/// a case-insensitive allowlist.
+const SAFE_SVG_ELEMENTS: &[&str] = &[
+    "svg",
+    "g",
+    "path",
+    "rect",
+    "circle",
+    "ellipse",
+    "polygon",
+    "polyline",
+    "line",
+    "title",
+    "desc",
+    "defs",
+    "clipPath",
+    "linearGradient",
+    "radialGradient",
+    "stop",
+];
+
+/// Attributes that only carry geometry, paint, or accessibility information.
+/// `style`, `class`, `href`, `xlink:href`, and every event handler are absent on
+/// purpose: there is no way to express script, CSS, or a remote reference.
+const SAFE_SVG_ATTRIBUTES: &[&str] = &[
+    "id",
+    "role",
+    "aria-label",
+    "aria-hidden",
+    "x",
+    "y",
+    "width",
+    "height",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "cx",
+    "cy",
+    "r",
+    "rx",
+    "ry",
+    "fx",
+    "fy",
+    "fr",
+    "d",
+    "points",
+    "transform",
+    "gradientTransform",
+    "gradientUnits",
+    "spreadMethod",
+    "clipPathUnits",
+    "viewBox",
+    "preserveAspectRatio",
+    "version",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-width",
+    "stroke-opacity",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "opacity",
+    "color",
+    "display",
+    "visibility",
+    "clip-path",
+    "offset",
+    "stop-color",
+    "stop-opacity",
+];
+
+/// Local names that must never appear on an element, even if a future edit
+/// accidentally adds one to the attribute allowlist.
+const FORBIDDEN_SVG_ATTRIBUTES: &[&str] = &[
+    "href",
+    "src",
+    "srcset",
+    "action",
+    "formaction",
+    "poster",
+    "data",
+    "cite",
+    "background",
+    "longdesc",
+    "usemap",
+    "style",
+];
+
+/// Safe, static SVG subset used for bundled diagrams. Validation works on the
+/// parsed XML tree, not on a substring scan: whitespace around `=`, entity
+/// encodings, namespace prefixes, and attribute order cannot bypass it.
 fn inspect_svg(bytes: &[u8], path: &str) -> Result<(u32, u32), ValidationError> {
-    if bytes.len() > 2 * 1024 * 1024 {
+    if bytes.len() > MAX_SVG_BYTES {
         return Err(ValidationError::new(path, "SVGは2MB以下にしてください"));
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ValidationError::new(path, "SVGはUTF-8で保存してください"))?;
-    let lower = text.to_lowercase();
-    for forbidden in [
-        "<script",
-        "<foreignobject",
-        "<iframe",
-        "<object",
-        "<embed",
-        "<image",
-        "<use",
-        "<a ",
-        "<style",
-        "javascript:",
-        "url(",
-        "@import",
-        "<!doctype",
-        "<!entity",
-        "href=",
-        "xlink:href",
-        "style=",
-    ] {
-        if lower.contains(forbidden) {
-            return Err(ValidationError::new(
-                path,
-                format!("SVGに許可されない要素が含まれています: {forbidden}"),
-            ));
-        }
-    }
-    if has_event_handler(&lower) {
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: false,
+        nodes_limit: MAX_SVG_NODES,
+        ..Default::default()
+    };
+    let document = roxmltree::Document::parse_with_options(text, options).map_err(|error| {
+        ValidationError::new(
+            path,
+            format!("SVGのXML構文が不正です（DTD・外部エンティティは使用できません）: {error}"),
+        )
+    })?;
+    let root = document.root_element();
+    if root.tag_name().name() != "svg" {
         return Err(ValidationError::new(
             path,
-            "SVGにイベントハンドラを含めることはできません",
+            "SVGのルート要素は <svg> である必要があります",
         ));
     }
-    let allowed = [
-        "svg",
-        "g",
-        "path",
-        "rect",
-        "circle",
-        "ellipse",
-        "polygon",
-        "polyline",
-        "line",
-        "title",
-        "desc",
-        "defs",
-        "clippath",
-        "lineargradient",
-        "radialgradient",
-        "stop",
-    ];
-    let mut rest = text;
-    while let Some(start) = rest.find('<') {
-        rest = &rest[start + 1..];
-        if rest.starts_with('!') || rest.starts_with('?') || rest.starts_with('/') {
-            // Comments, declarations, and closing tags are fine; the matching
-            // opening tag was already checked.
-            if rest.starts_with('/') {
-                rest = &rest[1..];
-            } else {
-                continue;
-            }
-        }
-        let name: String = rest
-            .chars()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == ':')
-            .collect();
-        if name.is_empty() {
-            continue;
-        }
-        let name = name.to_lowercase();
-        if !allowed.contains(&name.as_str()) {
+    if root
+        .tag_name()
+        .namespace()
+        .is_some_and(|ns| ns != SVG_NAMESPACE)
+    {
+        return Err(ValidationError::new(
+            path,
+            "SVGに許可されない名前空間が含まれています",
+        ));
+    }
+
+    let mut elements = 0usize;
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > MAX_SVG_DEPTH {
             return Err(ValidationError::new(
                 path,
-                format!("SVGに許可されない要素が含まれています: <{name}>"),
+                format!("SVGのネストが深すぎます（最大{MAX_SVG_DEPTH}階層）"),
             ));
         }
+        validate_svg_element(node, path)?;
+        elements += 1;
+        if elements > MAX_SVG_ELEMENTS {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGの要素数が多すぎます（最大{MAX_SVG_ELEMENTS}個）"),
+            ));
+        }
+        for child in node.children() {
+            match child.node_type() {
+                roxmltree::NodeType::Element => stack.push((child, depth + 1)),
+                roxmltree::NodeType::PI => {
+                    return Err(ValidationError::new(
+                        path,
+                        "SVGに処理命令（processing instruction）を含めることはできません",
+                    ));
+                }
+                roxmltree::NodeType::Text | roxmltree::NodeType::Comment => {}
+                roxmltree::NodeType::Root => {}
+            }
+        }
     }
-    let root = text
-        .find("<svg")
-        .map(|index| &text[index..])
-        .ok_or_else(|| ValidationError::new(path, "SVGのルート要素がありません"))?;
-    let tag_end = root
-        .find('>')
-        .ok_or_else(|| ValidationError::new(path, "SVGのルート要素が壊れています"))?;
-    let tag = &root[..tag_end];
-    let width = svg_dimension(tag, "width");
-    let height = svg_dimension(tag, "height");
+
+    let width = svg_dimension(root, "width");
+    let height = svg_dimension(root, "height");
     let (width, height) = match (width, height) {
         (Some(width), Some(height)) => (width, height),
         _ => {
-            let view_box = svg_attribute(tag, "viewbox")
+            let view_box = root
+                .attribute("viewBox")
                 .ok_or_else(|| ValidationError::new(path, "SVGにサイズがありません"))?;
             let values: Vec<f64> = view_box
                 .split(|ch: char| ch.is_whitespace() || ch == ',')
@@ -306,113 +484,147 @@ fn inspect_svg(bytes: &[u8], path: &str) -> Result<(u32, u32), ValidationError> 
         return Err(ValidationError::new(path, "SVGのサイズが不正です"));
     }
     let (width, height) = (width.round() as u32, height.round() as u32);
-    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
-        return Err(ValidationError::new(
-            path,
-            format!(
-                "SVGの画素数が上限を超えています（最大{}万画素）",
-                MAX_IMAGE_PIXELS / 10_000
-            ),
-        ));
-    }
+    validate_image_dimensions(width, height, path)?;
     Ok((width, height))
 }
 
-fn svg_dimension(tag: &str, name: &str) -> Option<f64> {
-    let value = svg_attribute(tag, name)?;
+fn validate_svg_element(node: roxmltree::Node<'_, '_>, path: &str) -> Result<(), ValidationError> {
+    let name = node.tag_name().name();
+    if !SAFE_SVG_ELEMENTS.contains(&name) {
+        return Err(ValidationError::new(
+            path,
+            format!("SVGに許可されない要素が含まれています: <{name}>"),
+        ));
+    }
+    if node
+        .tag_name()
+        .namespace()
+        .is_some_and(|ns| ns != SVG_NAMESPACE)
+    {
+        return Err(ValidationError::new(
+            path,
+            format!("SVGに許可されない名前空間が含まれています: <{name}>"),
+        ));
+    }
+    for namespace in node.namespaces() {
+        let uri = namespace.uri();
+        if namespace.name().is_none() && uri == SVG_NAMESPACE {
+            continue;
+        }
+        return Err(ValidationError::new(
+            path,
+            format!("SVGに許可されない名前空間宣言が含まれています: {uri}"),
+        ));
+    }
+    for attribute in node.attributes() {
+        let local = attribute.name();
+        let lower = local.to_ascii_lowercase();
+        if attribute.namespace().is_some() {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGに名前空間付き属性を含めることはできません: {local}"),
+            ));
+        }
+        if FORBIDDEN_SVG_ATTRIBUTES.contains(&lower.as_str()) {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGに許可されない属性が含まれています: {local}"),
+            ));
+        }
+        if lower.starts_with("on") && lower.len() > 2 {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGにイベントハンドラ属性を含めることはできません: {local}"),
+            ));
+        }
+        if !SAFE_SVG_ATTRIBUTES.contains(&local) {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGに許可されない属性が含まれています: {local}"),
+            ));
+        }
+        validate_svg_attribute_value(attribute.value(), path, local)?;
+    }
+    Ok(())
+}
+
+fn validate_svg_attribute_value(
+    value: &str,
+    path: &str,
+    attribute: &str,
+) -> Result<(), ValidationError> {
+    // XML entities are decoded before this point, so `java&#115;cript:` is
+    // caught here as well. Whitespace and control characters are removed to
+    // stop `java\nscript:` style evasions.
+    let normalized: String = value
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+        .flat_map(char::to_lowercase)
+        .collect();
+    for scheme in [
+        "javascript:",
+        "vbscript:",
+        "data:",
+        "file:",
+        "http:",
+        "https:",
+        "ftp:",
+    ] {
+        if normalized.contains(scheme) {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGの属性に外部参照・スクリプトURLは使用できません: {attribute}"),
+            ));
+        }
+    }
+    if normalized.contains("//") || value.contains('<') || value.contains('>') {
+        return Err(ValidationError::new(
+            path,
+            format!("SVGの属性に外部参照・マークアップは使用できません: {attribute}"),
+        ));
+    }
+    // `url(...)` is only accepted for an internal fragment such as
+    // `url(#gradient)`, which cannot reach the network or the filesystem.
+    let mut rest = normalized.as_str();
+    while let Some(index) = rest.find("url(") {
+        let after = &rest[index + 4..];
+        let Some(close) = after.find(')') else {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGの属性に不正な url() があります: {attribute}"),
+            ));
+        };
+        let target = after[..close].trim();
+        let Some(id) = target.strip_prefix('#') else {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGの属性に外部を参照する url() は使用できません: {attribute}"),
+            ));
+        };
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+        {
+            return Err(ValidationError::new(
+                path,
+                format!("SVGの属性に不正な url() があります: {attribute}"),
+            ));
+        }
+        rest = &after[close + 1..];
+    }
+    Ok(())
+}
+
+fn svg_dimension(node: roxmltree::Node<'_, '_>, name: &str) -> Option<f64> {
+    let value = node.attribute(name)?;
     value
         .trim()
-        .trim_end_matches("px")
+        .strip_suffix("px")
+        .unwrap_or(value.trim())
         .trim()
         .parse::<f64>()
         .ok()
-}
-
-fn svg_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let lower = tag.to_lowercase();
-    let needle = format!("{name}=");
-    let mut from = 0;
-    while let Some(relative) = lower[from..].find(&needle) {
-        let start = from + relative;
-        let boundary = start == 0
-            || lower[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|ch| ch.is_whitespace());
-        if boundary {
-            let after = &tag[start + needle.len()..];
-            let quote = after.chars().next()?;
-            if quote != '"' && quote != '\'' {
-                return None;
-            }
-            let rest = &after[1..];
-            let end = rest.find(quote)?;
-            return Some(&rest[..end]);
-        }
-        from = start + needle.len();
-    }
-    None
-}
-
-fn has_event_handler(lower: &str) -> bool {
-    let bytes = lower.as_bytes();
-    let mut index = 0;
-    while index + 2 < bytes.len() {
-        if bytes[index] == b'o' && bytes[index + 1] == b'n' {
-            let mut cursor = index + 2;
-            while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
-                cursor += 1;
-            }
-            let mut spaces = cursor;
-            while spaces < bytes.len() && bytes[spaces].is_ascii_whitespace() {
-                spaces += 1;
-            }
-            if cursor > index + 2 && spaces < bytes.len() && bytes[spaces] == b'=' {
-                return true;
-            }
-        }
-        index += 1;
-    }
-    false
-}
-
-fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    if bytes.len() < 24 || &bytes[..8] != SIGNATURE || &bytes[12..16] != b"IHDR" {
-        return None;
-    }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-    Some((width, height))
-}
-
-fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return None;
-    }
-    let mut index = 2;
-    while index + 9 < bytes.len() {
-        if bytes[index] != 0xFF {
-            index += 1;
-            continue;
-        }
-        let marker = bytes[index + 1];
-        if marker == 0xD8 || marker == 0xD9 {
-            index += 2;
-            continue;
-        }
-        let length = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
-        if length < 2 {
-            return None;
-        }
-        if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
-            let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
-            let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32;
-            return Some((width, height));
-        }
-        index += 2 + length;
-    }
-    None
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
@@ -1414,16 +1626,146 @@ mod tests {
         assert!(parsed.fraction);
     }
 
-    #[test]
-    fn images_with_an_excessive_pixel_count_are_rejected() {
+    fn inspect_png(bytes: &[u8]) -> Result<(u32, u32), ValidationError> {
+        inspect_image(bytes, "image/png", "asset")
+    }
+
+    fn encode_png(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        let pixels = vec![128u8; (width * height * 3) as usize];
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&pixels, width, height, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        bytes
+    }
+
+    fn encode_jpeg(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        let pixels = vec![128u8; (width * height * 3) as usize];
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .write_image(&pixels, width, height, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        bytes
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for byte in data {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(12 + data.len());
+        chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        chunk.extend_from_slice(kind);
+        chunk.extend_from_slice(data);
+        let mut crc_input = kind.to_vec();
+        crc_input.extend_from_slice(data);
+        chunk.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        chunk
+    }
+
+    /// A structurally valid PNG header that declares huge dimensions without
+    /// carrying pixel data. The dimension check must run before decoding.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
-        bytes.extend_from_slice(&13u32.to_be_bytes());
-        bytes.extend_from_slice(b"IHDR");
-        bytes.extend_from_slice(&20_000u32.to_be_bytes());
-        bytes.extend_from_slice(&20_000u32.to_be_bytes());
-        bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
-        let error = inspect_image(&bytes, "image/png", "asset").unwrap_err();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+        bytes.extend(png_chunk(b"IHDR", &ihdr));
+        // An empty zlib stream: enough for the header reader to accept the
+        // file structure without allocating the declared pixel buffer.
+        bytes.extend(png_chunk(
+            b"IDAT",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        ));
+        bytes.extend(png_chunk(b"IEND", &[]));
+        bytes
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    #[test]
+    fn images_with_an_excessive_pixel_count_are_rejected_before_decoding() {
+        let bytes = png_header(6_000, 5_000);
+        let error = inspect_png(&bytes).unwrap_err();
         assert!(error.message.contains("画素数"), "{error}");
+    }
+
+    #[test]
+    fn valid_png_and_jpeg_decode_and_report_their_real_size() {
+        assert_eq!(inspect_png(&encode_png(4, 3)).unwrap(), (4, 3));
+        assert_eq!(
+            inspect_image(&encode_jpeg(4, 3), "image/jpeg", "asset").unwrap(),
+            (4, 3)
+        );
+    }
+
+    #[test]
+    fn header_only_and_truncated_png_are_rejected() {
+        let png = encode_png(4, 3);
+        let header_only = png[..24].to_vec();
+        assert!(inspect_png(&header_only).is_err());
+
+        let without_iend = &png[..png.len() - 12];
+        assert!(inspect_png(without_iend).is_err());
+
+        let truncated = &png[..png.len() / 2];
+        assert!(inspect_png(truncated).is_err());
+    }
+
+    #[test]
+    fn corrupt_png_crc_and_chunks_are_rejected() {
+        let png = encode_png(4, 3);
+        let mut bad_crc = png.clone();
+        bad_crc[29] ^= 0xFF; // first byte of the IHDR CRC
+        assert!(inspect_png(&bad_crc).is_err());
+
+        let mut bad_chunk = png.clone();
+        let idat = find_bytes(&bad_chunk, b"IDAT").unwrap();
+        bad_chunk[idat] = b'X';
+        assert!(inspect_png(&bad_chunk).is_err());
+    }
+
+    #[test]
+    fn truncated_or_malformed_jpeg_is_rejected() {
+        let jpeg = encode_jpeg(16, 16);
+        assert!(inspect_image(&jpeg[..jpeg.len() * 2 / 3], "image/jpeg", "asset").is_err());
+        // Removing only the EOI marker still leaves an incomplete file.
+        assert!(inspect_image(&jpeg[..jpeg.len() - 2], "image/jpeg", "asset").is_err());
+
+        let mut bad_segment = jpeg.clone();
+        if bad_segment.len() > 6 && bad_segment[2] == 0xFF {
+            bad_segment[4] = 0;
+            bad_segment[5] = 1;
+        }
+        assert!(inspect_image(&bad_segment, "image/jpeg", "asset").is_err());
+    }
+
+    #[test]
+    fn declared_media_type_must_match_the_bytes() {
+        let png = encode_png(4, 3);
+        let error = inspect_image(&png, "image/jpeg", "asset").unwrap_err();
+        assert!(error.message.contains("一致しません"), "{error}");
+
+        let jpeg = encode_jpeg(4, 3);
+        let error = inspect_image(&jpeg, "image/png", "asset").unwrap_err();
+        assert!(error.message.contains("一致しません"), "{error}");
+
+        assert!(inspect_png(b"not an image").is_err());
     }
 
     #[test]
@@ -1444,22 +1786,77 @@ mod tests {
             r##"<svg width="10" height="10"><script>alert(1)</script></svg>"##,
             r##"<svg width="10" height="10"><image href="https://example.com/a.png"/></svg>"##,
             r##"<svg width="10" height="10"><use href="#x"/></svg>"##,
+            r##"<svg width="10" height="10"><iframe src="https://example.com"/></svg>"##,
+            r##"<svg width="10" height="10"><object data="https://example.com"/></svg>"##,
+            r##"<svg width="10" height="10"><embed src="https://example.com"/></svg>"##,
             r##"<svg width="10" height="10"><rect onload="alert(1)"/></svg>"##,
             r##"<svg width="10" height="10"><rect style="fill:red"/></svg>"##,
+            r##"<svg width="10" height="10"><style>rect{fill:red}</style></svg>"##,
             r##"<svg width="10" height="10"><rect fill="url(http://x)"/></svg>"##,
             r##"<svg width="10" height="10"><foreignObject/></svg>"##,
             r##"<svg width="10" height="10"><animate/></svg>"##,
             r##"<?xml version="1.0"?><!DOCTYPE svg><svg width="10" height="10"/>"##,
+            r##"<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg width="10" height="10"/>"##,
         ] {
             assert!(inspect(svg).is_err(), "should reject: {svg}");
         }
     }
 
     #[test]
+    fn svg_href_obfuscation_cannot_bypass_structural_validation() {
+        for svg in [
+            r##"<svg width="10" height="10"><rect href = "https://example.invalid/a.svg"/></svg>"##,
+            "<svg width=\"10\" height=\"10\"><rect\nhref\n=\n\"https://example.invalid/a.svg\"/></svg>",
+            r##"<svg width="10" height="10"><rect HREF="https://example.invalid/a.svg"/></svg>"##,
+            r##"<svg width="10" height="10" xmlns:xlink="http://www.w3.org/1999/xlink"><rect xlink:href="https://example.invalid/a.svg"/></svg>"##,
+            r##"<svg width="10" height="10"><rect onload = "alert(1)"/></svg>"##,
+            r##"<svg width="10" height="10"><rect ONLOAD = "alert(1)"/></svg>"##,
+            r##"<svg width="10" height="10"><rect fill="java&#115;cript:alert(1)"/></svg>"##,
+            r##"<svg width="10" height="10"><rect fill="url( https://example.invalid/a.svg )"/></svg>"##,
+        ] {
+            assert!(inspect(svg).is_err(), "should reject: {svg}");
+        }
+    }
+
+    #[test]
+    fn svg_rejects_invalid_namespaces_syntax_and_disallowed_attributes() {
+        for svg in [
+            r##"<svg xmlns="http://example.invalid/svg" width="10" height="10"/>"##,
+            r##"<svg width="10" height="10"><rect class="x"/></svg>"##,
+            r##"<svg width="10" height="10"><rect filter="none"/></svg>"##,
+            r##"<svg width="10" height="10"><rect/><g></svg>"##,
+            r##"<html width="10" height="10"/>"##,
+        ] {
+            assert!(inspect(svg).is_err(), "should reject: {svg}");
+        }
+    }
+
+    #[test]
+    fn svg_rejects_excessive_size_and_nesting() {
+        assert!(inspect(&" ".repeat(MAX_SVG_BYTES + 1)).is_err());
+
+        let mut deep = String::from(r##"<svg width="10" height="10">"##);
+        for _ in 0..=MAX_SVG_DEPTH {
+            deep.push_str("<g>");
+        }
+        for _ in 0..=MAX_SVG_DEPTH {
+            deep.push_str("</g>");
+        }
+        deep.push_str("</svg>");
+        let error = inspect(&deep).unwrap_err();
+        assert!(error.message.contains("ネスト"), "{error}");
+    }
+
+    #[test]
     fn svg_allows_only_static_shapes_and_gradients() {
-        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
-          <title>t</title><g fill="#fff"><path d="M0 0L1 1"/><rect width="1" height="1"/>
-          <circle cx="1" cy="1" r="1"/><polygon points="0,0 1,1 0,1"/></g></svg>"##;
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" role="img">
+          <title>t</title><desc>d</desc><g fill="#fff"><path d="M0 0L1 1"/><rect width="1" height="1"/>
+          <circle cx="1" cy="1" r="1"/><ellipse cx="1" cy="1" rx="1" ry="1"/>
+          <polygon points="0,0 1,1 0,1"/><polyline points="0,0 1,1"/><line x1="0" y1="0" x2="1" y2="1"/></g>
+          <defs><linearGradient id="lg"><stop offset="0" stop-color="#fff"/></linearGradient>
+          <radialGradient id="rg"><stop offset="1" stop-color="#000"/></radialGradient>
+          <clipPath id="cp"><rect width="1" height="1"/></clipPath></defs>
+          <rect width="1" height="1" fill="url(#lg)" clip-path="url(#cp)"/></svg>"##;
         assert_eq!(inspect(svg).unwrap(), (10, 10));
     }
 }
