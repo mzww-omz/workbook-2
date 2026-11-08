@@ -8,7 +8,7 @@ mod modal;
 mod ui_logic;
 mod views;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -31,6 +31,9 @@ use workbook_domain::{
 };
 use workbook_import::LegacyPreview;
 use workbook_service::{BookSummary, Snapshot, StudyView, TodaySummary, WorkbookService};
+
+/// Window-space rectangle `(x, y, width, height)` in logical pixels.
+pub(crate) type HotspotImageBounds = (f32, f32, f32, f32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Route {
@@ -101,6 +104,10 @@ pub struct WorkbookApp {
     pub(crate) matching: BTreeMap<String, String>,
     pub(crate) matching_left: Option<String>,
     pub(crate) hotspot_point: Option<(f64, f64)>,
+    /// Last measured bounds of the hotspot image element in window logical
+    /// pixels: `(x, y, width, height)`. Refreshed on every prepaint so clicks
+    /// do not depend on scroll position or window placement.
+    pub(crate) hotspot_image_bounds: Rc<Cell<Option<HotspotImageBounds>>>,
     pub(crate) hotspot_list_open: bool,
     pub(crate) labeling: BTreeMap<String, String>,
     pub(crate) labeling_label: Option<String>,
@@ -189,6 +196,7 @@ impl WorkbookApp {
             labeling: BTreeMap::new(),
             labeling_label: None,
             image_cache: Rc::new(RefCell::new(BTreeMap::new())),
+            hotspot_image_bounds: Rc::new(Cell::new(None)),
             rating_picker_open: false,
             notice: None,
             modal: None,

@@ -10,8 +10,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, Context, FontWeight, Image, ImageFormat, ImageSource, IntoElement, ObjectFit,
-    ParentElement, Render, SharedString, Styled, div, img, px, relative,
+    AnyElement, ClickEvent, Context, FontWeight, Image, ImageFormat, ImageSource, IntoElement,
+    ObjectFit, ParentElement, Render, SharedString, Styled, div, img, px, relative,
 };
 use workbook_domain::{
     Content, GradeStatus, Mode, Phase, Question, QuestionType, Rating, RatingSource, ThemeSetting,
@@ -52,6 +52,53 @@ struct OrderDrag {
 struct LabelDrag {
     id: String,
     label: String,
+}
+
+/// Shared row layout for rich answer options. The content itself is rendered by
+/// the one common content renderer; this only adds selection markers and the
+/// paired item shown in Matching.
+fn rich_option_body(
+    prefix: &str,
+    leading: Option<&str>,
+    content: &Content,
+    trailing: Option<(&str, &Content)>,
+    theme: &gpui_kit::component::Theme,
+) -> AnyElement {
+    let mut row = div().flex().items_center().gap_2().flex_1().min_w(px(0.0));
+    if let Some(leading) = leading {
+        row = row.child(
+            div()
+                .flex_none()
+                .text_size(px(12.0))
+                .text_color(theme.muted_foreground)
+                .child(leading.to_string()),
+        );
+    }
+    row = row.child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(
+        crate::content::render_content_compact(prefix, content, theme),
+    ));
+    if let Some((arrow, trailing_content)) = trailing {
+        row = row
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted_foreground)
+                    .child(arrow.to_string()),
+            )
+            .child(
+                div()
+                    .max_w(relative(0.5))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .child(crate::content::render_content_compact(
+                        &format!("{prefix}-trailing"),
+                        trailing_content,
+                        theme,
+                    )),
+            );
+    }
+    row.into_any_element()
 }
 
 fn format_duration(ms: i64) -> String {
@@ -1935,28 +1982,30 @@ impl WorkbookApp {
 
     fn render_ordering(&self, question: &Question, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let labels: BTreeMap<&str, String> = question
+        let contents: BTreeMap<&str, &Content> = question
             .options
             .as_ref()
             .map(|options| {
                 options
                     .iter()
-                    .map(|option| (option.id.as_str(), option.content.plain_text()))
+                    .map(|option| (option.id.as_str(), &option.content))
                     .collect()
             })
             .unwrap_or_default();
         let mut list = div().flex().flex_col().gap_2();
         for (index, id) in self.ordering.iter().enumerate() {
             let id = id.clone();
-            let label = labels
-                .get(id.as_str())
-                .cloned()
+            let content = contents.get(id.as_str()).copied();
+            let accessible = content
+                .map(Content::plain_text)
                 .unwrap_or_else(|| id.clone());
             let target_index = index;
             let up_id = id.clone();
             let down_id = id.clone();
             let drag_id = id.clone();
-            let drag_label = label.clone();
+            let drag_label = accessible.clone();
+            let up_label = format!("{accessible} を上へ");
+            let down_label = format!("{accessible} を下へ");
             let row = div()
                 .id(SharedString::from(format!("order-row-{id}")))
                 .flex()
@@ -1968,14 +2017,26 @@ impl WorkbookApp {
                 .child(
                     div()
                         .w(px(24.0))
+                        .flex_none()
                         .text_size(px(11.0))
                         .text_color(theme.muted_foreground)
                         .child(format!("{}", index + 1)),
                 )
-                .child(div().flex_1().text_size(px(15.0)).child(label))
+                .child(match content {
+                    Some(content) => {
+                        rich_option_body(&format!("order-{id}"), None, content, None, &theme)
+                    }
+                    None => div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(15.0))
+                        .child(id.clone())
+                        .into_any_element(),
+                })
                 .child(
                     Button::new(format!("order-up-{id}"))
                         .label("↑")
+                        .accessibility_label(up_label)
                         .ghost()
                         .disabled(index == 0)
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -1987,6 +2048,7 @@ impl WorkbookApp {
                 .child(
                     Button::new(format!("order-down-{id}"))
                         .label("↓")
+                        .accessibility_label(down_label)
                         .ghost()
                         .disabled(index + 1 >= self.ordering.len())
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -2050,14 +2112,29 @@ impl WorkbookApp {
                     .right
                     .iter()
                     .find(|candidate| &candidate.id == right)
-                    .map(|candidate| candidate.content.plain_text())
             });
+            let accessible = match assigned {
+                Some(right) => format!(
+                    "{} → {}",
+                    item.content.plain_text(),
+                    right.content.plain_text()
+                ),
+                None => item.content.plain_text(),
+            };
+            let body = rich_option_body(
+                &format!("match-left-body-{}", item.id),
+                Some(if selected { "●" } else { "　" }),
+                &item.content,
+                assigned.map(|right| ("→", &right.content)),
+                &theme,
+            );
             left_list = left_list.child(
                 Button::new(format!("match-left-{}", item.id))
-                    .label(match assigned {
-                        Some(right) => format!("{} → {right}", item.content.plain_text()),
-                        None => item.content.plain_text(),
-                    })
+                    .child(body)
+                    .accessibility_label(accessible)
+                    .h_auto()
+                    .items_start()
+                    .py(px(6.0))
                     .when(selected, |button| button.primary())
                     .when(!selected, |button| button.secondary())
                     .w_full()
@@ -2078,20 +2155,30 @@ impl WorkbookApp {
                 .matching
                 .iter()
                 .find(|(_, right)| **right == item.id)
-                .and_then(|(left, _)| {
-                    matching
-                        .left
-                        .iter()
-                        .find(|candidate| &candidate.id == left)
-                        .map(|candidate| candidate.content.plain_text())
-                });
+                .and_then(|(left, _)| matching.left.iter().find(|candidate| &candidate.id == left));
             let assigned = assigned_left.is_some();
+            let accessible = match assigned_left {
+                Some(left) => format!(
+                    "{} → {}",
+                    left.content.plain_text(),
+                    item.content.plain_text()
+                ),
+                None => item.content.plain_text(),
+            };
+            let body = rich_option_body(
+                &format!("match-right-body-{}", item.id),
+                Some(if assigned { "✓" } else { "　" }),
+                &item.content,
+                assigned_left.map(|left| ("←", &left.content)),
+                &theme,
+            );
             right_list = right_list.child(
                 Button::new(format!("match-right-{}", item.id))
-                    .label(match assigned_left.as_ref() {
-                        Some(left) => format!("{left} → {}", item.content.plain_text()),
-                        None => item.content.plain_text(),
-                    })
+                    .child(body)
+                    .accessibility_label(accessible)
+                    .h_auto()
+                    .items_start()
+                    .py(px(6.0))
                     .when(assigned, |button| button.primary())
                     .when(!assigned, |button| button.secondary())
                     .w_full()
@@ -2152,38 +2239,69 @@ impl WorkbookApp {
             .cloned();
         let mut column = div().flex().flex_col().gap_3();
         if let Some(asset) = asset {
-            let mut image = self.render_question_image(&asset, cx);
-            // Transparent 20x20 hit grid. It records a normalized point near
-            // the click without depending on window/scroll pixel coordinates.
-            const GRID: usize = 20;
-            for row in 0..GRID {
-                for col in 0..GRID {
-                    let x = (col as f64 + 0.5) / GRID as f64;
-                    let y = (row as f64 + 0.5) / GRID as f64;
-                    image = image.child(
-                        div()
-                            .id(SharedString::from(format!("hotspot-cell-{row}-{col}")))
-                            .absolute()
-                            .left(relative(col as f32 / GRID as f32))
-                            .top(relative(row as f32 / GRID as f32))
-                            .w(relative(1.0 / GRID as f32))
-                            .h(relative(1.0 / GRID as f32))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.hotspot_point = Some((x, y));
-                                this.persist_draft(window, cx);
-                                cx.notify();
-                            })),
-                    );
-                }
-            }
-            column = column.child(match self.hotspot_point {
+            let asset_width = asset.width;
+            let asset_height = asset.height;
+            let bounds_slot = self.hotspot_image_bounds.clone();
+            let mut image = self
+                .render_question_image(&asset, cx)
+                .on_children_prepainted(move |children, _, _| {
+                    if let Some(bounds) = children.first() {
+                        bounds_slot.set(Some((
+                            f32::from(bounds.origin.x),
+                            f32::from(bounds.origin.y),
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        )));
+                    }
+                })
+                .id("hotspot-image");
+            image = image.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // Use the real pointer position. GPUI reports it in logical
+                // pixels, so Retina/HiDPI scaling is already applied.
+                let Some(position) = event.mouse_position() else {
+                    return;
+                };
+                let Some((left, top, width, height)) = this.hotspot_image_bounds.get() else {
+                    return;
+                };
+                let Some(point) = crate::ui_logic::normalize_image_point(
+                    f32::from(position.x) - left,
+                    f32::from(position.y) - top,
+                    width,
+                    height,
+                    asset_width,
+                    asset_height,
+                ) else {
+                    // A click in the letterbox margin is not an answer.
+                    return;
+                };
+                this.hotspot_point = Some(point);
+                this.persist_draft(window, cx);
+                cx.notify();
+            }));
+            let marker_position = self.hotspot_point.and_then(|(x, y)| {
+                let (width, height) = self
+                    .hotspot_image_bounds
+                    .get()
+                    .map(|(_, _, width, height)| (width, height))
+                    .unwrap_or_else(|| {
+                        crate::ui_logic::fit_image(asset.width, asset.height, 640.0, 380.0)
+                    });
+                crate::ui_logic::image_point_to_container(
+                    x,
+                    y,
+                    width,
+                    height,
+                    asset.width,
+                    asset.height,
+                )
+            });
+            column = column.child(match marker_position {
                 Some((x, y)) => image.child(
                     div()
                         .absolute()
-                        .left(relative(x as f32))
-                        .top(relative(y as f32))
-                        .ml(px(-7.0))
-                        .mt(px(-7.0))
+                        .left(px(x - 7.0))
+                        .top(px(y - 7.0))
                         .w(px(14.0))
                         .h(px(14.0))
                         .bg(theme.accent),
@@ -2211,12 +2329,14 @@ impl WorkbookApp {
                 div()
                     .text_size(px(11.0))
                     .text_color(theme.muted_foreground)
-                    .child(format!("選択位置: {:.0}% / {:.0}%", x * 100.0, y * 100.0)),
+                    .child(format!("選択位置: {:.1}% / {:.1}%", x * 100.0, y * 100.0)),
             );
         }
         let mut regions = div().flex().flex_wrap().gap_2();
         for region in &hotspot.regions {
-            let point = crate::ui_logic::region_center(&region.shape);
+            let Some(point) = crate::ui_logic::region_center(&region.shape) else {
+                continue;
+            };
             let selected = self
                 .hotspot_point
                 .is_some_and(|(x, y)| region.shape.contains(x, y));
@@ -2270,10 +2390,10 @@ impl WorkbookApp {
             .as_ref()
             .and_then(|view| view.assets.iter().find(|asset| asset.id == labeling.asset))
             .cloned();
-        let label_text: BTreeMap<&str, String> = labeling
+        let label_contents: BTreeMap<&str, &Content> = labeling
             .labels
             .iter()
-            .map(|label| (label.id.as_str(), label.content.plain_text()))
+            .map(|label| (label.id.as_str(), &label.content))
             .collect();
         let mut column = div().flex().flex_col().gap_3();
         if let Some(asset) = asset {
@@ -2282,7 +2402,7 @@ impl WorkbookApp {
                 let assigned = self
                     .labeling
                     .get(&target.id)
-                    .and_then(|label| label_text.get(label.as_str()).cloned());
+                    .and_then(|label| label_contents.get(label.as_str()).copied());
                 let target_id = target.id.clone();
                 let target_id_drop = target.id.clone();
                 let target_button = div()
@@ -2298,6 +2418,7 @@ impl WorkbookApp {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .overflow_hidden()
                     .bg(if assigned.is_some() {
                         theme.accent.opacity(0.35)
                     } else {
@@ -2306,9 +2427,18 @@ impl WorkbookApp {
                     .border_1()
                     .border_color(theme.accent)
                     .text_size(px(12.0))
-                    .child(match assigned.clone() {
-                        Some(text) => text,
-                        None => "＋".to_string(),
+                    .child(match assigned {
+                        Some(content) => div()
+                            .max_w(px(120.0))
+                            .max_h(px(32.0))
+                            .overflow_hidden()
+                            .child(crate::content::render_content_compact(
+                                &format!("label-target-content-{}", target.id),
+                                content,
+                                &theme,
+                            ))
+                            .into_any_element(),
+                        None => div().text_size(px(12.0)).child("＋").into_any_element(),
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(label) = this.labeling_label.take() {
@@ -2351,6 +2481,13 @@ impl WorkbookApp {
             let text = label.content.plain_text();
             let selected = self.labeling_label.as_deref() == Some(label.id.as_str());
             let used = self.labeling.values().any(|value| value == &label.id);
+            let body = rich_option_body(
+                &format!("label-body-{}", label.id),
+                Some(if used { "✓" } else { "　" }),
+                &label.content,
+                None,
+                &theme,
+            );
             chips = chips.child(
                 div()
                     .id(SharedString::from(format!("label-drag-{}", label.id)))
@@ -2366,11 +2503,12 @@ impl WorkbookApp {
                     )
                     .child(
                         Button::new(format!("label-{}", label.id))
-                            .label(if used {
-                                format!("✓ {text}")
-                            } else {
-                                text.clone()
-                            })
+                            .child(body)
+                            .accessibility_label(text)
+                            .h_auto()
+                            .items_start()
+                            .py(px(6.0))
+                            .max_w(relative(0.48))
                             .when(selected, |button| button.primary())
                             .when(!selected, |button| button.secondary())
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2385,24 +2523,53 @@ impl WorkbookApp {
                     ),
             );
         }
-        let targets: Vec<(String, String)> = labeling
-            .targets
-            .iter()
-            .map(|target| {
-                let assigned = self
-                    .labeling
-                    .get(&target.id)
-                    .and_then(|label| label_text.get(label.as_str()))
-                    .cloned()
-                    .unwrap_or_else(|| "未配置".to_string());
-                (target.id.clone(), format!("{}: {assigned}", target.alt))
-            })
-            .collect();
         let mut target_buttons = div().flex().flex_wrap().gap_1();
-        for (target_id, line) in targets {
+        for target in &labeling.targets {
+            let target_id = target.id.clone();
+            let assigned = self
+                .labeling
+                .get(&target.id)
+                .and_then(|label| label_contents.get(label.as_str()).copied());
+            let accessible = match assigned {
+                Some(content) => format!("{}: {}", target.alt, content.plain_text()),
+                None => format!("{}: 未配置", target.alt),
+            };
+            let body = div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(12.0))
+                        .child(format!("{}: ", target.alt)),
+                )
+                .child(match assigned {
+                    Some(content) => div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(crate::content::render_content_compact(
+                            &format!("label-target-alt-content-{}", target.id),
+                            content,
+                            &theme,
+                        ))
+                        .into_any_element(),
+                    None => div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child("未配置")
+                        .into_any_element(),
+                })
+                .into_any_element();
             target_buttons = target_buttons.child(
                 Button::new(SharedString::from(format!("label-target-alt-{target_id}")))
-                    .label(line)
+                    .child(body)
+                    .accessibility_label(accessible)
+                    .h_auto()
+                    .items_start()
+                    .py(px(6.0))
                     .secondary()
                     .w(relative(0.48))
                     .on_click(cx.listener(move |this, _, window, cx| {

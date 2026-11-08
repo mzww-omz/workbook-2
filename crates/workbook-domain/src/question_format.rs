@@ -549,8 +549,14 @@ pub fn normalize_unit(value: &str) -> String {
 
 use unicode_normalization::UnicodeNormalization;
 
-/// Global conversion table used only for diagnostics. A workbook must opt in
-/// to a unit through `acceptedUnits` before it counts as correct.
+/// Global conversion table into a shared base unit per dimension. It is used
+/// only for diagnostics and for comparing an equivalent unit the workbook did
+/// not explicitly accept. A workbook must opt in to a unit through
+/// `acceptedUnits` before an answer using that unit can count as correct.
+///
+/// The factor converts the unit into the dimension's base unit (`cm` → m,
+/// `mA` → A). `acceptedUnits` factors are relative to the expected unit, so
+/// grading combines them with the expected unit's base factor.
 pub fn known_unit(unit: &str) -> Option<(&'static str, f64)> {
     Some(match normalize_unit(unit).as_str() {
         "m" => ("length", 1.0),
@@ -735,27 +741,34 @@ fn parse_rational(value: &str) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-fn count_significant_figures(digits: &str) -> u32 {
-    let mut cleaned = String::new();
-    for ch in digits.chars() {
-        if ch.is_ascii_digit() {
-            cleaned.push(ch);
-        }
-    }
-    let first_non_zero = cleaned.find(|ch| ch != '0');
+/// Counts significant figures from the mantissa only.
+///
+/// Rules:
+/// - The exponent (`e`/`E` and everything after it) never contributes digits.
+/// - A leading sign never contributes.
+/// - Leading zeros are not significant.
+/// - Trailing zeros written after a decimal point are significant.
+/// - Integer trailing zeros are counted as written (`300` → 3). Use exponent
+///   notation (`3e2` → 1) when the trailing zeros are placeholders.
+/// - An all-zero mantissa keeps the zeros written after the decimal point:
+///   `0` and `0.0` → 1, `0.00` → 2.
+fn count_significant_figures(literal: &str) -> u32 {
+    let mantissa = literal
+        .split(['e', 'E'])
+        .next()
+        .unwrap_or(literal)
+        .trim()
+        .trim_start_matches(['+', '-']);
+    let digits: String = mantissa.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let first_non_zero = digits.find(|ch| ch != '0');
     match first_non_zero {
-        Some(index) => (cleaned.len() - index) as u32,
+        Some(index) => (digits.len() - index) as u32,
         None => {
-            if digits.contains('.') {
-                digits
-                    .chars()
-                    .rev()
-                    .take_while(|ch| *ch == '0')
-                    .count()
-                    .max(1) as u32
-            } else {
-                1
-            }
+            let decimals = mantissa
+                .split_once('.')
+                .map(|(_, fraction)| fraction.chars().filter(|ch| ch.is_ascii_digit()).count())
+                .unwrap_or(0);
+            decimals.max(1) as u32
         }
     }
 }
@@ -1185,6 +1198,61 @@ mod tests {
 
     fn inspect(svg: &str) -> Result<(u32, u32), ValidationError> {
         inspect_image(svg.as_bytes(), "image/svg+xml", "asset")
+    }
+
+    #[test]
+    fn significant_figures_exclude_the_exponent_and_sign() {
+        for (text, expected) in [
+            ("3", 1),
+            ("3.0", 2),
+            ("3.00", 3),
+            ("0.0030", 2),
+            ("3e2", 1),
+            ("3.0e2", 2),
+            ("3.00e-2", 3),
+            ("+3.0E+2", 2),
+            ("-0.0030", 2),
+        ] {
+            assert_eq!(
+                parse_numeric_answer(text).unwrap().significant_figures,
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn significant_figures_define_zero_and_trailing_zero_rules() {
+        // All-zero mantissas keep the zeros written after the decimal point.
+        assert_eq!(parse_numeric_answer("0").unwrap().significant_figures, 1);
+        assert_eq!(parse_numeric_answer("0.0").unwrap().significant_figures, 1);
+        assert_eq!(parse_numeric_answer("0.00").unwrap().significant_figures, 2);
+        // Integer trailing zeros are counted as written; use exponent notation
+        // when a value such as 300 should be one significant figure.
+        assert_eq!(parse_numeric_answer("100").unwrap().significant_figures, 3);
+        assert_eq!(parse_numeric_answer("1e2").unwrap().significant_figures, 1);
+        // Fractions keep the more precise side, as before.
+        assert_eq!(parse_numeric_answer("3/2").unwrap().significant_figures, 1);
+        assert_eq!(
+            parse_numeric_answer("3.0/2.00")
+                .unwrap()
+                .significant_figures,
+            3
+        );
+    }
+
+    #[test]
+    fn exponent_notation_normalizes_value_and_unit() {
+        let parsed = parse_numeric_answer("3.00e-2m").unwrap();
+        assert!((parsed.value - 0.03).abs() < 1e-12);
+        assert_eq!(parsed.significant_figures, 3);
+        assert_eq!(parsed.unit.as_deref(), Some("m"));
+        assert!(!parsed.fraction);
+
+        let parsed = parse_numeric_answer("1e2/2e1").unwrap();
+        assert!((parsed.value - 5.0).abs() < 1e-12);
+        assert_eq!(parsed.significant_figures, 1);
+        assert!(parsed.fraction);
     }
 
     #[test]

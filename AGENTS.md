@@ -57,6 +57,8 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 - Keep GPUI dependencies pinned; do not mix crate versions. See `vendor/` and `docs/DECISIONS.md`.
 - Do not add decorative cards, gradients, glows, or motion. Keep the sidebar hidden during Study.
 - Do not show scheduler internals during Study. Feedback must use text as well as color.
+- Hotspot answers use the real pointer position normalized to the drawn image area. Do not reintroduce a fixed click grid; keep the coordinate math in `workbook-ui/src/ui_logic.rs` and tested.
+- Ordering, Matching, and Labeling options must render `Content` through the shared `content.rs` renderer. Do not flatten them to `plain_text()` or add per-format content renderers.
 - Do not bind rating digits while a text input is focused; keep IME input usable.
 - Do not fabricate screenshots or claim VoiceOver, IME, Windows, or Linux verification without an actual run.
 - Screenshots live in `docs/screenshots/`; regenerate with `./scripts/capture-screenshots.sh`.

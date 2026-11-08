@@ -306,14 +306,24 @@ fn grade_numeric(question: &Question, answer: Option<&Answer>) -> GradeResult {
         .iter()
         .map(|(unit, factor)| (normalize_unit(unit), *factor))
         .collect();
-    let tolerance = spec.tolerance.unwrap_or_else(|| {
+    let raw_tolerance = spec.tolerance.unwrap_or_else(|| {
         let scale = expected.abs().max(1.0);
         scale * 1e-9
     });
 
-    // Convert the learner's value into the canonical unit before comparing.
-    let mut converted = parsed.value;
+    // `known_unit` gives a factor into the shared base unit of a dimension
+    // (m, kg, s, A, ...). `acceptedUnits` is authored relative to the expected
+    // unit, so an accepted value is first converted into the expected unit and
+    // then into the base unit. When the expected unit is unknown there is no
+    // shared base, so the comparison stays in expected-unit space.
+    let expected_known = expected_unit.as_deref().and_then(known_unit);
+    let base_factor = expected_known.map(|(_, factor)| factor);
+    let space_factor = base_factor.unwrap_or(1.0);
+    let mut expected_compare = expected * space_factor;
+    let mut tolerance = raw_tolerance * space_factor;
+    let mut converted = parsed.value * space_factor;
     let mut unit_issue: Option<NearMissReason> = None;
+
     match expected_unit.as_deref() {
         Some(expected_unit) => match input_unit.as_deref() {
             None => {
@@ -324,43 +334,54 @@ fn grade_numeric(question: &Question, answer: Option<&Answer>) -> GradeResult {
             Some(unit) if unit == expected_unit => {}
             Some(unit) => {
                 if let Some(factor) = accepted_units.get(unit).copied() {
-                    converted = parsed.value * factor;
-                } else if let Some((expected_dimension, _)) = known_unit(expected_unit)
-                    && let Some((input_dimension, factor)) = known_unit(unit)
+                    // The factor maps the accepted unit onto the expected unit.
+                    converted = parsed.value * factor * space_factor;
+                } else if let Some((expected_dimension, _)) = expected_known
+                    && let Some((input_dimension, input_factor)) = known_unit(unit)
                     && expected_dimension == input_dimension
                 {
-                    converted = parsed.value * factor;
+                    converted = parsed.value * input_factor;
                     unit_issue = Some(NearMissReason::EquivalentExpression);
                 } else {
+                    // Different dimensions or an unknown unit: the number can
+                    // still be "near" when it matches the expected number, but
+                    // the units are not physically comparable.
+                    expected_compare = expected;
+                    tolerance = raw_tolerance;
+                    converted = parsed.value;
                     unit_issue = Some(NearMissReason::WrongUnit);
                 }
             }
         },
         None => {
-            if input_unit.is_some() {
-                unit_issue = Some(NearMissReason::WrongUnit);
+            if let Some(unit) = input_unit.as_deref() {
+                if let Some(factor) = accepted_units.get(unit).copied() {
+                    converted = parsed.value * factor;
+                } else {
+                    expected_compare = expected;
+                    tolerance = raw_tolerance;
+                    converted = parsed.value;
+                    unit_issue = Some(NearMissReason::WrongUnit);
+                }
             }
         }
     }
 
-    let numeric_matches = (converted - expected).abs() <= tolerance;
+    // The explicit tolerance is in expected-unit terms. Normalizing it with the
+    // same factor as the values keeps e.g. a 0.01 cm tolerance meaningful when
+    // the learner answers in metres. A small relative epsilon absorbs binary
+    // floating-point noise in the conversion itself.
+    let epsilon = expected_compare.abs().max(1.0) * 1e-12;
+    let numeric_matches = (converted - expected_compare).abs() <= tolerance + epsilon;
     if !numeric_matches {
         return GradeResult::incorrect();
     }
 
     if let Some(reason) = unit_issue {
         // A missing/wrong unit can still be "near" when the number itself is
-        // right; that is exactly the assisted-grading case.
-        let reason = match reason {
-            NearMissReason::WrongUnit => {
-                if spec.require_unit {
-                    NearMissReason::WrongUnit
-                } else {
-                    NearMissReason::EquivalentExpression
-                }
-            }
-            other => other,
-        };
+        // right; that is exactly the assisted-grading case. `requireUnit` only
+        // decides whether a missing unit is acceptable, not whether a unit of
+        // the wrong dimension is equivalent.
         return GradeResult::near_miss(reason);
     }
 
@@ -489,16 +510,19 @@ fn grade_hotspot(question: &Question, answer: Option<&Answer>) -> GradeResult {
         return GradeResult::near_miss(NearMissReason::FormatError);
     }
     let accepted: BTreeSet<&str> = spec.region_ids.iter().map(String::as_str).collect();
-    for region in &hotspot.regions {
-        if region.shape.contains(*x, *y) {
-            return if accepted.contains(region.id.as_str()) {
-                GradeResult::correct()
-            } else {
-                GradeResult::incorrect()
-            };
-        }
+    // Regions may overlap. Grading only looks at the point, not at array order,
+    // so a click inside any accepted region is correct even when an earlier
+    // non-accepted region also contains it. A point that only lands in
+    // non-accepted regions (or in no region) stays incorrect.
+    if hotspot
+        .regions
+        .iter()
+        .any(|region| region.shape.contains(*x, *y) && accepted.contains(region.id.as_str()))
+    {
+        GradeResult::correct()
+    } else {
+        GradeResult::incorrect()
     }
-    GradeResult::incorrect()
 }
 
 fn grade_labeling(question: &Question, answer: Option<&Answer>) -> GradeResult {
@@ -594,6 +618,94 @@ mod tests {
         assert_eq!(result.status, GradeStatus::NearMiss);
         assert_eq!(result.reasons, vec![NearMissReason::SignificantFigures]);
         assert_eq!(numeric(q, "3.0m").status, GradeStatus::Correct);
+    }
+
+    #[test]
+    fn numeric_converts_both_units_to_a_common_base() {
+        let q = r#"{"id":"q","revision":1,"type":"numeric","prompt":"長さ","explanation":"e",
+            "answer":{"value":3,"unit":"cm","requireUnit":true}}"#;
+        assert_eq!(numeric(q, "3cm").status, GradeStatus::Correct);
+        assert_eq!(numeric(q, "3m").status, GradeStatus::Incorrect);
+
+        let equivalent = numeric(q, "0.03m");
+        assert_eq!(equivalent.status, GradeStatus::NearMiss);
+        assert_eq!(
+            equivalent.reasons,
+            vec![NearMissReason::EquivalentExpression]
+        );
+        let millimetres = numeric(q, "30mm");
+        assert_eq!(millimetres.status, GradeStatus::NearMiss);
+        assert_eq!(
+            millimetres.reasons,
+            vec![NearMissReason::EquivalentExpression]
+        );
+
+        let mass = numeric(q, "3kg");
+        assert_ne!(mass.status, GradeStatus::Correct);
+        assert_eq!(mass.reasons, vec![NearMissReason::WrongUnit]);
+    }
+
+    #[test]
+    fn numeric_conversion_works_in_the_reverse_direction() {
+        let q = r#"{"id":"q","revision":1,"type":"numeric","prompt":"長さ","explanation":"e",
+            "answer":{"value":0.03,"unit":"m","requireUnit":true}}"#;
+        assert_eq!(numeric(q, "0.03m").status, GradeStatus::Correct);
+        let centimetres = numeric(q, "3cm");
+        assert_eq!(centimetres.status, GradeStatus::NearMiss);
+        assert_eq!(
+            centimetres.reasons,
+            vec![NearMissReason::EquivalentExpression]
+        );
+        let kilometres = numeric(q, "0.00003km");
+        assert_eq!(kilometres.status, GradeStatus::NearMiss);
+        assert_eq!(
+            kilometres.reasons,
+            vec![NearMissReason::EquivalentExpression]
+        );
+
+        let current = r#"{"id":"q","revision":1,"type":"numeric","prompt":"電流","explanation":"e",
+            "answer":{"value":3000,"unit":"mA","acceptedUnits":{"A":1000},"requireUnit":true}}"#;
+        assert_eq!(numeric(current, "3A").status, GradeStatus::Correct);
+        let without_opt_in = r#"{"id":"q","revision":1,"type":"numeric","prompt":"電流","explanation":"e",
+            "answer":{"value":3000,"unit":"mA","requireUnit":true}}"#;
+        let result = numeric(without_opt_in, "3A");
+        assert_eq!(result.status, GradeStatus::NearMiss);
+        assert_eq!(result.reasons, vec![NearMissReason::EquivalentExpression]);
+    }
+
+    #[test]
+    fn numeric_tolerance_is_compared_in_the_base_unit() {
+        let q = r#"{"id":"q","revision":1,"type":"numeric","prompt":"長さ","explanation":"e",
+            "answer":{"value":3,"unit":"cm","tolerance":0.01,"requireUnit":true}}"#;
+        let within = numeric(q, "0.0301m");
+        assert_eq!(within.status, GradeStatus::NearMiss);
+        assert_eq!(within.reasons, vec![NearMissReason::EquivalentExpression]);
+        assert_eq!(numeric(q, "0.0302m").status, GradeStatus::Incorrect);
+    }
+
+    #[test]
+    fn numeric_significant_figures_ignore_the_exponent() {
+        let q = r#"{"id":"q","revision":1,"type":"numeric","prompt":"値","explanation":"e",
+            "answer":{"value":300,"unit":"m","significantFigures":1,"requireUnit":true}}"#;
+        assert_eq!(numeric(q, "3e2m").status, GradeStatus::Correct);
+        let three_digits = numeric(q, "3.0e2m");
+        assert_eq!(three_digits.status, GradeStatus::NearMiss);
+        assert_eq!(
+            three_digits.reasons,
+            vec![NearMissReason::SignificantFigures]
+        );
+        assert_eq!(numeric(q, "4e2m").status, GradeStatus::Incorrect);
+    }
+
+    #[test]
+    fn numeric_wrong_dimension_is_never_equivalent_without_require_unit() {
+        let q = r#"{"id":"q","revision":1,"type":"numeric","prompt":"電流","explanation":"e",
+            "answer":{"value":3,"unit":"A"}}"#;
+        let result = numeric(q, "3V");
+        assert_eq!(result.status, GradeStatus::NearMiss);
+        assert_eq!(result.reasons, vec![NearMissReason::WrongUnit]);
+        // Omitting the unit is fine when the workbook does not require one.
+        assert_eq!(numeric(q, "3").status, GradeStatus::Correct);
     }
 
     #[test]
@@ -798,6 +910,43 @@ mod tests {
             let result = grade_answer_detailed(&question, Some(&Answer::Hotspot { x, y })).unwrap();
             assert_eq!(result.status, expected, "{x},{y}");
         }
+    }
+
+    #[test]
+    fn hotspot_overlapping_regions_are_order_independent() {
+        let cases = [
+            r#"[
+              {"id":"wrong","alt":"誤","shape":{"type":"rect","x":0.2,"y":0.2,"w":0.5,"h":0.5}},
+              {"id":"right","alt":"正","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}}]"#,
+            r#"[
+              {"id":"right","alt":"正","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}},
+              {"id":"wrong","alt":"誤","shape":{"type":"rect","x":0.2,"y":0.2,"w":0.5,"h":0.5}}]"#,
+        ];
+        for regions in cases {
+            let q = format!(
+                r#"{{"id":"q","revision":1,"type":"hotspot","prompt":"図","explanation":"e",
+                "hotspot":{{"asset":"map","regions":{regions}}},
+                "answer":{{"regionIds":["right"]}}}}"#
+            );
+            let question = question(&q);
+            let result =
+                grade_answer_detailed(&question, Some(&Answer::Hotspot { x: 0.5, y: 0.5 }))
+                    .unwrap();
+            assert_eq!(result.status, GradeStatus::Correct, "{regions}");
+        }
+    }
+
+    #[test]
+    fn hotspot_clicking_only_non_accepted_overlapping_region_is_incorrect() {
+        let q = r#"{"id":"q","revision":1,"type":"hotspot","prompt":"図","explanation":"e",
+            "hotspot":{"asset":"map","regions":[
+              {"id":"right","alt":"正","shape":{"type":"rect","x":0.2,"y":0.2,"w":0.2,"h":0.2}},
+              {"id":"wrong","alt":"誤","shape":{"type":"circle","cx":0.7,"cy":0.7,"r":0.1}}]},
+            "answer":{"regionIds":["right"]}}"#;
+        let question = question(q);
+        let result =
+            grade_answer_detailed(&question, Some(&Answer::Hotspot { x: 0.7, y: 0.7 })).unwrap();
+        assert_eq!(result.status, GradeStatus::Incorrect);
     }
 
     #[test]

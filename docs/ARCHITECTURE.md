@@ -90,6 +90,18 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
 - Learn Ahead は same learning day のときだけ
 - 3:55に4:05の期限が来る短期カードは前倒ししない
 
+## UI の入力座標とコンテンツ描画
+
+- Hotspot は画像要素の実測 bounds と GPUI の `ClickEvent` 位置（論理ピクセル）から、
+  `contain` 表示のレターボックスを考慮して 0〜1 に正規化する。20×20 などの固定
+  グリッドは使わない。保存形式は従来どおり `Answer::Hotspot { x, y }`。
+- 座標変換、多角形の代表点、並べ替え、割当ては `workbook-ui/src/ui_logic.rs` の
+  純粋関数に置き、ディスプレイなしで単体テストする。
+- Ordering / Matching / Labeling の選択肢は `workbook-ui/src/content.rs` の共通
+  レンダラーを使い、Text / Markdown / Image / Math / Code を ID ベースの回答形式を
+  変えずに表示する。問題形式ごとの専用レンダラーは作らない。
+- UI は採点しない。採点と Near Miss の判定は `workbook-domain::grading` が持つ。
+
 ## SQLite
 
 `application_id = 1463962418`（`"WBK2"`）、`user_version = 3`。
