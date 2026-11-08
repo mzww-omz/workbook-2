@@ -29,6 +29,69 @@ fn daily_backups_keep_seven_generations_and_private_permissions() {
     storage.close().unwrap();
 }
 
+fn v1_schema_sql() -> String {
+    workbook_storage::schema::SCHEMA_SQL
+        .replace("  rating_source TEXT NOT NULL DEFAULT 'manual',\n", "")
+}
+
+fn create_v1_database(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection.execute_batch(&v1_schema_sql()).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA application_id=1463962418; PRAGMA user_version=1;
+             INSERT INTO meta(key,value) VALUES('app','workbook-2');",
+        )
+        .unwrap();
+}
+
+fn schema_version_and_rating_source(path: &std::path::Path) -> (i64, i64) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('attempts') WHERE name='rating_source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (version, column)
+}
+
+#[test]
+fn version_one_database_migrates_in_place_with_a_safety_backup() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    create_v1_database(&path);
+    let storage = Storage::open(dir.path()).unwrap();
+    drop(storage);
+    let (version, column) = schema_version_and_rating_source(&path);
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    assert_eq!(column, 1);
+    let backups: Vec<_> = std::fs::read_dir(dir.path().join("backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("pre-migration-v1-"))
+        .collect();
+    assert_eq!(backups.len(), 1);
+}
+
+#[test]
+fn version_one_backup_can_be_restored_and_is_upgraded() {
+    let source = tempdir().unwrap();
+    let old = source.path().join("old.sqlite");
+    create_v1_database(&old);
+    let dir = tempdir().unwrap();
+    let mut storage = Storage::open(dir.path()).unwrap();
+    storage.restore_from(&old).unwrap();
+    drop(storage);
+    let (version, column) = schema_version_and_rating_source(&dir.path().join("workbook.sqlite"));
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    assert_eq!(column, 1);
+}
+
 #[test]
 fn next_due_at_only_returns_future_deadlines() {
     let dir = tempdir().unwrap();
@@ -58,16 +121,9 @@ fn next_due_at_only_returns_future_deadlines() {
             view.revision,
         )
         .unwrap();
-    let committed = service
-        .commit_rating(
-            &evaluated.session_id,
-            &uuid::Uuid::new_v4().to_string(),
-            workbook_domain::Rating::Good,
-            evaluated.revision,
-        )
-        .unwrap();
+    assert!(evaluated.feedback.as_ref().unwrap().committed);
     service
-        .finish(&committed.session_id, committed.revision)
+        .finish(&evaluated.session_id, evaluated.revision)
         .unwrap();
     let next = service.next_wake_at().unwrap().expect("future due");
     assert!(next > clock.now());

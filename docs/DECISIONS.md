@@ -95,3 +95,14 @@
 - 4時境界でリセット
 - Newセッション開始時に残り枠を `new_limit - introduced_today` で計算
 - 残り0ならセッションを開始しない
+
+## 13. 自動評価
+
+- `workbook-domain::automatic_rating` を純粋関数として置き、時刻・UI・DBに依存させない
+- 不正解 / わからない → Again、ヒント使用後の正解 → Hard、ヒントなし正解 → Good
+- Easy は自動判定しない。回答時間や初回正解を根拠にしない
+- フラッシュカードは主観評価のため手動フォールバック。ただし「わからない」は Again
+- 自動評価ONでは `EvaluateAnswer` 内で評価と確定を同一トランザクションにする
+- 自動評価OFFでは従来の `CommitRating` を残す
+- 訂正は既存の `CorrectAttempt` を使い、Attemptを増やさず `rating_source=manual` にする
+- `attempts.rating_source` で automatic / manual を識別する

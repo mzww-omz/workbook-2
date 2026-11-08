@@ -82,12 +82,7 @@ fn main() -> anyhow::Result<()> {
                             false,
                             prepared.revision,
                         )?;
-                        view = service.commit_rating(
-                            &pending.session_id,
-                            &uuid::Uuid::new_v4().to_string(),
-                            Rating::Good,
-                            pending.revision,
-                        )?;
+                        view = ensure_committed(&service, pending, Rating::Good)?;
                     }
                     Phase::Feedback => {
                         view = service.next(&view.session_id, view.revision)?;
@@ -123,12 +118,7 @@ fn seed_upcoming(service: &WorkbookService) -> anyhow::Result<()> {
         false,
         view.revision,
     )?;
-    let committed = service.commit_rating(
-        &pending.session_id,
-        &uuid::Uuid::new_v4().to_string(),
-        Rating::Again,
-        pending.revision,
-    )?;
+    let committed = ensure_committed(service, pending, Rating::Again)?;
     service.finish(&committed.session_id, committed.revision)?;
     Ok(())
 }
@@ -152,12 +142,7 @@ fn finish_new_session(service: &WorkbookService, book_id: &str) -> anyhow::Resul
                     false,
                     prepared.revision,
                 )?;
-                view = service.commit_rating(
-                    &pending.session_id,
-                    &uuid::Uuid::new_v4().to_string(),
-                    Rating::Good,
-                    pending.revision,
-                )?;
+                view = ensure_committed(service, pending, Rating::Good)?;
             }
             Phase::Feedback => {
                 view = service.next(&view.session_id, view.revision)?;
@@ -184,6 +169,27 @@ fn wait_for_question(service: &WorkbookService, mut view: StudyView) -> anyhow::
         anyhow::bail!("expected question, got {:?}", view.phase);
     }
     Ok(view)
+}
+
+fn ensure_committed(
+    service: &WorkbookService,
+    view: StudyView,
+    rating: Rating,
+) -> anyhow::Result<StudyView> {
+    if view
+        .feedback
+        .as_ref()
+        .is_some_and(|feedback| feedback.committed)
+    {
+        Ok(view)
+    } else {
+        Ok(service.commit_rating(
+            &view.session_id,
+            &uuid::Uuid::new_v4().to_string(),
+            rating,
+            view.revision,
+        )?)
+    }
 }
 
 fn prepare_answer(service: &WorkbookService, view: &StudyView) -> anyhow::Result<StudyView> {

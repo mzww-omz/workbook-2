@@ -22,14 +22,17 @@ macOS / Apple Silicon first. Rust + GPUI + SQLite. Offline only, no WebView, no 
 - History: 異なる問題数 / 総回答 / 短期再学習 / 初回正答率 / スキップ / 学習時間
 - Settings: retention、新規上限、テーマ、タイムゾーン、バックアップ、復元、旧DB移行、整合性、履歴リセット
 - FSRS-7 automatic scheduling、Learn Ahead 20分、午前4日境界
+- 回答の正誤からFSRS評価を自動決定（既定ON）。Easyは自動判定せず、手動訂正を残す
+- 自動採点できない問題は手動評価へフォールバック
 - 新規は既定10問/日。Skip・Practice・未確定評価はカウントしない
 
 ## Constraints
 
 - SQLite が唯一の永続状態
 - 既存 Electron アプリとデータディレクトリを共有しない
-- 回答評価のユーザー操作を自動省略しない
+- 通常の学習では4つの評価ボタンを必須にしない。自動評価の結果は控えめに表示し、必要なときだけ訂正できる
 - Easyを自動判定しない
+- 自動採点できない問題で誤った評価を確定しない
 - 外部画像は取得しない
 - v1はJSON教材の読み込みに限定し、内蔵エディタは後続
 - Windows/Linuxは将来対応。v1で対応済みと表現しない

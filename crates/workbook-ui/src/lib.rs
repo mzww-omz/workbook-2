@@ -24,6 +24,7 @@ use gpui_kit::{
 };
 use workbook_domain::{
     Answer, Mode, Phase, Question, QuestionType, Rating, Settings, ThemeSetting, Workbook,
+    answer_is_blank,
 };
 use workbook_import::LegacyPreview;
 use workbook_service::{BookSummary, Snapshot, StudyView, TodaySummary, WorkbookService};
@@ -92,6 +93,7 @@ pub struct WorkbookApp {
     pub(crate) multiple_choice: BTreeSet<String>,
     pub(crate) true_false: Option<bool>,
     pub(crate) self_correct: Option<bool>,
+    pub(crate) rating_picker_open: bool,
     pub(crate) notice: Option<Notice>,
     pub(crate) modal: Option<Modal>,
     pub(crate) settings_retention: Entity<InputState>,
@@ -164,6 +166,7 @@ impl WorkbookApp {
             multiple_choice: BTreeSet::new(),
             true_false: None,
             self_correct: None,
+            rating_picker_open: false,
             notice: None,
             modal: None,
             settings_retention,
@@ -497,14 +500,17 @@ impl WorkbookApp {
                     .as_ref()
                     .is_some_and(|feedback| !feedback.committed)
                 {
-                    self.rate_question(
-                        view.feedback
-                            .as_ref()
-                            .map(|feedback| feedback.suggested_rating)
-                            .unwrap_or(Rating::Good),
-                        window,
-                        cx,
-                    );
+                    let Some(suggested) = view
+                        .feedback
+                        .as_ref()
+                        .and_then(|feedback| feedback.suggested_rating)
+                    else {
+                        self.rating_picker_open = true;
+                        self.notice_info("この問題は自動評価できません。評価を選んでください");
+                        cx.notify();
+                        return;
+                    };
+                    self.rate_question(suggested, window, cx);
                 } else {
                     self.next_question(window, cx);
                 }
@@ -539,6 +545,11 @@ impl WorkbookApp {
                     cx.notify();
                     return;
                 }
+                if answer_is_blank(answer.as_ref()) {
+                    self.notice_info("回答を入力してください");
+                    cx.notify();
+                    return;
+                }
                 self.evaluate(view, answer, None, false, window, cx);
             }
             Phase::WorkbookResult | Phase::OverallResult => {}
@@ -563,7 +574,11 @@ impl WorkbookApp {
             view.revision,
         ) {
             Ok(updated) => {
+                self.rating_picker_open = updated.feedback.as_ref().is_some_and(|feedback| {
+                    !feedback.committed && feedback.suggested_rating.is_none()
+                });
                 self.study = Some(updated);
+                self.refresh(cx);
                 window.focus(&self.root_focus, cx);
                 cx.notify();
             }
@@ -582,6 +597,11 @@ impl WorkbookApp {
             return;
         }
         self.evaluate(view, None, None, true, window, cx);
+    }
+
+    pub(crate) fn toggle_rating_picker(&mut self, cx: &mut Context<Self>) {
+        self.rating_picker_open = !self.rating_picker_open;
+        cx.notify();
     }
 
     pub(crate) fn rate_question(
@@ -617,6 +637,7 @@ impl WorkbookApp {
         };
         match result {
             Ok(updated) => {
+                self.rating_picker_open = false;
                 self.study = Some(updated);
                 self.refresh(cx);
                 window.focus(&self.root_focus, cx);
@@ -741,6 +762,7 @@ impl WorkbookApp {
         self.multiple_choice.clear();
         self.true_false = None;
         self.self_correct = None;
+        self.rating_picker_open = false;
         self.answer_subscriptions.clear();
         self.answer_subscriptions.push(cx.subscribe_in(
             &self.short_input.clone(),
@@ -940,10 +962,13 @@ impl WorkbookApp {
                 "4" => Some(Rating::Easy),
                 _ => None,
             }
-            && self
-                .study
-                .as_ref()
-                .is_some_and(|view| view.phase == Phase::Feedback)
+            && self.study.as_ref().is_some_and(|view| {
+                view.phase == Phase::Feedback
+                    && view
+                        .feedback
+                        .as_ref()
+                        .is_some_and(|feedback| !feedback.committed || self.rating_picker_open)
+            })
         {
             self.rate_question(rating, window, cx);
         }
@@ -1064,6 +1089,26 @@ impl WorkbookApp {
             Ok(()) => {
                 self.refresh(cx);
                 self.apply_theme(window, cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn set_automatic_rating(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let mut settings = self.snapshot.settings.clone();
+        settings.automatic_rating = enabled;
+        match self.service.update_settings(settings) {
+            Ok(()) => {
+                self.refresh(cx);
+                self.notice_success(if enabled {
+                    "自動評価を有効にしました"
+                } else {
+                    "自動評価を無効にしました"
+                });
                 cx.notify();
             }
             Err(error) => {

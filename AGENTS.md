@@ -37,6 +37,8 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 
 - Commit FSRS state, Attempt, Session, item status, note introduction, and sibling bury in one transaction.
 - Corrections update the current Attempt; never append a new Attempt.
+- Automatic rating is conservative: wrong/unknown → Again, hinted correct → Hard, unhinted correct → Good. Never auto-assign Easy. Ungraded questions fall back to manual.
+- Persist `attempts.rating_source` as automatic/manual. An automatic commit must be atomic with evaluation.
 - Recompute the next queue from SQLite after every answer; do not use a fixed queue.
 - Learn Ahead is limited to 20 minutes and the same 4 a.m. learning day. Never rewrite saved `due_at`.
 - The daily new limit counts distinct committed New questions. Skip, Practice, and uncommitted evaluation do not count.

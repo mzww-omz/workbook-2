@@ -11,10 +11,12 @@ pub mod session;
 pub mod settings;
 pub mod workbook;
 
-pub use answer::{Answer, automatic_rating, grade_answer, normalize_answer};
+pub use answer::{Answer, answer_is_blank, automatic_rating, grade_answer, normalize_answer};
 pub use calendar::{StudyCalendar, learning_day, next_learning_day_start};
 pub use content::{Content, ContentBlock, ImageFit};
-pub use session::{CardState, Mode, Phase, Rating, SessionItemStatus, SessionStatus, StoredCard};
+pub use session::{
+    CardState, Mode, Phase, Rating, RatingSource, SessionItemStatus, SessionStatus, StoredCard,
+};
 pub use settings::{Settings, ThemeSetting};
 pub use workbook::{
     ChoiceOption, MAX_JSON_BYTES, Note, Question, QuestionType, ValidationError, Workbook,

@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use uuid::Uuid;
-use workbook_domain::{Answer, Mode, Phase, Rating};
+use workbook_domain::{Answer, Mode, Phase, Rating, RatingSource};
 use workbook_scheduler::{Clock, FixedClock};
 use workbook_service::{SAMPLE_WORKBOOK_JSON, ServiceError, StudyView, WorkbookService};
 
@@ -23,12 +23,23 @@ impl Harness {
         let service = WorkbookService::open(dir.path(), clock.clone()).unwrap();
         let mut settings = service.settings().unwrap();
         settings.timezone = "UTC".to_string();
+        // The legacy scenarios in this file exercise the explicit manual
+        // rating command. Automatic-rating scenarios opt in with `new_auto`.
+        settings.automatic_rating = false;
         service.update_settings(settings).unwrap();
         Self {
             _dir: dir,
             clock,
             service: Some(service),
         }
+    }
+
+    fn new_auto() -> Self {
+        let harness = Self::new();
+        let mut settings = harness.service().settings().unwrap();
+        settings.automatic_rating = true;
+        harness.service().update_settings(settings).unwrap();
+        harness
     }
 
     fn service(&self) -> &WorkbookService {
@@ -62,13 +73,22 @@ impl Harness {
     }
 
     fn evaluate(&self, view: &StudyView, answer: Option<Answer>) -> StudyView {
+        self.evaluate_with_hint(view, answer, false)
+    }
+
+    fn evaluate_with_hint(
+        &self,
+        view: &StudyView,
+        answer: Option<Answer>,
+        hint: bool,
+    ) -> StudyView {
         self.service()
             .evaluate_answer(
                 &view.session_id,
                 answer.as_ref(),
                 false,
                 None,
-                false,
+                hint,
                 view.revision,
             )
             .unwrap()
@@ -107,6 +127,40 @@ impl Harness {
     fn history(&self) -> Vec<workbook_service::HistoryEntry> {
         self.service().history(20).unwrap()
     }
+
+    fn evaluate_unknown(&self, view: &StudyView) -> StudyView {
+        self.service()
+            .evaluate_answer(&view.session_id, None, true, None, false, view.revision)
+            .unwrap()
+    }
+
+    fn attempt_rows(&self) -> Vec<(String, u8, Option<String>, String)> {
+        let connection = Connection::open(self._dir.path().join("workbook.sqlite")).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT rating_source,rating,after_state_json,answered_at
+                 FROM attempts ORDER BY answered_at,rowid",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u8,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn review_state_count(&self) -> i64 {
+        let connection = Connection::open(self._dir.path().join("workbook.sqlite")).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM review_states", [], |row| row.get(0))
+            .unwrap()
+    }
 }
 
 fn one_question(id: &str) -> String {
@@ -135,6 +189,322 @@ fn sibling_workbook(id: &str) -> String {
     )
 }
 
+fn flashcard_workbook(id: &str) -> String {
+    format!(
+        r#"{{
+          "format":"workbook","schemaVersion":1,"id":"{id}","revision":1,
+          "title":"Flash","description":"","language":"ja","tags":[],
+          "notes":[{{"id":"n-{id}","title":"Note","knowledgeCard":"card","questions":[
+            {{"id":"q-{id}","revision":1,"type":"flashcard","front":"front","back":"back",
+              "explanation":"because"}}
+          ]}}]
+        }}"#
+    )
+}
+
+#[test]
+fn consecutive_automatic_answers_advance_without_manual_rating() {
+    let h = Harness::new_auto();
+    let book = h.import(&sibling_workbook("auto-consecutive"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let first = h.evaluate(&view, Some(Answer::Bool(true)));
+    assert!(first.feedback.as_ref().unwrap().committed);
+    let second_view = h.next(&first);
+    let second_view = h.begin(&second_view);
+    let second = h.evaluate(&second_view, Some(Answer::Bool(true)));
+    assert!(second.feedback.as_ref().unwrap().committed);
+    h.finish(&second);
+    let rows = h.attempt_rows();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.0 == "automatic"));
+    assert_eq!(h.history()[0].stats.attempts, 2);
+}
+
+#[test]
+fn blank_answer_is_not_auto_rated_as_incorrect() {
+    let h = Harness::new_auto();
+    let book = h.import(SAMPLE_WORKBOOK_JSON);
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let error = h
+        .service()
+        .evaluate_answer(&view.session_id, None, false, None, false, view.revision)
+        .unwrap_err();
+    assert!(matches!(error, ServiceError::Invalid(_)));
+    assert!(h.attempt_rows().is_empty());
+    let active = h.service().active_view().unwrap().unwrap();
+    assert_eq!(active.phase, Phase::Question);
+    assert_eq!(active.revision, view.revision);
+}
+
+#[test]
+fn automatic_rating_commits_incorrect_and_unknown_as_again() {
+    let h = Harness::new_auto();
+    let book = h.import(&one_question("auto-again"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let evaluated = h.evaluate(&view, Some(Answer::Bool(false)));
+    let feedback = evaluated.feedback.as_ref().unwrap();
+    assert!(feedback.committed);
+    assert_eq!(feedback.correct, Some(false));
+    assert_eq!(feedback.rating, Some(Rating::Again));
+    assert_eq!(feedback.rating_source, Some(RatingSource::Automatic));
+    assert!(feedback.attempt_id.is_some());
+    h.finish(&evaluated);
+
+    let h = Harness::new_auto();
+    let book = h.import(&one_question("auto-unknown"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let evaluated = h.evaluate_unknown(&view);
+    let feedback = evaluated.feedback.as_ref().unwrap();
+    assert!(feedback.committed);
+    assert!(feedback.unknown);
+    assert_eq!(feedback.rating, Some(Rating::Again));
+    assert_eq!(feedback.rating_source, Some(RatingSource::Automatic));
+    h.finish(&evaluated);
+}
+
+#[test]
+fn automatic_rating_uses_hard_for_hinted_correct_and_good_without_hint() {
+    let h = Harness::new_auto();
+    let book = h.import(&one_question("auto-hard"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let evaluated = h.evaluate_with_hint(&view, Some(Answer::Bool(true)), true);
+    let feedback = evaluated.feedback.as_ref().unwrap();
+    assert!(feedback.hint);
+    assert_eq!(feedback.rating, Some(Rating::Hard));
+    assert_eq!(feedback.rating_source, Some(RatingSource::Automatic));
+    h.finish(&evaluated);
+
+    let h = Harness::new_auto();
+    let book = h.import(&one_question("auto-good"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let evaluated = h.evaluate(&view, Some(Answer::Bool(true)));
+    let feedback = evaluated.feedback.as_ref().unwrap();
+    assert_eq!(feedback.rating, Some(Rating::Good));
+    assert_ne!(feedback.rating, Some(Rating::Easy));
+    assert_eq!(feedback.rating_source, Some(RatingSource::Automatic));
+    h.finish(&evaluated);
+}
+
+#[test]
+fn automatic_rating_falls_back_to_manual_for_subjective_flashcards() {
+    let h = Harness::new_auto();
+    let book = h.import(&flashcard_workbook("fc"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let revealed = h
+        .service()
+        .save_draft(&view.session_id, None, false, true, view.revision)
+        .unwrap();
+    let evaluated = h
+        .service()
+        .evaluate_answer(
+            &revealed.session_id,
+            Some(&Answer::Bool(true)),
+            false,
+            Some(true),
+            false,
+            revealed.revision,
+        )
+        .unwrap();
+    let feedback = evaluated.feedback.as_ref().unwrap();
+    assert!(!feedback.committed);
+    assert_eq!(feedback.suggested_rating, None);
+    assert_eq!(feedback.rating, None);
+    let committed = h.commit(&evaluated, Rating::Good);
+    assert!(committed.feedback.as_ref().unwrap().committed);
+    assert_eq!(
+        committed.feedback.as_ref().unwrap().rating_source,
+        Some(RatingSource::Manual)
+    );
+    h.finish(&committed);
+}
+
+#[test]
+fn automatic_and_manual_ratings_produce_identical_fsrs_state() {
+    let auto = Harness::new_auto();
+    let auto_book = auto.import(&one_question("same-fsrs"));
+    let auto_view = auto.start(Mode::New, Some(&auto_book));
+    let auto_view = auto.begin(&auto_view);
+    let auto_evaluated = auto.evaluate(&auto_view, Some(Answer::Bool(true)));
+    assert!(auto_evaluated.feedback.as_ref().unwrap().committed);
+    let auto_row = auto.attempt_rows().remove(0);
+
+    let manual = Harness::new();
+    let manual_book = manual.import(&one_question("same-fsrs"));
+    let manual_view = manual.start(Mode::New, Some(&manual_book));
+    let manual_view = manual.begin(&manual_view);
+    let manual_evaluated = manual.evaluate(&manual_view, Some(Answer::Bool(true)));
+    let manual_committed = manual.commit(&manual_evaluated, Rating::Good);
+    assert!(manual_committed.feedback.as_ref().unwrap().committed);
+    let manual_row = manual.attempt_rows().remove(0);
+
+    assert_eq!(auto_row.1, manual_row.1);
+    assert_eq!(auto_row.2, manual_row.2);
+    assert_eq!(auto_row.3, manual_row.3);
+    assert_eq!(auto_row.0, "automatic");
+    assert_eq!(manual_row.0, "manual");
+}
+
+#[test]
+fn automatic_correction_updates_the_same_attempt_and_recomputes_fsrs() {
+    let h = Harness::new_auto();
+    let book = h.import(&one_question("auto-correct"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let evaluated = h.evaluate(&view, Some(Answer::Bool(true)));
+    let attempt_id = evaluated
+        .feedback
+        .as_ref()
+        .unwrap()
+        .attempt_id
+        .clone()
+        .unwrap();
+    let before = h.attempt_rows().remove(0);
+    assert_eq!(before.1, Rating::Good.value());
+    let corrected = h
+        .service()
+        .correct_attempt(
+            &evaluated.session_id,
+            &attempt_id,
+            None,
+            Some(Rating::Hard),
+            evaluated.revision,
+        )
+        .unwrap();
+    let feedback = corrected.feedback.as_ref().unwrap();
+    assert_eq!(feedback.rating, Some(Rating::Hard));
+    assert_eq!(feedback.rating_source, Some(RatingSource::Manual));
+    let after = h.attempt_rows();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].1, Rating::Hard.value());
+    assert_ne!(before.2, after[0].2);
+    h.finish(&corrected);
+    assert_eq!(h.history()[0].stats.attempts, 1);
+
+    // The corrected state is recomputed from the saved before-state, not from
+    // the automatic Good state. It must equal a direct manual Hard commit.
+    let manual = Harness::new();
+    let manual_book = manual.import(&one_question("auto-correct"));
+    let manual_view = manual.start(Mode::New, Some(&manual_book));
+    let manual_view = manual.begin(&manual_view);
+    let manual_evaluated = manual.evaluate(&manual_view, Some(Answer::Bool(true)));
+    let manual_committed = manual.commit(&manual_evaluated, Rating::Hard);
+    assert!(manual_committed.feedback.as_ref().unwrap().committed);
+    let manual_row = manual.attempt_rows().remove(0);
+    assert_eq!(after[0].2, manual_row.2);
+}
+
+#[test]
+fn automatic_double_submit_is_rejected_and_keeps_one_attempt() {
+    let h = Harness::new_auto();
+    let book = h.import(&one_question("auto-double"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let evaluated = h.evaluate(&view, Some(Answer::Bool(true)));
+    let attempt_id = evaluated
+        .feedback
+        .as_ref()
+        .unwrap()
+        .attempt_id
+        .clone()
+        .unwrap();
+    let error = h
+        .service()
+        .evaluate_answer(
+            &evaluated.session_id,
+            Some(&Answer::Bool(true)),
+            false,
+            None,
+            false,
+            view.revision,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServiceError::Conflict(_)));
+    let idempotent = h
+        .service()
+        .commit_rating(
+            &evaluated.session_id,
+            &attempt_id,
+            Rating::Good,
+            evaluated.revision,
+        )
+        .unwrap();
+    assert_eq!(
+        idempotent.feedback.as_ref().unwrap().attempt_id.as_deref(),
+        Some(attempt_id.as_str())
+    );
+    assert_eq!(h.attempt_rows().len(), 1);
+    h.finish(&idempotent);
+}
+
+#[test]
+fn automatic_commit_survives_restart_without_duplicating_attempts() {
+    let mut h = Harness::new_auto();
+    let book = h.import(&one_question("auto-restart"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let _evaluated = h.evaluate(&view, Some(Answer::Bool(true)));
+    h.reopen();
+    let feedback = h.service().active_view().unwrap().unwrap();
+    assert_eq!(feedback.phase, Phase::Feedback);
+    let feedback_view = feedback.feedback.as_ref().unwrap();
+    assert!(feedback_view.committed);
+    assert_eq!(feedback_view.rating_source, Some(RatingSource::Automatic));
+    h.finish(&feedback);
+    assert_eq!(h.attempt_rows().len(), 1);
+    assert_eq!(h.history()[0].stats.attempts, 1);
+}
+
+#[test]
+fn automatic_practice_records_attempt_without_fsrs_update() {
+    let h = Harness::new_auto();
+    let book = h.import(&one_question("auto-practice"));
+    let view = h.start(Mode::Practice, Some(&book));
+    let view = h.begin(&view);
+    let evaluated = h.evaluate(&view, Some(Answer::Bool(true)));
+    assert!(evaluated.feedback.as_ref().unwrap().committed);
+    assert_eq!(
+        evaluated.feedback.as_ref().unwrap().rating_source,
+        Some(RatingSource::Automatic)
+    );
+    assert_eq!(h.review_state_count(), 0);
+    h.finish(&evaluated);
+    assert_eq!(h.attempt_rows().len(), 1);
+}
+
+#[test]
+fn automatic_setting_can_be_toggled_mid_session() {
+    let h = Harness::new_auto();
+    let book = h.import(&sibling_workbook("toggle"));
+    let view = h.start(Mode::New, Some(&book));
+    let view = h.begin(&view);
+    let auto = h.evaluate(&view, Some(Answer::Bool(true)));
+    assert!(auto.feedback.as_ref().unwrap().committed);
+    let mut settings = h.service().settings().unwrap();
+    settings.automatic_rating = false;
+    h.service().update_settings(settings).unwrap();
+    let next = h.next(&auto);
+    let next = h.begin(&next);
+    let manual = h.evaluate(&next, Some(Answer::Bool(true)));
+    assert!(!manual.feedback.as_ref().unwrap().committed);
+    assert_eq!(
+        manual.feedback.as_ref().unwrap().suggested_rating,
+        Some(Rating::Good)
+    );
+    let committed = h.commit(&manual, Rating::Good);
+    h.finish(&committed);
+    let rows = h.attempt_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "automatic");
+    assert_eq!(rows[1].0, "manual");
+}
+
 #[test]
 fn new_session_shows_intro_once_and_saves_answer() {
     let h = Harness::new();
@@ -147,7 +517,7 @@ fn new_session_shows_intro_once_and_saves_answer() {
     let view = h.evaluate(&view, Some(Answer::Text("b".to_string())));
     let feedback = view.feedback.as_ref().unwrap();
     assert_eq!(feedback.correct, Some(true));
-    assert_eq!(feedback.suggested_rating, Rating::Good);
+    assert_eq!(feedback.suggested_rating, Some(Rating::Good));
     let view = h.commit(&view, Rating::Good);
     assert_eq!(view.phase, Phase::Feedback);
     assert!(view.feedback.as_ref().unwrap().committed);

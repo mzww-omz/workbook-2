@@ -4,9 +4,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use thiserror::Error;
 use workbook_domain::{
-    Answer, CardState, Content, Mode, Phase, Question, Rating, SessionItemStatus, SessionStatus,
-    Settings, StudyCalendar, ThemeSetting, Workbook, automatic_rating, grade_answer,
-    parse_workbook,
+    Answer, CardState, Content, Mode, Phase, Question, QuestionType, Rating, RatingSource,
+    SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
+    answer_is_blank, automatic_rating, grade_answer, parse_workbook,
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{Clock, QueueInput, QueueKind, Scheduler, SchedulerSettings, select_next};
@@ -112,7 +112,10 @@ pub struct FeedbackView {
     pub unknown: bool,
     pub hint: bool,
     pub rating: Option<Rating>,
-    pub suggested_rating: Rating,
+    pub rating_source: Option<RatingSource>,
+    /// The rating the automatic policy would choose. `None` means the answer
+    /// cannot be scored automatically and the learner must choose a rating.
+    pub suggested_rating: Option<Rating>,
     pub explanation: Content,
     pub answer_summary: String,
     pub given_answer: String,
@@ -590,11 +593,14 @@ impl WorkbookService {
         }
         let correct = if unknown {
             Some(false)
-        } else if question.kind == workbook_domain::QuestionType::Flashcard {
+        } else if question.kind == QuestionType::Flashcard {
             self_correct
         } else {
             grade_answer(&question, answer)
         };
+        if !unknown && question.kind != QuestionType::Flashcard && answer_is_blank(answer) {
+            return Err(ServiceError::Invalid("回答を入力してください".to_string()));
+        }
         record_time(&mut bundle.session, now);
         bundle.session.draft_json = answer
             .map(serde_json::to_value)
@@ -606,7 +612,28 @@ impl WorkbookService {
         bundle.session.pending_at = Some(now);
         bundle.session.phase = Phase::Feedback;
         bundle.session.revision += 1;
-        storage.update_session(&bundle.session)?;
+
+        // Automatic rating commits in the same service call. This keeps the
+        // answer, FSRS state, attempt, and session cursor crash-safe: either
+        // the whole answer is saved or none of it is.
+        let automatic = if settings.automatic_rating {
+            automatic_rating_for(&question, correct, bundle.session.hint, unknown)
+        } else {
+            None
+        };
+        match automatic {
+            Some(rating) => self.commit_pending(
+                &mut storage,
+                &mut bundle,
+                &uuid::Uuid::new_v4().to_string(),
+                rating,
+                RatingSource::Automatic,
+                now,
+                &settings,
+                &calendar,
+            )?,
+            None => storage.update_session(&bundle.session)?,
+        }
         self.view_for(&storage, &bundle, &settings, &calendar, now)
     }
 
@@ -638,16 +665,41 @@ impl WorkbookService {
                 "回答を確認してから評価してください".to_string(),
             ));
         }
+        self.commit_pending(
+            &mut storage,
+            &mut bundle,
+            attempt_id,
+            rating,
+            RatingSource::Manual,
+            now,
+            &settings,
+            &calendar,
+        )?;
+        self.view_for(&storage, &bundle, &settings, &calendar, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_pending(
+        &self,
+        storage: &mut Storage,
+        bundle: &mut SessionBundle,
+        attempt_id: &str,
+        rating: Rating,
+        rating_source: RatingSource,
+        now: DateTime<Utc>,
+        settings: &Settings,
+        calendar: &StudyCalendar,
+    ) -> Result<()> {
+        if bundle.session.phase != Phase::Feedback {
+            return Err(ServiceError::Invalid(
+                "回答を確認してから評価してください".to_string(),
+            ));
+        }
         let pending_at = bundle
             .session
             .pending_at
             .ok_or_else(|| ServiceError::Invalid("回答時刻が記録されていません".to_string()))?;
-        let item = current_item(&bundle)?.clone();
-        let workbook = storage.workbook(&item.workbook_id)?;
-        let question = workbook
-            .find_question(&item.note_id, &item.question_id)
-            .map(|(_, question)| question.clone())
-            .ok_or_else(|| ServiceError::NotFound("問題".to_string()))?;
+        let item = current_item(bundle)?.clone();
         let before = storage.review_state(&item.workbook_id, &item.question_id)?;
         let card = if bundle.session.mode == Mode::Practice {
             None
@@ -677,7 +729,7 @@ impl WorkbookService {
         let after_json = card.as_ref().map(serde_json::to_string).transpose()?;
         let attempt = AttemptRow {
             id: attempt_id.to_string(),
-            session_id: session_id.to_string(),
+            session_id: bundle.session.id.clone(),
             workbook_id: item.workbook_id.clone(),
             note_id: item.note_id.clone(),
             question_id: item.question_id.clone(),
@@ -687,6 +739,7 @@ impl WorkbookService {
             hint: bundle.session.hint,
             elapsed_ms: bundle.session.question_elapsed_ms,
             rating: rating.value(),
+            rating_source,
             answer_json,
             before_state_json: before_json,
             after_state_json: after_json,
@@ -719,8 +772,7 @@ impl WorkbookService {
         {
             row.status = SessionItemStatus::Answered;
         }
-        let _ = question;
-        self.view_for(&storage, &bundle, &settings, &calendar, now)
+        Ok(())
     }
 
     pub fn correct_attempt(
@@ -759,7 +811,9 @@ impl WorkbookService {
         if let Some(correct) = correct {
             new_correct = Some(correct);
             new_unknown = false;
-            new_rating = automatic_rating(Some(correct), current.hint, false).value();
+            if let Some(suggested) = automatic_rating(Some(correct), current.hint, false) {
+                new_rating = suggested.value();
+            }
         }
         if let Some(rating) = rating {
             new_rating = rating.value();
@@ -799,6 +853,7 @@ impl WorkbookService {
         attempt.correct = new_correct;
         attempt.unknown = new_unknown;
         attempt.rating = new_rating;
+        attempt.rating_source = RatingSource::Manual;
         attempt.after_state_json = card.as_ref().map(serde_json::to_string).transpose()?;
         attempt.state_revision = card.as_ref().map(|card| card.revision).unwrap_or(0);
         bundle.session.revision += 1;
@@ -1179,7 +1234,12 @@ impl WorkbookService {
             .map(serde_json::from_str::<Value>)
             .transpose()?;
         if let Some(correct) = session.pending_correct {
-            let rating = automatic_rating(Some(correct), session.hint, session.pending_unknown);
+            let suggested = automatic_rating_for(
+                question,
+                Some(correct),
+                session.hint,
+                session.pending_unknown,
+            );
             return Ok(Some(FeedbackView {
                 attempt_id: None,
                 committed: false,
@@ -1187,7 +1247,8 @@ impl WorkbookService {
                 unknown: session.pending_unknown,
                 hint: session.hint,
                 rating: None,
-                suggested_rating: rating,
+                rating_source: None,
+                suggested_rating: suggested,
                 explanation: question.explanation.clone(),
                 answer_summary: question.answer_summary(),
                 given_answer: format_given_answer(question, answer.as_ref()),
@@ -1212,7 +1273,13 @@ impl WorkbookService {
             unknown: attempt.unknown,
             hint: attempt.hint,
             rating: Rating::from_value(attempt.rating),
-            suggested_rating: automatic_rating(attempt.correct, attempt.hint, attempt.unknown),
+            rating_source: Some(attempt.rating_source),
+            suggested_rating: automatic_rating_for(
+                question,
+                attempt.correct,
+                attempt.hint,
+                attempt.unknown,
+            ),
             explanation: question.explanation.clone(),
             answer_summary: question.answer_summary(),
             given_answer: format_given_answer(question, answer.as_ref()),
@@ -1391,6 +1458,22 @@ fn ensure_active(bundle: &SessionBundle) -> Result<()> {
         return Err(ServiceError::Invalid("終了したセッションです".to_string()));
     }
     Ok(())
+}
+
+/// The domain policy is pure; the service only adds the question-type rule.
+/// Subjective flashcards fall back to the manual rating flow unless the
+/// learner explicitly says "わからない", which is always `Again`.
+fn automatic_rating_for(
+    question: &Question,
+    correct: Option<bool>,
+    hint: bool,
+    unknown: bool,
+) -> Option<Rating> {
+    if question.kind == QuestionType::Flashcard && !unknown {
+        None
+    } else {
+        automatic_rating(correct, hint, unknown)
+    }
 }
 
 fn check_revision(session: &SessionRow, expected: u64) -> Result<()> {

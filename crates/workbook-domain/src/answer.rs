@@ -26,6 +26,18 @@ pub fn normalize_answer(value: &str) -> String {
         .join(" ")
 }
 
+/// True when the learner submitted nothing at all. This is distinct from a
+/// wrong answer: a blank response must not be auto-rated as `Again`.
+pub fn answer_is_blank(answer: Option<&Answer>) -> bool {
+    match answer {
+        None => true,
+        Some(Answer::Text(value)) => value.trim().is_empty(),
+        Some(Answer::Choices(values)) => values.is_empty(),
+        Some(Answer::Blanks(values)) => values.values().all(|value| value.trim().is_empty()),
+        Some(Answer::Bool(_)) => false,
+    }
+}
+
 /// Grades an answer. `None` means the question has no automatic correctness
 /// (flashcards), matching the legacy Workbook behaviour.
 pub fn grade_answer(question: &Question, answer: Option<&Answer>) -> Option<bool> {
@@ -90,16 +102,22 @@ pub fn grade_answer(question: &Question, answer: Option<&Answer>) -> Option<bool
     }
 }
 
-/// Conservative automatic rating used when the learner does not choose one.
-/// A wrong answer is always Again; a hinted correct answer starts at Hard.
-/// Easy is never assigned automatically.
-pub fn automatic_rating(correct: Option<bool>, hint: bool, unknown: bool) -> Rating {
-    if unknown || correct != Some(true) {
-        Rating::Again
-    } else if hint {
-        Rating::Hard
+/// Conservative automatic rating derived only from a graded answer, the hint
+/// state, and an explicit "わからない" response.
+///
+/// `None` means the answer cannot be scored automatically (for example a
+/// subjective flashcard) and the caller must keep the manual rating flow.
+///
+/// `Easy` is deliberately never returned: elapsed time or a first correct
+/// answer is not trustworthy evidence of ease. The learner can still choose
+/// `Easy` manually.
+pub fn automatic_rating(correct: Option<bool>, hint: bool, unknown: bool) -> Option<Rating> {
+    if unknown || correct == Some(false) {
+        Some(Rating::Again)
+    } else if correct == Some(true) {
+        Some(if hint { Rating::Hard } else { Rating::Good })
     } else {
-        Rating::Good
+        None
     }
 }
 
@@ -115,10 +133,37 @@ mod tests {
     }
 
     #[test]
-    fn automatic_ratings_never_promote_to_easy() {
-        assert_eq!(automatic_rating(Some(true), false, false), Rating::Good);
-        assert_eq!(automatic_rating(Some(true), true, false), Rating::Hard);
-        assert_eq!(automatic_rating(Some(false), false, false), Rating::Again);
-        assert_eq!(automatic_rating(None, false, true), Rating::Again);
+    fn automatic_ratings_are_conservative_and_never_easy() {
+        assert_eq!(
+            automatic_rating(Some(true), false, false),
+            Some(Rating::Good)
+        );
+        assert_eq!(
+            automatic_rating(Some(true), true, false),
+            Some(Rating::Hard)
+        );
+        assert_eq!(
+            automatic_rating(Some(false), false, false),
+            Some(Rating::Again)
+        );
+        assert_eq!(
+            automatic_rating(Some(false), true, false),
+            Some(Rating::Again)
+        );
+        assert_eq!(automatic_rating(None, false, true), Some(Rating::Again));
+        assert_eq!(automatic_rating(None, false, false), None);
+        assert_ne!(
+            automatic_rating(Some(true), false, false),
+            Some(Rating::Easy)
+        );
+    }
+
+    #[test]
+    fn blank_answers_are_distinct_from_wrong_answers() {
+        assert!(answer_is_blank(None));
+        assert!(answer_is_blank(Some(&Answer::Text("   ".to_string()))));
+        assert!(answer_is_blank(Some(&Answer::Choices(Vec::new()))));
+        assert!(!answer_is_blank(Some(&Answer::Bool(false))));
+        assert!(!answer_is_blank(Some(&Answer::Text("x".to_string()))));
     }
 }

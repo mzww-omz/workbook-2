@@ -21,6 +21,8 @@
 - FSRS-7（`fsrs-rs` の v7 モデル、固定コミット）と、旧 `ts-fsrs 6.0.0 DefaultScheduler` 互換の短期ステップ
 - Learning Steps `1分 → 10分`、Relearning `10分`、Desired Retention 既定 `90%`、Learn Ahead `20分`
 - 評価確定時に FSRS状態・Attempt・Session・Note初回学習・関連問題の延期を **1 SQLite トランザクション**で保存
+- 回答の正誤からFSRS評価を自動決定し、回答確認と同時に保存（既定ON）。不正解・「わからない」は Again、ヒント使用後の正解は Hard、ヒントなし正解は Good。Easyは自動判定せず、必要なときだけ手動で訂正
+- 自動採点できないフラッシュカードは従来の手動評価へフォールバック
 - 回答ごとの独立 Attempt ID、同一問題の短期再出題も全件履歴、二重送信の冪等性、訂正時の再計算
 - 次問を毎回 DB の現在状態から再選択する動的キュー
 - 期限到来済み Learning/Relearning → 通常 Review/New → 20分以内 Learn Ahead → 結果、の優先順位
@@ -74,21 +76,24 @@ open "dist/Workbook 2.app"
 | `⌘,` | Settings |
 | `⌘O` | JSON教材を読み込む |
 | `⌘F` | Library の検索へ |
-| `⌘Return` | 回答チェック / 評価確定 / 次へ |
-| Feedback中の `1` `2` `3` `4` | Again / Hard / Good / Easy（入力フォーカスなし時） |
+| `⌘Return` | 回答チェック / 次へ（手動評価時は評価確定） |
+| Feedback中の `1` `2` `3` `4` | Again / Hard / Good / Easy（入力フォーカスなし時。自動評価後は「評価を変更」を開いたときだけ有効） |
 | `Esc` | 終了確認（進行を勝手に破棄しません） |
 
 すべての操作はマウスからも実行できます。テキスト入力中は数字キーを評価に使いません。
 
 ## FSRS 自動化の流れ
 
-1. `EvaluateAnswer`: 正誤と解説を準備。FSRS/Attempt はまだ書きません
-2. ユーザーが Again/Hard/Good/Easy を選択
-3. `CommitRating`: 保存済みの評価前状態と実回答時刻から FSRS-7 を計算
-4. 短期ステップまたは FSRS の長期間隔から `due_at` を決定
-5. FSRS状態・Attempt・Sessionカーソル・Note初回学習・関連問題の延期を同一トランザクションで保存
-6. 次問選択時に候補を再計算（固定キューではない）
-7. Today とタイマーが SQLite の期限から件数・次の期限を再計算
+1. `EvaluateAnswer`: 正誤・ヒント・「わからない」を確定し、自動評価ポリシーで rating を決定（手動評価時は FSRS/Attempt をまだ書かない）
+2. 自動評価ON: 同じサービス呼び出し内で `CommitRating` 相当を実行し、回答確認と保存を原子的に完了
+3. 自動評価OFF: 従来どおり Again/Hard/Good/Easy を選択
+4. `CommitRating`: 保存済みの評価前状態と実回答時刻から FSRS-7 を計算
+5. 短期ステップまたは FSRS の長期間隔から `due_at` を決定
+6. FSRS状態・Attempt・Sessionカーソル・Note初回学習・関連問題の延期を同一トランザクションで保存
+7. 次問選択時に候補を再計算（固定キューではない）
+8. Today とタイマーが SQLite の期限から件数・次の期限を再計算
+
+自動評価の rating は `attempts.rating_source` に `automatic` / `manual` として保存します。評価を訂正した場合は同じAttempt行を更新し、評価前状態からFSRSを再計算します。自動評価でもFSRSの数式・ステップ・キューは変わりません。
 
 詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) と [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
@@ -113,6 +118,10 @@ cargo check --workspace
 - Today の実データ件数、短期再学習待ち、次の期限
 - 関連Noteの抑制、同一Questionの再出題、複数WorkbookのResult
 - 二重送信・評価訂正・stale revision・Practice/Skipの非更新
+- 自動評価（不正解/わからない→Again、ヒント正解→Hard、ヒントなし正解→Good、Easy非自動）
+- 自動採点不可のフラッシュカードの手動フォールバック、自動評価の手動訂正、訂正時のAttempt非重複
+- 自動評価と手動評価で同一rating・回答時刻・評価前状態から同一FSRS結果になること
+- 自動評価の再起動復旧、設定の途中変更、v1 DBの安全なスキーマ移行
 - 旧v1 DB移行、バックアップ/復元、破損DB拒否、7世代保持
 - 独立コピーと削除
 

@@ -138,6 +138,33 @@ impl Rating {
     }
 }
 
+/// Who chose the FSRS rating for an attempt. Automatic ratings are derived
+/// from the graded answer; manual ratings come from the learner, including
+/// corrections of an automatic rating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RatingSource {
+    Automatic,
+    Manual,
+}
+
+impl RatingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "automatic" => Some(Self::Automatic),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CardState {

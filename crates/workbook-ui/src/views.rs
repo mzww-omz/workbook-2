@@ -9,7 +9,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, px,
 };
-use workbook_domain::{Content, Mode, Phase, Question, QuestionType, Rating, ThemeSetting};
+use workbook_domain::{
+    Content, Mode, Phase, Question, QuestionType, Rating, RatingSource, ThemeSetting,
+};
 
 use crate::{NoticeKind, Route, WorkbookApp};
 
@@ -1187,6 +1189,37 @@ impl WorkbookApp {
                 )
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_size(px(15.0)).child("自動評価"))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(
+                                            "回答の正誤からFSRS評価を自動で決めます。Easyは自動判定せず、必要なときだけ評価を変更できます。",
+                                        ),
+                                ),
+                        )
+                        .child(
+                            Button::new("settings-automatic")
+                                .label(if settings.automatic_rating { "ON" } else { "OFF" })
+                                .when(settings.automatic_rating, |button| button.primary())
+                                .when(!settings.automatic_rating, |button| button.secondary())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let enabled = !this.snapshot.settings.automatic_rating;
+                                    this.set_automatic_rating(enabled, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
                         .text_size(px(12.0))
                         .text_color(theme.muted_foreground)
                         .child(
@@ -1911,70 +1944,106 @@ impl WorkbookApp {
             ));
 
         if feedback.committed {
+            let rating = feedback.rating.unwrap_or(Rating::Good);
+            let automatic = feedback.rating_source == Some(RatingSource::Automatic);
             page = page.child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .justify_between()
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "現在の評価: {}",
-                                feedback.rating.unwrap_or(feedback.suggested_rating).label()
-                            )),
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "{}: {}",
+                                        if automatic { "自動評価" } else { "評価" },
+                                        rating.label()
+                                    )),
+                            )
+                            .when(automatic, |row| {
+                                row.child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child("正誤から自動で保存しました"),
+                                )
+                            }),
                     )
                     .child(
-                        Button::new("feedback-correct")
-                            .label("正誤を訂正")
-                            .ghost()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_correct(window, cx);
-                            })),
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("feedback-correct")
+                                    .label("正誤を訂正")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_correct(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("feedback-rating-toggle")
+                                    .label(if self.rating_picker_open {
+                                        "評価を閉じる"
+                                    } else {
+                                        "評価を変更"
+                                    })
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_rating_picker(cx);
+                                    })),
+                            ),
                     ),
             );
+            if self.rating_picker_open {
+                page = page.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(self.rating_button("rating-again", Rating::Again, feedback, cx))
+                        .child(self.rating_button("rating-hard", Rating::Hard, feedback, cx))
+                        .child(self.rating_button("rating-good", Rating::Good, feedback, cx))
+                        .child(self.rating_button("rating-easy", Rating::Easy, feedback, cx)),
+                );
+            }
         } else {
             page = page.child(
                 div()
                     .text_size(px(12.0))
                     .text_color(theme.muted_foreground)
-                    .child("評価を選ぶとFSRS状態が確定します。"),
+                    .child(if feedback.suggested_rating.is_some() {
+                        "評価を選ぶとFSRS状態が確定します。"
+                    } else {
+                        "この問題は自動評価できません。評価を選んでください。"
+                    }),
             );
-        }
-
-        page = page.child(
-            div()
-                .flex()
-                .gap_2()
-                .child(self.rating_button("rating-again", Rating::Again, feedback, cx))
-                .child(self.rating_button("rating-hard", Rating::Hard, feedback, cx))
-                .child(self.rating_button("rating-good", Rating::Good, feedback, cx))
-                .child(self.rating_button("rating-easy", Rating::Easy, feedback, cx)),
-        );
-
-        if feedback.committed {
             page = page.child(
                 div()
                     .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        Button::new("feedback-skip")
-                            .label("スキップ")
-                            .ghost()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.skip_question(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("feedback-next")
-                            .label("次へ  ⌘↩")
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.next_question(window, cx);
-                            })),
-                    ),
+                    .gap_2()
+                    .child(self.rating_button("rating-again", Rating::Again, feedback, cx))
+                    .child(self.rating_button("rating-hard", Rating::Hard, feedback, cx))
+                    .child(self.rating_button("rating-good", Rating::Good, feedback, cx))
+                    .child(self.rating_button("rating-easy", Rating::Easy, feedback, cx)),
+            );
+        }
+
+        if feedback.committed {
+            page = page.child(
+                div().flex().justify_end().items_center().child(
+                    Button::new("feedback-next")
+                        .label("次へ  ⌘↩")
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.next_question(window, cx);
+                        })),
+                ),
             );
         }
 
@@ -1991,7 +2060,7 @@ impl WorkbookApp {
         let active = if feedback.committed {
             feedback.rating == Some(rating)
         } else {
-            feedback.suggested_rating == rating
+            feedback.suggested_rating == Some(rating)
         };
         Button::new(id)
             .label(format!(

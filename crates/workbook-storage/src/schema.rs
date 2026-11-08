@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -105,6 +105,7 @@ CREATE TABLE attempts(
   hint INTEGER NOT NULL,
   elapsed_ms INTEGER NOT NULL,
   rating INTEGER NOT NULL,
+  rating_source TEXT NOT NULL DEFAULT 'manual',
   answer_json TEXT NOT NULL,
   before_state_json TEXT,
   after_state_json TEXT,

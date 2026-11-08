@@ -8,8 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 use workbook_domain::{
-    CardState, Mode, Phase, SessionItemStatus, SessionStatus, Settings, StoredCard, StudyCalendar,
-    ThemeSetting, Workbook, parse_workbook,
+    CardState, Mode, Phase, RatingSource, SessionItemStatus, SessionStatus, Settings, StoredCard,
+    StudyCalendar, ThemeSetting, Workbook, parse_workbook,
 };
 use workbook_import::{
     LegacyAttempt, LegacyPlan, LegacySession, LegacySessionItem, LegacySessionWorkbook,
@@ -119,6 +119,7 @@ pub struct AttemptRow {
     pub hint: bool,
     pub elapsed_ms: i64,
     pub rating: u8,
+    pub rating_source: RatingSource,
     pub answer_json: String,
     pub before_state_json: Option<String>,
     pub after_state_json: Option<String>,
@@ -175,7 +176,7 @@ impl Storage {
         ensure_private_dir(&backups)?;
         let path = directory.join("workbook.sqlite");
         let existed = path.exists();
-        let connection = open_connection(&path, true)?;
+        let mut connection = open_connection(&path, true)?;
         {
             let application_id = pragma_i64(&connection, "application_id")?;
             let version = pragma_i64(&connection, "user_version")?;
@@ -221,8 +222,11 @@ impl Storage {
                         "Workbook 2のスキーマが一致しません".to_string(),
                     ));
                 }
+                if version < SCHEMA_VERSION {
+                    migrate_connection(&mut connection, &backups, version)?;
+                }
             }
-            if existed && version == SCHEMA_VERSION {
+            if existed {
                 let integrity: String =
                     connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
                 if integrity != "ok" {
@@ -897,8 +901,8 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                    elapsed_ms,rating,answer_json,before_state_json,after_state_json,state_revision,
-                    short_term,created_at
+                    elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
+                    state_revision,short_term,created_at
              FROM attempts WHERE session_id=?1 ORDER BY answered_at, created_at, rowid",
         )?;
         let rows = statement.query_map([session_id], map_attempt)?;
@@ -914,8 +918,8 @@ impl Storage {
             .connection()?
             .query_row(
                 "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                        elapsed_ms,rating,answer_json,before_state_json,after_state_json,state_revision,
-                        short_term,created_at
+                        elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
+                        state_revision,short_term,created_at
                  FROM attempts WHERE id=?1",
                 [attempt_id],
                 map_attempt,
@@ -933,8 +937,8 @@ impl Storage {
             .connection()?
             .query_row(
                 "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                        elapsed_ms,rating,answer_json,before_state_json,after_state_json,state_revision,
-                        short_term,created_at
+                        elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
+                        state_revision,short_term,created_at
                  FROM attempts WHERE session_id=?1 AND question_id=?2
                  ORDER BY answered_at DESC, created_at DESC, rowid DESC LIMIT 1",
                 params![session_id, question_id],
@@ -948,8 +952,8 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                    elapsed_ms,rating,answer_json,before_state_json,after_state_json,state_revision,
-                    short_term,created_at
+                    elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
+                    state_revision,short_term,created_at
              FROM attempts WHERE answered_at>=?1 ORDER BY answered_at",
         )?;
         let rows = statement.query_map([format_ts(since)], map_attempt)?;
@@ -1045,12 +1049,13 @@ impl Storage {
             )?;
         }
         transaction.execute(
-            "UPDATE attempts SET correct=?1,unknown=?2,rating=?3,after_state_json=?4,
-                    state_revision=?5 WHERE id=?6",
+            "UPDATE attempts SET correct=?1,unknown=?2,rating=?3,rating_source=?4,after_state_json=?5,
+                    state_revision=?6 WHERE id=?7",
             params![
                 write.attempt.correct.map(i64::from),
                 i64::from(write.attempt.unknown),
                 write.attempt.rating,
+                write.attempt.rating_source.as_str(),
                 write.attempt.after_state_json,
                 write.attempt.state_revision as i64,
                 write.attempt.id
@@ -1168,9 +1173,9 @@ impl Storage {
             ));
         }
         let version = pragma_i64(&connection, "user_version")?;
-        if version != SCHEMA_VERSION {
+        if !(1..=SCHEMA_VERSION).contains(&version) {
             return Err(StorageError::Unsupported(format!(
-                "バックアップのバージョンが一致しません: {version}"
+                "バックアップのバージョンに対応していません: {version}"
             )));
         }
         let tables = table_names(&connection)?;
@@ -1284,7 +1289,11 @@ impl Storage {
                 }
             }
             fs::rename(&staging, &live)?;
-            let connection = open_connection(&live, false)?;
+            let mut connection = open_connection(&live, false)?;
+            let version = pragma_i64(&connection, "user_version")?;
+            if version < SCHEMA_VERSION {
+                migrate_connection(&mut connection, &directory, version)?;
+            }
             self.conn = Some(connection);
             let integrity = self.integrity()?;
             if integrity != "ok" {
@@ -1488,6 +1497,7 @@ fn legacy_attempt_to_row(session_id: &str, attempt: &LegacyAttempt) -> AttemptRo
         hint: attempt.hint,
         elapsed_ms: attempt.elapsed_ms,
         rating: attempt.rating,
+        rating_source: RatingSource::Manual,
         answer_json: attempt.answer_json.clone(),
         before_state_json: attempt.before_state_json.clone(),
         after_state_json: attempt.after_state_json.clone(),
@@ -1603,9 +1613,9 @@ fn insert_session_workbook(
 fn insert_attempt(transaction: &rusqlite::Transaction<'_>, attempt: &AttemptRow) -> Result<()> {
     transaction.execute(
         "INSERT INTO attempts(id,session_id,workbook_id,note_id,question_id,answered_at,correct,
-                unknown,hint,elapsed_ms,rating,answer_json,before_state_json,after_state_json,
-                state_revision,short_term,created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                unknown,hint,elapsed_ms,rating,rating_source,answer_json,before_state_json,
+                after_state_json,state_revision,short_term,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
         params![
             attempt.id,
             attempt.session_id,
@@ -1618,6 +1628,7 @@ fn insert_attempt(transaction: &rusqlite::Transaction<'_>, attempt: &AttemptRow)
             i64::from(attempt.hint),
             attempt.elapsed_ms,
             attempt.rating,
+            attempt.rating_source.as_str(),
             attempt.answer_json,
             attempt.before_state_json,
             attempt.after_state_json,
@@ -1873,12 +1884,14 @@ fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
         hint: row.get::<_, i64>(8)? != 0,
         elapsed_ms: row.get(9)?,
         rating: row.get::<_, i64>(10)? as u8,
-        answer_json: row.get(11)?,
-        before_state_json: row.get(12)?,
-        after_state_json: row.get(13)?,
-        state_revision: row.get::<_, i64>(14)? as u64,
-        short_term: row.get::<_, i64>(15)? != 0,
-        created_at: parse_ts(&row.get::<_, String>(16)?).map_err(to_sql_error)?,
+        rating_source: RatingSource::parse(&row.get::<_, String>(11)?)
+            .unwrap_or(RatingSource::Manual),
+        answer_json: row.get(12)?,
+        before_state_json: row.get(13)?,
+        after_state_json: row.get(14)?,
+        state_revision: row.get::<_, i64>(15)? as u64,
+        short_term: row.get::<_, i64>(16)? != 0,
+        created_at: parse_ts(&row.get::<_, String>(17)?).map_err(to_sql_error)?,
     })
 }
 
@@ -1899,6 +1912,46 @@ fn open_connection(path: &Path, wal: bool) -> Result<Connection> {
     }
     connection.execute_batch(&pragmas)?;
     Ok(connection)
+}
+
+/// Applies forward-only schema migrations. A backup is written with the
+/// SQLite backup API before the first change so a failed upgrade can be
+/// inspected or restored without touching the live file directly.
+fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) -> Result<()> {
+    if from >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    ensure_private_dir(backups)?;
+    let backup = backups.join(format!(
+        "pre-migration-v{from}-{}.sqlite",
+        Utc::now().timestamp_millis()
+    ));
+    let temp = backup.with_extension(format!("{}.partial", Uuid::new_v4()));
+    if temp.exists() {
+        fs::remove_file(&temp)?;
+    }
+    let result = (|| -> Result<()> {
+        connection.backup("main", &temp, None::<fn(rusqlite::backup::Progress)>)?;
+        set_private_file(&temp)?;
+        sync_file(&temp)?;
+        fs::rename(&temp, &backup)?;
+        sync_dir(backups);
+        Ok(())
+    })();
+    if temp.exists() {
+        let _ = fs::remove_file(&temp);
+    }
+    result?;
+
+    let transaction = connection.transaction()?;
+    if from < 2 {
+        transaction.execute_batch(
+            "ALTER TABLE attempts ADD COLUMN rating_source TEXT NOT NULL DEFAULT 'manual';",
+        )?;
+    }
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn pragma_i64(connection: &Connection, name: &str) -> Result<i64> {

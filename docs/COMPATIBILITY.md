@@ -94,6 +94,12 @@ fsrs-rs  due_at = 2026-02-23T20:51:55.503Z
 - `allowModelOverride=false` のため、ステップがある評価ではモデル間隔で上書きしない
 - 最大間隔 36500日でクランプ
 
+## 自動評価と互換性
+
+自動評価は rating の決定方法だけを変える。同じ rating・回答時刻・評価前状態を与えた場合、FSRS-7 の記憶状態、state、learningStep、scheduledDays、due_at は手動評価と一致する。`workbook-service` のテストで `after_state_json` と `answered_at` を直接比較している。
+
+自動評価が返すのは Again / Hard / Good のみで、Easy は返さない。フラッシュカードなど自動採点できない問題は手動評価へフォールバックする。
+
 ## 未確認
 
 - 旧アプリの実ユーザー履歴によるパラメータ最適化（旧アプリも既定パラメータ）

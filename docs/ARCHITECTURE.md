@@ -23,10 +23,14 @@ workbook-app     macOS起動、データディレクトリ、メニュー
 回答入力
   │
   ├─ EvaluateAnswer（サービス内）
-  │    correct を計算、draft/elapsed/pending_at を session に保存
-  │    Attempt も review_state も書かない
+  │    correct/hint/unknown を計算、draft/elapsed/pending_at を session に保存
+  │    自動評価ONなら automatic_rating（domainの純粋関数）で rating を決定
+  │    rating が決まる場合は 1 トランザクションで CommitRating 相当まで実行
+  │    （Attempt・FSRS状態・Sessionを同時に保存）
+  │    自動採点不可なら Feedback の未確定状態で止め、手動評価へフォールバック
   │
-  ├─ ユーザーが Again/Hard/Good/Easy を選択
+  ├─ 自動評価OFF、または手動フォールバック時
+  │    ユーザーが Again/Hard/Good/Easy を選択
   │
   └─ CommitRating(attempt_id, rating, answered_at)
        BEGIN IMMEDIATE
@@ -35,7 +39,7 @@ workbook-app     macOS起動、データディレクトリ、メニュー
          memory ← FSRS7.next_states(before, elapsed)
          due/state/step ← StepPolicy(decision)
          review_states ← after_state
-         attempts INSERT（独立Attempt ID）
+         attempts INSERT（独立Attempt ID, rating_source=automatic|manual）
          sessions ← pending解除, revision+1
          session_items ← answered
          notes ← introduced=1（Practice以外）
@@ -43,9 +47,20 @@ workbook-app     macOS起動、データディレクトリ、メニュー
        COMMIT
 ```
 
+自動評価ポリシーは `workbook-domain` の `automatic_rating` にあり、時刻・UI・DBに依存しない。
+
+| 状況 | rating |
+|---|---|
+| 不正解 / 「わからない」 | Again |
+| ヒント使用後の正解 | Hard |
+| ヒントなしの正解 | Good |
+| 明確に容易（自動では判定しない） | Easy（手動のみ） |
+| 自動採点不可（フラッシュカード） | 手動フォールバック |
+
 - 同一Attempt IDの再送は既存Attemptを返し、FSRSを二度更新しない
+- 自動評価は評価と確定を同じトランザクションで行うため、クラッシュ時に未確定の回答だけが残らない
 - 相違なるAttempt IDでも、Feedback中の二重確定は `session.pending_correct` と revision で拒否
-- 訂正は `before_state_json` と `answered_at` から再計算し、同じAttempt行を更新する。Attempt件数は増えない
+- 訂正は `before_state_json` と `answered_at` から再計算し、同じAttempt行を更新する。Attempt件数は増えない。`rating_source` は manual になる
 - Practice は review_states を書かない。Skip も書かない
 
 ## 動的キュー
@@ -72,7 +87,7 @@ workbook-app     macOS起動、データディレクトリ、メニュー
 
 ## SQLite
 
-`application_id = 1463962418`（`"WBK2"`）、`user_version = 1`。
+`application_id = 1463962418`（`"WBK2"`）、`user_version = 2`。
 
 | Table | 役割 |
 |---|---|
@@ -83,12 +98,15 @@ workbook-app     macOS起動、データディレクトリ、メニュー
 | `sessions` | mode/status/cursor/phase/draft/pending/revision |
 | `session_items` | セッションの初期対象と状態 |
 | `session_workbooks` | 複数WorkbookのResult順序 |
-| `attempts` | 回答ごとの独立UUID、正誤、評価、前後状態、時刻 |
+| `attempts` | 回答ごとの独立UUID、正誤、評価、評価元（automatic/manual）、前後状態、時刻 |
 | `settings` | JSON設定 |
 | `meta` | アプリ識別情報 |
 
 設定:
 `WAL`, `synchronous=FULL`, `foreign_keys=ON`, `trusted_schema=OFF`, `busy_timeout=5000`。
+
+スキーマ移行:
+`user_version=1` のDBは起動時に `attempts.rating_source` を追加し、`user_version=2` へ更新する。変更前に `backups/pre-migration-v1-*.sqlite` をSQLite backup APIで作成する。v1のバックアップも復元時に同じ移行を行う。
 
 ## 再評価タイミング
 
