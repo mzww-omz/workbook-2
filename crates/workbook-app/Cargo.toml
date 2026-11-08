@@ -1,0 +1,20 @@
+[package]
+name = "workbook-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "workbook2"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+gpui-kit.workspace = true
+workbook-scheduler = { path = "../workbook-scheduler" }
+workbook-service = { path = "../workbook-service" }
+workbook-ui = { path = "../workbook-ui" }
+workbook-domain = { path = "../workbook-domain" }
+uuid.workspace = true

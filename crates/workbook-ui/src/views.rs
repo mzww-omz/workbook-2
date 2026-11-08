@@ -1,0 +1,2234 @@
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
+use gpui_kit::component::{
+    ActiveTheme, Disableable,
+    button::{Button, ButtonVariants},
+    input::Input,
+};
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, px,
+};
+use workbook_domain::{Content, Mode, Phase, Question, QuestionType, Rating, ThemeSetting};
+
+use crate::{NoticeKind, Route, WorkbookApp};
+
+fn format_duration(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    if seconds < 60 {
+        format!("{seconds}秒")
+    } else {
+        format!("{}分{:02}秒", seconds / 60, seconds % 60)
+    }
+}
+
+fn format_percent(correct: usize, graded: usize) -> String {
+    if graded == 0 {
+        "—".to_string()
+    } else {
+        format!("{:.0}%", correct as f64 / graded as f64 * 100.0)
+    }
+}
+
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::New => "新規",
+        Mode::Review => "復習",
+        Mode::Practice => "練習",
+    }
+}
+
+fn format_datetime(value: DateTime<Utc>, timezone: &str) -> String {
+    let tz = timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+    value
+        .with_timezone(&tz)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+impl WorkbookApp {
+    pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let mut sidebar = div()
+            .flex()
+            .flex_col()
+            .w(px(232.0))
+            .h_full()
+            .flex_none()
+            .border_r_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .px(px(24.0))
+            .py(px(28.0));
+
+        sidebar = sidebar
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(24.0))
+                            .font_weight(FontWeight::LIGHT)
+                            .child("Workbook 2"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child("LOCAL · FSRS-7"),
+                    ),
+            )
+            .child(div().h(px(36.0)));
+
+        sidebar = sidebar
+            .child(self.nav_item("nav-today", "今日", "⌘1", Route::Today, cx))
+            .child(self.nav_item("nav-library", "教材", "⌘2", Route::Library, cx))
+            .child(self.nav_item("nav-history", "履歴", "⌘3", Route::History, cx))
+            .child(self.nav_item("nav-settings", "設定", "⌘,", Route::Settings, cx));
+
+        if let Some(active) = self.snapshot.active.as_ref()
+            && self.route != Route::Study
+        {
+            {
+                let title = active
+                    .workbook_title
+                    .clone()
+                    .unwrap_or_else(|| "学習中".to_string());
+                sidebar = sidebar.child(
+                    div()
+                        .mt(px(28.0))
+                        .p_3()
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("中断中のセッション"),
+                        )
+                        .child(div().text_size(px(14.0)).child(title))
+                        .child(
+                            Button::new("sidebar-resume")
+                                .label("再開する")
+                                .primary()
+                                .w_full()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.resume(window, cx);
+                                })),
+                        ),
+                );
+            }
+        }
+
+        sidebar = sidebar.child(div().flex_1());
+        sidebar = sidebar
+            .child(
+                Button::new("sidebar-import")
+                    .label("JSONを読み込む")
+                    .secondary()
+                    .w_full()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.import_json_dialog(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .mt(px(10.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("⌘O · オフライン"),
+            );
+        sidebar.into_any_element()
+    }
+
+    fn nav_item(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        shortcut: &'static str,
+        route: Route,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let active = self.route == route;
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_between()
+            .py(px(10.0))
+            .pl(px(10.0))
+            .pr(px(8.0))
+            .border_l_3()
+            .border_color(if active {
+                theme.accent
+            } else {
+                theme.transparent
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.secondary))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.go(route, window, cx);
+            }))
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .text_color(if active {
+                        theme.accent
+                    } else {
+                        theme.foreground
+                    })
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(shortcut),
+            )
+            .into_any_element()
+    }
+
+    pub(crate) fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut container = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .max_w(px(1120.0))
+            .mx_auto()
+            .px(px(56.0))
+            .py(px(44.0))
+            .gap_6();
+
+        if let Some(notice) = self.notice.clone() {
+            container = container.child(self.render_notice(notice, cx));
+        }
+
+        let page = match self.route {
+            Route::Today => self.render_today(cx),
+            Route::Library => self.render_library(cx),
+            Route::BookDetail => self.render_book_detail(cx),
+            Route::History => self.render_history(cx),
+            Route::Settings => self.render_settings(cx),
+            Route::Study => self.render_study(cx),
+        };
+        container.child(page).into_any_element()
+    }
+
+    pub(crate) fn render_notice(
+        &self,
+        notice: crate::Notice,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let (color, background) = match notice.kind {
+            NoticeKind::Info => (theme.accent, theme.accent.opacity(0.08)),
+            NoticeKind::Success => (theme.success, theme.success.opacity(0.10)),
+            NoticeKind::Error => (theme.danger, theme.danger.opacity(0.10)),
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .p_3()
+            .border_l_3()
+            .border_color(color)
+            .bg(background)
+            .child(div().text_size(px(14.0)).child(notice.text))
+            .child(
+                Button::new("notice-close")
+                    .label("閉じる")
+                    .text()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_notice(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn page_header(
+        &self,
+        title: impl Into<SharedString>,
+        subtitle: impl Into<SharedString>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(48.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .line_height(px(54.0))
+                    .child(title.into()),
+            )
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(theme.muted_foreground)
+                    .child(subtitle.into()),
+            )
+            .into_any_element()
+    }
+
+    fn render_today(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let today = &self.snapshot.today;
+        let mut page = div().flex().flex_col().gap_7();
+        page = page.child(self.page_header(
+            "今日",
+            format!("{} · 学習日は午前4時に切り替わります", self.today_date()),
+            cx,
+        ));
+
+        if let Some(active) = self.snapshot.active.as_ref() {
+            page = page.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .p_4()
+                    .border_1()
+                    .border_color(theme.accent)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child("中断中のセッション"),
+                            )
+                            .child(
+                                div().text_size(px(18.0)).child(
+                                    active
+                                        .workbook_title
+                                        .clone()
+                                        .unwrap_or_else(|| "学習".to_string()),
+                                ),
+                            ),
+                    )
+                    .child(
+                        Button::new("today-resume")
+                            .label("再開する")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.resume(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        page = page.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_4()
+                .items_stretch()
+                .child(self.big_stat(
+                    "復習",
+                    today.due,
+                    if today.short_term_pending > 0 {
+                        format!(
+                            "期限到来 {} · 短期再学習 {}（20分以内）",
+                            today.due, today.short_term_pending
+                        )
+                    } else {
+                        "期限が来た問題".to_string()
+                    },
+                    cx,
+                ))
+                .child(self.big_stat(
+                    "新規",
+                    today.new_available.min(today.new_remaining_today),
+                    format!(
+                        "未学習 {} · 本日の残り {}",
+                        today.new_available, today.new_remaining_today
+                    ),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .justify_between()
+                        .p_5()
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex_1()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child("今日の回答"),
+                                )
+                                .child(div().text_size(px(24.0)).child(format!(
+                                    "{} 回 · 正答 {} / {}",
+                                    today.answers, today.correct, today.graded
+                                )))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!(
+                                            "学習時間 {}",
+                                            format_duration(today.elapsed_ms)
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(if today.due > 0 {
+                                            "期限到来中".to_string()
+                                        } else {
+                                            match today.next_due_at {
+                                                Some(next) => format!(
+                                                    "次の期限 {}",
+                                                    format_datetime(next, &self.snapshot.timezone)
+                                                ),
+                                                None => "次の期限 なし".to_string(),
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div().flex().gap_2().child(
+                                Button::new("today-review")
+                                    .label(if today.due == 0 && today.short_term_pending > 0 {
+                                        "短期再学習を始める"
+                                    } else {
+                                        "今日の復習を始める"
+                                    })
+                                    .primary()
+                                    .disabled(today.due == 0 && today.short_term_pending == 0)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start(Mode::Review, None, window, cx);
+                                    })),
+                            ),
+                        ),
+                ),
+        );
+
+        if today.due == 0 && today.short_term_pending > 0 {
+            page = page.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .p_4()
+                    .border_l_3()
+                    .border_color(theme.accent)
+                    .bg(theme.accent.opacity(0.08))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_size(px(15.0)).child("短期再学習が待っています"))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child("1分・10分ステップのカードです。Learn Aheadの範囲内で今すぐ再開できます。"),
+                            ),
+                    )
+                    .child(
+                        Button::new("today-shortterm-start")
+                            .label("今すぐ再開")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start(Mode::Review, None, window, cx);
+                            })),
+                    ),
+            );
+        } else if today.due == 0 && today.short_term_pending == 0 {
+            page = page.child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme.muted_foreground)
+                    .child(if today.new_available > 0 {
+                        "今日の復習は完了しました。新規学習を始められます。"
+                    } else {
+                        "今日の復習は完了しました。"
+                    }),
+            );
+        }
+        page = page.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.muted_foreground)
+                .child(format!(
+                    "新規は1日{}問まで · 設定で変更できます（本日 {}問学習済み）",
+                    today.new_limit,
+                    today.new_limit as usize - today.new_remaining_today
+                )),
+        );
+
+        if self.snapshot.books.is_empty() {
+            page = page.child(self.empty_state(
+                "まだ教材がありません",
+                "JSON教材を読み込むか、同梱のサンプルから始めてください。",
+                cx,
+            ));
+            page = page.child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        Button::new("today-import")
+                            .label("JSONを読み込む")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.import_json_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("today-sample")
+                            .label("サンプルで試す")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.import_sample(window, cx);
+                            })),
+                    ),
+            );
+            return page.into_any_element();
+        }
+
+        page = page.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.muted_foreground)
+                .child("教材"),
+        );
+        let mut list = div().flex().flex_col();
+        for book in &self.snapshot.books {
+            let book_id = book.local_id.clone();
+            let new_id = book.local_id.clone();
+            let practice_id = book.local_id.clone();
+            let review_id = book.local_id.clone();
+            let title = book.title.clone();
+            let due = book.due;
+            let new_available = book.new_available;
+            let short_term_pending = book.short_term_pending;
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .py(px(16.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(div().text_size(px(18.0)).child(title))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "{}問 · 学習済み {} · 復習 {} · 短期 {} · 新規 {}",
+                                        book.total,
+                                        book.learned,
+                                        due,
+                                        short_term_pending,
+                                        new_available
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("today-review-{book_id}"))
+                                    .label(if due == 0 && short_term_pending > 0 {
+                                        "短期"
+                                    } else {
+                                        "復習"
+                                    })
+                                    .secondary()
+                                    .disabled(due == 0 && short_term_pending == 0)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start(
+                                            Mode::Review,
+                                            Some(review_id.clone()),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("today-new-{new_id}"))
+                                    .label("新規")
+                                    .primary()
+                                    .disabled(new_available == 0 || today.new_remaining_today == 0)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start(Mode::New, Some(new_id.clone()), window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("today-practice-{practice_id}"))
+                                    .label("練習")
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start(
+                                            Mode::Practice,
+                                            Some(practice_id.clone()),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("today-open-{book_id}"))
+                                    .label("開く")
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_book(book_id.clone(), cx);
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        page.child(list).into_any_element()
+    }
+
+    fn big_stat(
+        &self,
+        label: &'static str,
+        value: usize,
+        caption: impl Into<SharedString>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .flex_col()
+            .p_5()
+            .border_1()
+            .border_color(theme.border)
+            .flex_1()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_size(px(52.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .line_height(px(58.0))
+                    .child(value.to_string()),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted_foreground)
+                    .child(caption.into()),
+            )
+            .into_any_element()
+    }
+
+    fn empty_state(
+        &self,
+        title: &'static str,
+        body: &'static str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_6()
+            .border_1()
+            .border_color(theme.border)
+            .child(div().text_size(px(20.0)).child(title))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(theme.muted_foreground)
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    fn render_library(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let needle = self.search.to_lowercase();
+        let books: Vec<_> = self
+            .snapshot
+            .books
+            .iter()
+            .filter(|book| {
+                needle.is_empty()
+                    || book.title.to_lowercase().contains(&needle)
+                    || book.description.to_lowercase().contains(&needle)
+                    || book
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect();
+
+        let mut page = div().flex().flex_col().gap_6();
+        page = page.child(
+            div()
+                .flex()
+                .items_end()
+                .justify_between()
+                .child(self.page_header(
+                    "教材",
+                    "同じJSONを読み込んでも、進捗は独立したコピーになります。",
+                    cx,
+                ))
+                .child(
+                    Button::new("library-import")
+                        .label("JSONを読み込む")
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.import_json_dialog(window, cx);
+                        })),
+                ),
+        );
+        page = page.child(
+            div().w_full().child(
+                Input::new(&self.search_input)
+                    .id("library-search")
+                    .w_full()
+                    .cleanable(true),
+            ),
+        );
+
+        if books.is_empty() {
+            page = page.child(if self.snapshot.books.is_empty() {
+                self.empty_state(
+                    "教材がありません",
+                    "JSON教材を読み込むか、サンプルを追加してください。",
+                    cx,
+                )
+            } else {
+                self.empty_state("該当する教材がありません", "検索語を変えてください。", cx)
+            });
+            if self.snapshot.books.is_empty() {
+                page = page.child(
+                    Button::new("library-sample")
+                        .label("サンプルで試す")
+                        .secondary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.import_sample(window, cx);
+                        })),
+                );
+            }
+            return page.into_any_element();
+        }
+
+        let mut list = div().flex().flex_col();
+        for book in &books {
+            let id_open = book.local_id.clone();
+            let id_new = book.local_id.clone();
+            let id_review = book.local_id.clone();
+            let id_practice = book.local_id.clone();
+            let last_used = book
+                .last_used_at
+                .map(|value| format_datetime(value, &self.snapshot.timezone))
+                .unwrap_or_else(|| "未使用".to_string());
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .py(px(20.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap_6()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .child(div().text_size(px(22.0)).child(book.title.clone()))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(if book.description.is_empty() {
+                                                "説明なし".to_string()
+                                            } else {
+                                                book.description.clone()
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!(
+                                                "{}問 · 学習済み {} · 復習 {} · 短期 {} · 新規 {} · 最終使用 {}",
+                                                book.total,
+                                                book.learned,
+                                                book.due,
+                                                book.short_term_pending,
+                                                book.new_available,
+                                                last_used
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                Button::new(format!("library-open-{}", book.local_id))
+                                    .label("開く")
+                                    .secondary()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_book(id_open.clone(), cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("library-new-{}", book.local_id))
+                                    .label("新規")
+                                    .primary()
+                                    .disabled(
+                                        book.new_available == 0
+                                            || self.snapshot.today.new_remaining_today == 0,
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start(Mode::New, Some(id_new.clone()), window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("library-review-{}", book.local_id))
+                                    .label("復習")
+                                    .secondary()
+                                    .disabled(book.due == 0 && book.short_term_pending == 0)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start(Mode::Review, Some(id_review.clone()), window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("library-practice-{}", book.local_id))
+                                    .label("練習")
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start(Mode::Practice, Some(id_practice.clone()), window, cx);
+                                    })),
+                            )
+                            .when(!book.tags.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(book.tags.join(" · ")),
+                                )
+                            }),
+                    ),
+            );
+        }
+        page.child(list).into_any_element()
+    }
+
+    fn render_book_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(summary) = self.selected_summary() else {
+            return self.empty_state("教材が見つかりません", "一覧へ戻ってください。", cx);
+        };
+        let Some(workbook) = self.selected_workbook.as_ref() else {
+            return self.empty_state("教材を読み込めません", "一覧へ戻ってください。", cx);
+        };
+        let theme = cx.theme().clone();
+        let id_new = summary.local_id.clone();
+        let id_review = summary.local_id.clone();
+        let id_practice = summary.local_id.clone();
+        let id_delete = summary.local_id.clone();
+        let title = summary.title.clone();
+
+        let mut page = div().flex().flex_col().gap_6();
+        page = page
+            .child(
+                Button::new("detail-back")
+                    .label("← 教材一覧")
+                    .text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.go(Route::Library, window, cx);
+                    })),
+            )
+            .child(self.page_header(title.clone(), workbook.description.clone(), cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("detail-new")
+                            .label("新規学習")
+                            .primary()
+                            .disabled(
+                                summary.new_available == 0
+                                    || self.snapshot.today.new_remaining_today == 0,
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start(Mode::New, Some(id_new.clone()), window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("detail-review")
+                            .label("復習")
+                            .secondary()
+                            .disabled(summary.due == 0)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start(Mode::Review, Some(id_review.clone()), window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("detail-practice")
+                            .label("練習")
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start(Mode::Practice, Some(id_practice.clone()), window, cx);
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("detail-delete")
+                            .label("削除")
+                            .danger()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.modal = Some(crate::Modal::DeleteWorkbook {
+                                    id: id_delete.clone(),
+                                    title: title.clone(),
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_6()
+                    .py(px(14.0))
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(self.detail_stat("問題", summary.total.to_string(), cx))
+                    .child(self.detail_stat("学習済み", summary.learned.to_string(), cx))
+                    .child(self.detail_stat("復習", summary.due.to_string(), cx))
+                    .child(self.detail_stat(
+                        "短期再学習",
+                        summary.short_term_pending.to_string(),
+                        cx,
+                    ))
+                    .child(self.detail_stat("新規", summary.new_available.to_string(), cx))
+                    .child(self.detail_stat("言語", workbook.language.clone(), cx)),
+            );
+
+        let mut notes = div().flex().flex_col();
+        for (index, note) in workbook.notes.iter().enumerate() {
+            notes =
+                notes.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .py(px(16.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .flex()
+                                .items_baseline()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_baseline()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!("{:02}", index + 1)),
+                                        )
+                                        .child(div().text_size(px(17.0)).child(note.title.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{}問", note.questions.len())),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(theme.muted_foreground)
+                                .line_height(px(20.0))
+                                .child(note.knowledge_card.plain_text()),
+                        )
+                        .child(div().flex().flex_wrap().gap_2().children(
+                            note.questions.iter().map(|question| {
+                                div()
+                                    .px(px(7.0))
+                                    .py(px(2.0))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(type_label(question.kind))
+                                    .into_any_element()
+                            }),
+                        )),
+                );
+        }
+        page.child(notes).into_any_element()
+    }
+
+    fn detail_stat(&self, label: &'static str, value: String, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .child(label),
+            )
+            .child(div().text_size(px(20.0)).child(value))
+            .into_any_element()
+    }
+
+    fn render_history(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let entries = &self.history;
+        let mut page = div().flex().flex_col().gap_6();
+        page = page.child(self.page_header(
+            "履歴",
+            "終了したセッションの集計です。短期再学習と初回正答を分けて表示します。",
+            cx,
+        ));
+        if entries.is_empty() {
+            return page
+                .child(self.empty_state(
+                    "まだ履歴がありません",
+                    "学習セッションを終了すると、ここに集計が残ります。",
+                    cx,
+                ))
+                .into_any_element();
+        }
+        let mut list = div().flex().flex_col();
+        for entry in entries {
+            let rate = format_percent(
+                entry.stats.first_pass_correct,
+                entry.stats.first_pass_graded,
+            );
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .py(px(18.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_size(px(18.0))
+                                            .child(entry.workbook_titles.join(" / ")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(mode_label(entry.mode)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format_datetime(
+                                        entry.started_at,
+                                        &self.snapshot.timezone,
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_5()
+                            .child(history_stat("問題", entry.stats.questions.to_string(), cx))
+                            .child(history_stat(
+                                "回答した問題",
+                                entry.stats.answered.to_string(),
+                                cx,
+                            ))
+                            .child(history_stat("総回答", entry.stats.attempts.to_string(), cx))
+                            .child(history_stat(
+                                "短期再学習",
+                                entry.stats.short_term.to_string(),
+                                cx,
+                            ))
+                            .child(history_stat("初回正答率", rate, cx))
+                            .child(history_stat(
+                                "スキップ",
+                                entry.stats.skipped.to_string(),
+                                cx,
+                            ))
+                            .child(history_stat(
+                                "学習時間",
+                                format_duration(entry.stats.elapsed_ms),
+                                cx,
+                            )),
+                    ),
+            );
+        }
+        page.child(list).into_any_element()
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let settings = &self.snapshot.settings;
+        let mut page = div().flex().flex_col().gap_7();
+        page = page.child(self.page_header(
+            "設定",
+            "学習アルゴリズムとローカルデータを管理します。変更は既存カードの期限を一括変更しません。",
+            cx,
+        ));
+
+        page = page.child(section_heading("学習", cx)).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .p_5()
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex()
+                        .items_end()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .flex_1()
+                                .child(label("目標定着率 (0.70–0.97)", cx))
+                                .child(
+                                    Input::new(&self.settings_retention).id("settings-retention").w(px(180.0)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .flex_1()
+                                .child(label("1セッションの新規問題数", cx))
+                                .child(
+                                    Input::new(&self.settings_new_limit).id("settings-new-limit").w(px(180.0)),
+                                ),
+                        )
+                        .child(
+                            Button::new("settings-apply")
+                                .label("適用")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_settings(window, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            "FSRS-7 · 学習 1分 → 10分 · 再学習 10分 · Learn Ahead 20分 · 学習日 午前4時",
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("タイムゾーン: {}", self.snapshot.timezone)),
+                ),
+        );
+
+        page = page.child(section_heading("表示", cx)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(theme_button(
+                    "theme-system",
+                    "System",
+                    settings.theme == ThemeSetting::System,
+                    ThemeSetting::System,
+                    cx,
+                ))
+                .child(theme_button(
+                    "theme-light",
+                    "Light",
+                    settings.theme == ThemeSetting::Light,
+                    ThemeSetting::Light,
+                    cx,
+                ))
+                .child(theme_button(
+                    "theme-dark",
+                    "Dark",
+                    settings.theme == ThemeSetting::Dark,
+                    ThemeSetting::Dark,
+                    cx,
+                )),
+        );
+
+        page = page.child(section_heading("データ", cx)).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_5()
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child("保存先"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .child(self.snapshot.data_path.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("settings-backup")
+                                .label("完全バックアップ")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.backup_dialog(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("settings-restore")
+                                .label("バックアップから復元")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.restore_dialog(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("settings-legacy")
+                                .label("旧Workbookから移行")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.legacy_dialog(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("settings-folder")
+                                .label("Finderで開く")
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_data_folder(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("settings-integrity")
+                                .label("整合性チェック")
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.check_integrity(cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child("バックアップは教材・履歴・セッション・設定をすべて含みます。個人データとして扱ってください。"),
+                ),
+        );
+
+        page = page.child(section_heading("危険な操作", cx)).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .p_5()
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_size(px(15.0)).child("学習履歴をリセット"))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.muted_foreground)
+                                .child("教材は残し、FSRS状態・回答・セッションだけを削除します。"),
+                        ),
+                )
+                .child(
+                    Button::new("settings-reset")
+                        .label("リセット")
+                        .danger()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.modal = Some(crate::Modal::ResetHistory);
+                            cx.notify();
+                        })),
+                ),
+        );
+
+        page = page.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.muted_foreground)
+                .child(format!(
+                    "Workbook 2 v{} · オフライン · WebViewなし · GPUI",
+                    env!("CARGO_PKG_VERSION")
+                )),
+        );
+        page.into_any_element()
+    }
+
+    pub(crate) fn render_study(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(view) = self.study.as_ref() else {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child("学習セッションがありません")
+                .into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let mut page = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme.background)
+            .child(self.study_top_bar(view, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(760.0))
+                    .mx_auto()
+                    .px(px(32.0))
+                    .py(px(40.0))
+                    .gap_6()
+                    .child(match view.phase {
+                        Phase::Intro => self.render_intro(view, cx),
+                        Phase::Question => self.render_question(view, cx),
+                        Phase::Feedback => self.render_feedback(view, cx),
+                        Phase::WorkbookResult => self.render_workbook_result(view, cx),
+                        Phase::OverallResult => self.render_overall_result(view, cx),
+                    }),
+            );
+        if let Some(notice) = self.notice.clone() {
+            page = page.child(div().px(px(32.0)).child(self.render_notice(notice, cx)));
+        }
+        page.into_any_element()
+    }
+
+    fn study_top_bar(
+        &self,
+        view: &workbook_service::StudyView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let active = self
+            .snapshot
+            .active
+            .as_ref()
+            .is_some_and(|active| active.session_id == view.session_id);
+        let progress = if view.progress.total == 0 {
+            String::new()
+        } else {
+            format!(
+                "{} / {}",
+                view.progress.position.min(view.progress.total),
+                view.progress.total
+            )
+        };
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(28.0))
+            .py(px(12.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(if active {
+                Button::new("study-exit")
+                    .label("終了")
+                    .text()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.modal = Some(crate::Modal::Finish);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            } else {
+                Button::new("study-close")
+                    .label("Todayへ")
+                    .text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.study = None;
+                        this.go(Route::Today, window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(mode_label(view.mode)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.muted_foreground)
+                            .child(progress),
+                    ),
+            )
+            .child(if active {
+                Button::new("study-finish")
+                    .label("今日はここまで")
+                    .text()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.modal = Some(crate::Modal::Finish);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .into_any_element()
+    }
+
+    fn render_intro(
+        &self,
+        view: &workbook_service::StudyView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(intro) = view.intro.as_ref() else {
+            return div().into_any_element();
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("はじめに · このNoteは一度だけ説明を表示します"),
+            )
+            .child(
+                div()
+                    .text_size(px(28.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .child(intro.note_title.clone()),
+            )
+            .child(crate::content::render_content(
+                "intro-card",
+                &intro.content,
+                &theme,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("intro-begin")
+                            .label("問題へ")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_question(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("intro-skip")
+                            .label("この問題をスキップ")
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.skip_question(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_question(
+        &self,
+        view: &workbook_service::StudyView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(question) = view.question.as_ref() else {
+            return div().into_any_element();
+        };
+        let mut page = div().flex().flex_col().gap_5();
+        if let Some(note) = view.note_title.as_ref() {
+            page = page.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(note.clone()),
+                    )
+                    .when(view.item_kind == "short_term", |row| {
+                        row.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.accent)
+                                .child("短期再学習"),
+                        )
+                    }),
+            );
+        }
+        page = page.child(
+            div()
+                .text_size(px(28.0))
+                .font_weight(FontWeight::LIGHT)
+                .line_height(px(36.0))
+                .child(if question.kind == QuestionType::Flashcard {
+                    question
+                        .front
+                        .as_ref()
+                        .map(Content::plain_text)
+                        .unwrap_or_default()
+                } else {
+                    question.prompt_text()
+                }),
+        );
+
+        if question.kind == QuestionType::Flashcard {
+            if view.revealed {
+                if let Some(back) = question.back.as_ref() {
+                    page = page.child(crate::content::render_content("flash-back", back, &theme));
+                }
+                page = page.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("flash-yes")
+                                .label("思い出せた")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.self_correct = Some(true);
+                                    this.submit_answer(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("flash-no")
+                                .label("思い出せなかった")
+                                .danger()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.self_correct = Some(false);
+                                    this.submit_answer(window, cx);
+                                })),
+                        ),
+                );
+            } else {
+                page = page.child(
+                    Button::new("flash-reveal")
+                        .label("解答を見る")
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reveal_flashcard(window, cx);
+                        })),
+                );
+            }
+        } else {
+            page = page.child(self.render_answer_input(question, cx));
+        }
+
+        if let Some(hint) = question.hint.as_ref() {
+            if view.hint_visible {
+                page = page.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_4()
+                        .bg(theme.secondary)
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.muted_foreground)
+                                .child("ヒント"),
+                        )
+                        .child(crate::content::render_content("hint", hint, &theme)),
+                );
+            } else {
+                page = page.child(
+                    Button::new("hint-show")
+                        .label("ヒントを見る")
+                        .secondary()
+                        .w(px(160.0))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.save_hint(window, cx);
+                        })),
+                );
+            }
+        }
+
+        if question.kind != QuestionType::Flashcard || view.revealed {
+            page = page.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        Button::new("question-unknown")
+                            .label("わからない")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.mark_unknown(window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("question-skip")
+                                    .label("スキップ")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.skip_question(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("question-submit")
+                                    .label("回答する  ⌘↩")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_answer(window, cx);
+                                    })),
+                            ),
+                    ),
+            );
+        }
+
+        page.into_any_element()
+    }
+
+    fn render_answer_input(&self, question: &Question, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        match question.kind {
+            QuestionType::SingleChoice => {
+                let options = question.options.clone().unwrap_or_default();
+                let mut list = div().flex().flex_col().gap_2();
+                for option in options {
+                    let id = option.id.clone();
+                    let selected = self.single_choice.as_deref() == Some(option.id.as_str());
+                    let label = option.content.plain_text();
+                    list = list.child(
+                        Button::new(format!("choice-{}", option.id))
+                            .label(label)
+                            .when(selected, |button| button.primary())
+                            .when(!selected, |button| button.secondary())
+                            .w_full()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.single_choice = Some(id.clone());
+                                this.persist_draft(window, cx);
+                                cx.notify();
+                            })),
+                    );
+                }
+                list.into_any_element()
+            }
+            QuestionType::MultipleChoice => {
+                let options = question.options.clone().unwrap_or_default();
+                let mut list = div().flex().flex_col().gap_2();
+                for option in options {
+                    let id = option.id.clone();
+                    let selected = self.multiple_choice.contains(&option.id);
+                    let label = option.content.plain_text();
+                    list = list.child(
+                        Button::new(format!("multi-{}", option.id))
+                            .label(if selected {
+                                format!("✓ {label}")
+                            } else {
+                                label
+                            })
+                            .when(selected, |button| button.primary())
+                            .when(!selected, |button| button.secondary())
+                            .w_full()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if !this.multiple_choice.remove(&id) {
+                                    this.multiple_choice.insert(id.clone());
+                                }
+                                this.persist_draft(window, cx);
+                                cx.notify();
+                            })),
+                    );
+                }
+                list.into_any_element()
+            }
+            QuestionType::TrueFalse => div()
+                .flex()
+                .gap_3()
+                .child(
+                    Button::new("tf-true")
+                        .label("○ 正しい")
+                        .when(self.true_false == Some(true), |button| button.primary())
+                        .when(self.true_false != Some(true), |button| button.secondary())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.true_false = Some(true);
+                            this.persist_draft(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("tf-false")
+                        .label("× まちがい")
+                        .when(self.true_false == Some(false), |button| button.primary())
+                        .when(self.true_false != Some(false), |button| button.secondary())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.true_false = Some(false);
+                            this.persist_draft(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+            QuestionType::ShortText => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child("回答"),
+                )
+                .child(
+                    Input::new(&self.short_input)
+                        .id("short-answer")
+                        .w_full()
+                        .h(px(48.0)),
+                )
+                .into_any_element(),
+            QuestionType::Cloze => {
+                let theme = cx.theme().clone();
+                let mut list = div().flex().flex_col().gap_3();
+                for (id, input) in &self.cloze_inputs {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .w(px(120.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("［{id}］")),
+                            )
+                            .child(
+                                Input::new(input)
+                                    .id(format!("cloze-{id}"))
+                                    .w_full()
+                                    .h(px(44.0)),
+                            ),
+                    );
+                }
+                list.into_any_element()
+            }
+            QuestionType::Flashcard => div().into_any_element(),
+        }
+    }
+
+    fn render_feedback(
+        &self,
+        view: &workbook_service::StudyView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(feedback) = view.feedback.as_ref() else {
+            return div().into_any_element();
+        };
+        let (color, label) = if feedback.correct == Some(true) {
+            (theme.success, "正解")
+        } else if feedback.correct == Some(false) {
+            (theme.danger, "不正解")
+        } else {
+            (theme.accent, "自己評価")
+        };
+        let mut page = div().flex().flex_col().gap_5();
+        if let Some(question) = view.question.as_ref() {
+            page = page.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(if question.kind == QuestionType::Flashcard {
+                        question
+                            .front
+                            .as_ref()
+                            .map(Content::plain_text)
+                            .unwrap_or_default()
+                    } else {
+                        question.prompt_text()
+                    }),
+            );
+        }
+        page = page
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_4()
+                    .border_l_3()
+                    .border_color(color)
+                    .bg(color.opacity(0.08))
+                    .child(div().text_size(px(18.0)).child(label))
+                    .when(feedback.unknown, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.muted_foreground)
+                                .child("「わからない」として回答"),
+                        )
+                    })
+                    .when(feedback.hint, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.muted_foreground)
+                                .child("ヒント使用"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child("あなたの回答"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .child(feedback.given_answer.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child("正解"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .child(feedback.answer_summary.clone()),
+                    ),
+            )
+            .child(crate::content::render_content(
+                "feedback-explanation",
+                &feedback.explanation,
+                &theme,
+            ));
+
+        if feedback.committed {
+            page = page.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "現在の評価: {}",
+                                feedback.rating.unwrap_or(feedback.suggested_rating).label()
+                            )),
+                    )
+                    .child(
+                        Button::new("feedback-correct")
+                            .label("正誤を訂正")
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_correct(window, cx);
+                            })),
+                    ),
+            );
+        } else {
+            page = page.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted_foreground)
+                    .child("評価を選ぶとFSRS状態が確定します。"),
+            );
+        }
+
+        page = page.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(self.rating_button("rating-again", Rating::Again, feedback, cx))
+                .child(self.rating_button("rating-hard", Rating::Hard, feedback, cx))
+                .child(self.rating_button("rating-good", Rating::Good, feedback, cx))
+                .child(self.rating_button("rating-easy", Rating::Easy, feedback, cx)),
+        );
+
+        if feedback.committed {
+            page = page.child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Button::new("feedback-skip")
+                            .label("スキップ")
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.skip_question(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("feedback-next")
+                            .label("次へ  ⌘↩")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.next_question(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        page.into_any_element()
+    }
+
+    fn rating_button(
+        &self,
+        id: &'static str,
+        rating: Rating,
+        feedback: &workbook_service::FeedbackView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = if feedback.committed {
+            feedback.rating == Some(rating)
+        } else {
+            feedback.suggested_rating == rating
+        };
+        Button::new(id)
+            .label(format!(
+                "{} {}  [{}]",
+                rating.value(),
+                rating.japanese_label(),
+                rating.label()
+            ))
+            .when(active, |button| button.primary())
+            .when(!active, |button| button.secondary())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.rate_question(rating, window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_workbook_result(
+        &self,
+        view: &workbook_service::StudyView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(result) = view.workbook_result.as_ref() else {
+            return div().into_any_element();
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("教材の結果"),
+            )
+            .child(
+                div()
+                    .text_size(px(32.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .child(result.title.clone()),
+            )
+            .child(self.result_stats(result.stats, cx))
+            .when_some(result.next_workbook_title.clone(), |page, next| {
+                page.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_4()
+                        .bg(theme.secondary)
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("次の教材"),
+                        )
+                        .child(div().text_size(px(16.0)).child(next)),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Button::new("result-finish")
+                            .label("ここで終了")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = Some(crate::Modal::Finish);
+                                cx.notify();
+                            })),
+                    )
+                    .child(if result.next_workbook_title.is_some() {
+                        Button::new("result-continue")
+                            .label("次の教材へ")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.continue_workbook(window, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        Button::new("result-continue-end")
+                            .label("セッションを終える")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.continue_workbook(window, cx);
+                            }))
+                            .into_any_element()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_overall_result(
+        &self,
+        view: &workbook_service::StudyView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(result) = view.overall_result.as_ref() else {
+            return div().into_any_element();
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("セッションの結果"),
+            )
+            .child(
+                div()
+                    .text_size(px(36.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .child("おつかれさまでした"),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme.muted_foreground)
+                    .child(result.workbooks.join(" / ")),
+            )
+            .child(self.result_stats(result.stats, cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("overall-today")
+                            .label("今日へ戻る")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.refresh(cx);
+                                this.study = None;
+                                this.go(Route::Today, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("overall-history")
+                            .label("履歴を見る")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.study = None;
+                                this.go(Route::History, window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn result_stats(&self, stats: workbook_service::ResultStats, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_6()
+            .p_5()
+            .border_1()
+            .border_color(theme.border)
+            .child(history_stat("問題", stats.questions.to_string(), cx))
+            .child(history_stat("回答した問題", stats.answered.to_string(), cx))
+            .child(history_stat("総回答", stats.attempts.to_string(), cx))
+            .child(history_stat("短期再学習", stats.short_term.to_string(), cx))
+            .child(history_stat(
+                "初回正答率",
+                format_percent(stats.first_pass_correct, stats.first_pass_graded),
+                cx,
+            ))
+            .child(history_stat("スキップ", stats.skipped.to_string(), cx))
+            .child(history_stat(
+                "学習時間",
+                format_duration(stats.elapsed_ms),
+                cx,
+            ))
+            .into_any_element()
+    }
+}
+
+fn type_label(kind: QuestionType) -> &'static str {
+    match kind {
+        QuestionType::SingleChoice => "単一選択",
+        QuestionType::MultipleChoice => "複数選択",
+        QuestionType::TrueFalse => "正誤",
+        QuestionType::ShortText => "記述",
+        QuestionType::Cloze => "穴埋め",
+        QuestionType::Flashcard => "フラッシュカード",
+    }
+}
+
+fn label(text: &'static str, cx: &Context<WorkbookApp>) -> AnyElement {
+    div()
+        .text_size(px(11.0))
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+        .into_any_element()
+}
+
+fn section_heading(text: &'static str, cx: &Context<WorkbookApp>) -> AnyElement {
+    div()
+        .text_size(px(11.0))
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+        .into_any_element()
+}
+
+fn history_stat(label: &'static str, value: String, cx: &Context<WorkbookApp>) -> AnyElement {
+    let theme = cx.theme();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
+        .child(div().text_size(px(17.0)).child(value))
+        .into_any_element()
+}
+
+fn theme_button(
+    id: &'static str,
+    text: &'static str,
+    active: bool,
+    theme: ThemeSetting,
+    cx: &mut Context<WorkbookApp>,
+) -> AnyElement {
+    Button::new(id)
+        .label(text)
+        .when(active, |button| button.primary())
+        .when(!active, |button| button.secondary())
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.set_theme(theme, window, cx);
+        }))
+        .into_any_element()
+}

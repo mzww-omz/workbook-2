@@ -1,0 +1,140 @@
+pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
+pub const SCHEMA_VERSION: i64 = 1;
+
+pub const SCHEMA_SQL: &str = r#"
+CREATE TABLE workbooks(
+  local_id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  content_json TEXT NOT NULL,
+  imported_at TEXT NOT NULL,
+  last_used_at TEXT
+);
+
+CREATE TABLE notes(
+  workbook_id TEXT NOT NULL REFERENCES workbooks(local_id) ON DELETE CASCADE,
+  note_id TEXT NOT NULL,
+  introduced INTEGER NOT NULL DEFAULT 0,
+  introduced_at TEXT,
+  PRIMARY KEY(workbook_id, note_id)
+);
+
+CREATE TABLE questions(
+  workbook_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  buried_until TEXT,
+  PRIMARY KEY(workbook_id, question_id),
+  FOREIGN KEY(workbook_id, note_id) REFERENCES notes(workbook_id, note_id) ON DELETE CASCADE
+);
+CREATE INDEX questions_note ON questions(workbook_id, note_id);
+
+CREATE TABLE review_states(
+  workbook_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  state INTEGER NOT NULL,
+  stability REAL NOT NULL,
+  stability_fast REAL NOT NULL,
+  difficulty REAL NOT NULL,
+  due_at TEXT NOT NULL,
+  last_review_at TEXT,
+  reps INTEGER NOT NULL,
+  lapses INTEGER NOT NULL,
+  scheduled_days REAL NOT NULL,
+  learning_step INTEGER NOT NULL,
+  algorithm TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(workbook_id, question_id),
+  FOREIGN KEY(workbook_id, question_id) REFERENCES questions(workbook_id, question_id) ON DELETE CASCADE
+);
+CREATE INDEX review_states_due ON review_states(due_at, workbook_id);
+
+CREATE TABLE sessions(
+  id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  current_workbook_id TEXT,
+  current_item_id TEXT,
+  phase TEXT NOT NULL,
+  draft_json TEXT,
+  hint INTEGER NOT NULL DEFAULT 0,
+  revealed INTEGER NOT NULL DEFAULT 0,
+  pending_correct INTEGER,
+  pending_unknown INTEGER NOT NULL DEFAULT 0,
+  pending_at TEXT,
+  question_started_at TEXT,
+  question_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  cursor_kind TEXT NOT NULL DEFAULT 'initial',
+  revision INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX one_active_session ON sessions(status) WHERE status = 'active';
+
+CREATE TABLE session_workbooks(
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  workbook_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  result_ack INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(session_id, workbook_id)
+);
+
+CREATE TABLE session_items(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  workbook_id TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  UNIQUE(session_id, ordinal)
+);
+CREATE INDEX session_items_queue ON session_items(session_id, workbook_id, status, ordinal);
+
+CREATE TABLE attempts(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  workbook_id TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  answered_at TEXT NOT NULL,
+  correct INTEGER,
+  unknown INTEGER NOT NULL,
+  hint INTEGER NOT NULL,
+  elapsed_ms INTEGER NOT NULL,
+  rating INTEGER NOT NULL,
+  answer_json TEXT NOT NULL,
+  before_state_json TEXT,
+  after_state_json TEXT,
+  state_revision INTEGER NOT NULL,
+  short_term INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX attempts_session ON attempts(session_id, answered_at);
+CREATE INDEX attempts_question ON attempts(workbook_id, question_id, answered_at);
+
+CREATE TABLE settings(
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  data TEXT NOT NULL
+);
+
+CREATE TABLE meta(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+"#;
+
+pub const EXPECTED_TABLES: &[&str] = &[
+    "attempts",
+    "meta",
+    "notes",
+    "questions",
+    "review_states",
+    "session_items",
+    "session_workbooks",
+    "sessions",
+    "settings",
+    "workbooks",
+];

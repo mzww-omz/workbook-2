@@ -1,0 +1,97 @@
+# 設計判断
+
+## 1. GPUI の固定と vendored patch
+
+- `gpui-kit = "=0.9.0"`、内部で `gpui-pre 0.3.11`（Zed commit snapshot）に固定
+- GPUIはpre-1.0のため、バージョンを固定
+- GPUI Kit の macOS backend が stable Rust 1.96 では未安定の `Result::map_or_default` を3箇所使用していた
+- `vendor/gpui-pre-macos` に該当crateをコピーし、`.map_or_else(Default::default, ...)` に機械置換
+- `[patch.crates-io]` でそのcrateだけ差し替え。GPUI本体のフォークや独自描画はしていない
+- 異なるGPUI crateを混在させていない（UIは `gpui-kit` の再エクスポートのみ使用）
+
+## 2. FSRS は `fsrs-rs` main の FSRS-7
+
+- crates.io `fsrs 6.6.2` は FSRS-6（21パラメータ、`stability_fast` なし）
+- FSRS-7 は main branch に存在するため commit `65224f1d...` 固定
+- FSRS数式はライブラリに任せ、短期ステップ・状態・dueは `StepPolicy` に分離
+- 旧 `ts-fsrs DefaultScheduler` の `allowModelOverride=false` を再現
+- f32/f64差は許容範囲としてテストし、完全一致とは主張しない
+
+## 3. `workbook-service` を追加
+
+推奨構成の `workbook-app` に置くと UI と循環するため、Application Service を独立crateにした。
+
+- UI → service → storage/scheduler/import
+- service がトランザクション境界と revision / idempotency を所有
+- storage は FSRS を知らない
+- scheduler は DB / UI を知らない
+
+## 4. Attempt を独立テーブルに
+
+旧 `review_logs` は `(session, workbook, question)` がPKで、同じ問題の再回答を保持できなかった。
+
+- `attempts.id` を独立UUID
+- `session_id`, `question_id`, `answered_at`, rating, correct, hint, unknown, answer, before/after state, state_revision, short_term を保存
+- 評価訂正は行更新。新しいAttemptを追加しない
+- 二重送信はAttempt IDで冪等
+- 短期再出題は `short_term=1` で区別
+
+## 5. 動的キュー
+
+固定キューは「期限が来た短期カードを同じセッションで出せない」「Learn Aheadできない」ため廃止。
+
+- 次問のたびに `session_items` + `review_states` を参照
+- 候補は DB の現在値から再計算
+- セッション開始時の通常対象は `session_items` に固定し、Review中に新しいReview期限が来ても勝手に追加しない（旧仕様を維持）
+- 短期カードは同じセッション内で再出題
+
+## 6. Learn Ahead
+
+- 20分以内、同じ学習日、通常候補が空のときだけ
+- `due_at` は変更しない
+- 確認ダイアログ・回数制限・最低待機は追加しない
+- 3:55→4:05 のような学習日跨ぎは対象外
+
+## 7. 4時学習日とタイムゾーン
+
+- 保存はUTC Instant
+- 設定 `timezone` はIANA名。既定はシステム
+- `StudyCalendar` が日付境界とLearn Ahead可否を所有
+- 画面の日付・履歴表示も同じタイムゾーン
+
+## 8. Today の「完了」判定
+
+- 期限到来Review/Learningだけで完了にしない
+- 20分以内の短期再学習があれば「短期再学習が待っています」を表示
+- 通常候補がないReviewセッション開始時は Learn Ahead 対象を初期候補に含める
+- これにより「短期カードが残っているのに完了」を防ぐ
+
+## 9. 起動中の更新
+
+- 描画ごとにDBを読まない
+- `observe_window_activation` で再アクティブ時に再評価
+- `next_wake_at`（次のdue / 次の4時）に合わせたタイマー。最大10分で再確認
+- テキスト入力中はタイマー更新をスキップし、IME入力を乱さない
+
+## 10. 画像・数式
+
+- 外部画像は取得しない。imageブロックは alt / caption / URL を表示
+- mathブロックは等幅テキスト。KaTeX相当の組版はv1では未実装
+- MarkdownはGPUIのrich text。HTMLは実行しない
+
+## 11. バックアップ
+
+- 使用中DBのコピーではなく SQLite backup API
+- 0700ディレクトリ、0600ファイル
+- 7世代日次 + 安全バックアップ
+- 復元は検証後にファイル置換、失敗時ロールバック
+
+## 12. 新規上限
+
+設定 `new_limit` は「1日の新規Question数」として扱う。
+
+- 当日の新規セッションで commit された distinct Question を数える
+- Skip、Practice、未確定のEvaluateは数えない
+- 4時境界でリセット
+- Newセッション開始時に残り枠を `new_limit - introduced_today` で計算
+- 残り0ならセッションを開始しない

@@ -1,0 +1,22 @@
+//! Pure Workbook domain types and validation.
+//!
+//! This crate intentionally has no dependency on GPUI, SQLite, or any
+//! scheduling library. Content, questions, grading, and the 4 a.m. study
+//! calendar live here so they can be tested without a desktop session.
+
+pub mod answer;
+pub mod calendar;
+pub mod content;
+pub mod session;
+pub mod settings;
+pub mod workbook;
+
+pub use answer::{Answer, automatic_rating, grade_answer, normalize_answer};
+pub use calendar::{StudyCalendar, learning_day, next_learning_day_start};
+pub use content::{Content, ContentBlock, ImageFit};
+pub use session::{CardState, Mode, Phase, Rating, SessionItemStatus, SessionStatus, StoredCard};
+pub use settings::{Settings, ThemeSetting};
+pub use workbook::{
+    ChoiceOption, MAX_JSON_BYTES, Note, Question, QuestionType, ValidationError, Workbook,
+    parse_workbook,
+};

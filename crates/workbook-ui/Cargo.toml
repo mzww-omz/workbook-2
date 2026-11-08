@@ -1,0 +1,17 @@
+[package]
+name = "workbook-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+gpui-kit.workspace = true
+rfd.workspace = true
+uuid.workspace = true
+workbook-domain = { path = "../workbook-domain" }
+workbook-import = { path = "../workbook-import" }
+workbook-service = { path = "../workbook-service" }

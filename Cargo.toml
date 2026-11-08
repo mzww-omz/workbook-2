@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/workbook-domain",
+    "crates/workbook-scheduler",
+    "crates/workbook-import",
+    "crates/workbook-storage",
+    "crates/workbook-service",
+    "crates/workbook-ui",
+    "crates/workbook-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.96"
+
+[workspace.dependencies]
+chrono = { version = "0.4.42", features = ["serde"] }
+chrono-tz = "0.10.4"
+anyhow = "1"
+iana-time-zone = "0.1.65"
+rusqlite = { version = "0.41.1", features = ["bundled", "backup", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.18", features = ["v4", "serde"] }
+unicode-normalization = "0.1.26"
+url = "2.5.8"
+fsrs = { git = "https://github.com/open-spaced-repetition/fsrs-rs", rev = "65224f1de57c538385ecb5e4df0f2564ee6f0fb8" }
+gpui-kit = "=0.9.0"
+rfd = "0.17.2"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+
+[patch.crates-io]
+# GPUI Kit pins a snapshot of Zed's GPUI. Its macOS backend uses
+# `Result::map_or_default`, which is still unstable on Rust 1.96. These three
+# call sites are pure mechanical replacements; vendor the crate so the app
+# builds on stable Rust. See docs/DECISIONS.md.
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }

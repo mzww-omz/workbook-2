@@ -1,0 +1,14 @@
+{
+  "name": "workbook2-golden-generator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "golden": "tsx generate-legacy-golden.ts"
+  },
+  "dependencies": {
+    "ts-fsrs": "6.0.0"
+  },
+  "devDependencies": {
+    "tsx": "4.23.15"
+  }
+}

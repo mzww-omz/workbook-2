@@ -1,0 +1,8 @@
+/target
+/.reference
+/dist
+/scripts/node_modules
+.DS_Store
+*.sqlite-wal
+*.sqlite-shm
+*.partial

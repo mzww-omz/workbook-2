@@ -1,0 +1,172 @@
+{
+  "format": "workbook",
+  "schemaVersion": 1,
+  "id": "workbook-js-async",
+  "revision": 1,
+  "title": "JavaScript 非同期処理",
+  "description": "待つ・受け取る・組み合わせる。6つの問題形式で、非同期処理の基本を学びます。",
+  "language": "ja",
+  "tags": [
+    "プログラミング",
+    "入門"
+  ],
+  "notes": [
+    {
+      "id": "promise",
+      "title": "Promiseとは",
+      "knowledgeCard": "## 未来の結果を受け取る\n**Promise** は、非同期処理の成功または失敗を表すオブジェクトです。完了前は pending、成功すると fulfilled、失敗すると rejected になります。",
+      "questions": [
+        {
+          "id": "q1",
+          "revision": 1,
+          "type": "single_choice",
+          "prompt": "Promise が表しているものは？",
+          "options": [
+            {
+              "id": "a",
+              "content": "必ず成功する同期処理"
+            },
+            {
+              "id": "b",
+              "content": "非同期処理の最終的な成功または失敗"
+            },
+            {
+              "id": "c",
+              "content": "画面の描画速度"
+            }
+          ],
+          "answer": {
+            "optionId": "b"
+          },
+          "hint": "結果は、まだ届いていないことがあります。",
+          "explanation": "Promise は非同期処理の将来の結果を表します。成功だけでなく、失敗も扱えます。"
+        }
+      ]
+    },
+    {
+      "id": "async",
+      "title": "async関数",
+      "knowledgeCard": "## async は Promise を返す\n`async` を付けた関数は、値をそのまま返しても、戻り値が Promise になります。",
+      "questions": [
+        {
+          "id": "q2",
+          "revision": 1,
+          "type": "true_false",
+          "prompt": "async 関数は、戻り値として Promise を返す。",
+          "answer": true,
+          "hint": "return 1 と書いた場合も同じです。",
+          "explanation": "正しい記述です。async 関数が返す値は Promise に包まれます。"
+        }
+      ]
+    },
+    {
+      "id": "states",
+      "title": "Promiseの状態",
+      "knowledgeCard": "Promise は **pending → fulfilled**、または **pending → rejected** に遷移します。一度確定した結果は変わりません。",
+      "questions": [
+        {
+          "id": "q3",
+          "revision": 1,
+          "type": "multiple_choice",
+          "prompt": "Promise の確定後の状態を、すべて選んでください。",
+          "options": [
+            {
+              "id": "a",
+              "content": "fulfilled"
+            },
+            {
+              "id": "b",
+              "content": "pending"
+            },
+            {
+              "id": "c",
+              "content": "rejected"
+            }
+          ],
+          "answer": {
+            "optionIds": [
+              "a",
+              "c"
+            ]
+          },
+          "hint": "成功と失敗の2通りです。",
+          "explanation": "fulfilled と rejected が確定状態です。pending は処理が未完了の状態です。"
+        }
+      ]
+    },
+    {
+      "id": "name",
+      "title": "結果を表すオブジェクト",
+      "knowledgeCard": [
+        {
+          "type": "markdown",
+          "text": "非同期処理の結果を表す標準オブジェクトの名前は **Promise** です。"
+        },
+        {
+          "type": "code",
+          "text": "const result = Promise.resolve(42);",
+          "language": "javascript"
+        }
+      ],
+      "questions": [
+        {
+          "id": "q4",
+          "revision": 1,
+          "type": "short_text",
+          "prompt": "非同期処理の結果を表す標準オブジェクトの名前を英語で入力してください。",
+          "answer": {
+            "accepted": [
+              "Promise"
+            ]
+          },
+          "hint": "Pから始まります。",
+          "explanation": "Promise です。このアプリでは全角・半角、大文字・小文字の違いは正答として扱います。"
+        }
+      ]
+    },
+    {
+      "id": "await",
+      "title": "awaitで待つ",
+      "knowledgeCard": "`await` は Promise の結果を待ちます。通常、async 関数の中で使います（モジュールのトップレベルでも使用できます）。",
+      "questions": [
+        {
+          "id": "q5",
+          "revision": 1,
+          "type": "cloze",
+          "prompt": "const response = {{blank:one}} fetch(url);",
+          "answer": {
+            "blanks": {
+              "one": [
+                "await"
+              ]
+            }
+          },
+          "hint": "「待つ」を意味するキーワードです。",
+          "explanation": "await fetch(url) と書くと、Promise が解決するまで、この非同期関数の続きを待ちます。"
+        }
+      ]
+    },
+    {
+      "id": "error",
+      "title": "エラーを受け取る",
+      "knowledgeCard": "## try / catch\nawait した Promise が reject された場合、`try / catch` でエラーを処理できます。",
+      "questions": [
+        {
+          "id": "q6",
+          "revision": 1,
+          "type": "flashcard",
+          "front": "await した Promise の失敗を、どう扱いますか？",
+          "back": [
+            {
+              "type": "code",
+              "text": "try {\n  const response = await fetch(url);\n} catch (error) {\n  console.error(error);\n}",
+              "language": "javascript"
+            }
+          ],
+          "hint": "同期処理の例外と同じ構文が使えます。",
+          "explanation": "try / catch で失敗を扱います。fetch はHTTPエラーステータスでは reject されないので、response.ok の確認も必要です。"
+        }
+      ]
+    }
+  ]
+}
