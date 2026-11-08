@@ -1,54 +1,60 @@
-# AGENTS.md
-
-## Project
-
-Rust + GPUI + SQLite macOS app. The Electron Workbook is a read-only compatibility reference; do not edit or migrate its data in place.
+# Agent Instructions
+Rust + GPUI + SQLite macOS app. The legacy Electron Workbook is a read-only compatibility reference.
 
 ## Commands
 
-```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo check --workspace
-cargo run -p workbook-app --bin workbook2
-./scripts/package-macos.sh
-```
+| Task | Command |
+|------|---------|
+| Full verification | `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo check --workspace` |
+| Scheduler tests | `cargo test -p workbook-scheduler` |
+| Service scenarios | `cargo test -p workbook-service --test service` |
+| Storage/backup tests | `cargo test -p workbook-storage --test storage` |
+| Run app | `cargo run -p workbook-app --bin workbook2` |
+| Build `.app` | `./scripts/package-macos.sh` |
+| Regenerate golden fixture | `npm --prefix scripts install && npm --prefix scripts run golden` |
 
-Test-only time source: `workbook_scheduler::FixedClock`. All scheduling tests must use it.
+Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on real time.
+
+## External References
+
+| Need | File |
+|------|------|
+| Setup and usage | `README.md` |
+| Architecture and data flow | `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` |
+| FSRS compatibility and legacy audit | `docs/COMPATIBILITY.md`, `docs/AUDIT.md` |
+| Migration and restore | `docs/MIGRATION.md` |
+| Product and UI direction | `PRODUCT.md`, `DESIGN.md` |
+| Original requirements | `Workbook-2-GPUI-Coding-Agent-Master-Prompt.md` |
 
 ## Boundaries
 
-- `workbook-domain`: pure types, grading, content validation, study calendar
-- `workbook-scheduler`: FSRS adapter, StepPolicy, QueueSelector, Clock
-- `workbook-storage`: SQLite schema, attempts, sessions, backup/restore
-- `workbook-import`: JSON/legacy v1 inspection and migration plan
-- `workbook-service`: commands, transactions, views, snapshots
-- `workbook-ui`: GPUI Kit only. Never call SQLite or FSRS directly.
-- `workbook-app`: startup, data directory, native menu
+- `workbook-domain` / `workbook-scheduler`: pure types, grading, calendar, FSRS adapter, StepPolicy, QueueSelector, Clock. Keep FSRS formulas in `fsrs-rs`.
+- `workbook-storage` / `workbook-import`: SQLite, attempts, sessions, backup/restore; JSON and legacy v1 migration.
+- `workbook-service`: commands, transaction boundaries, snapshots, views.
+- `workbook-ui` / `workbook-app`: GPUI Kit views and startup. UI must not call SQLite or FSRS directly.
 
-Keep FSRS formulas in `fsrs-rs`; do not reimplement them. StepPolicy and queue policy belong in `workbook-scheduler`.
+## Scheduling Invariants
 
-## Data safety
+- Commit FSRS state, Attempt, Session, item status, note introduction, and sibling bury in one transaction.
+- Corrections update the current Attempt; never append a new Attempt.
+- Recompute the next queue from SQLite after every answer; do not use a fixed queue.
+- Learn Ahead is limited to 20 minutes and the same 4 a.m. learning day. Never rewrite saved `due_at`.
+- The daily new limit counts distinct committed New questions. Skip, Practice, and uncommitted evaluation do not count.
+- Store UTC instants; use the configured IANA timezone only for the 4 a.m. day boundary.
 
-- New app id `1463962418`; legacy id `1463962443`
-- Never write to the legacy DB
-- Back up before import/delete/restore/reset
-- Never copy a live SQLite file directly; use the backup API
-- Do not print user data or tokens
-- No push, release, notarization, or remote upload without explicit request
+## Data Safety
 
-## Verification
+- New app id `1463962418`; legacy id `1463962443`. Never write to the legacy DB.
+- Back up before import, delete, restore, or history reset.
+- Never copy a live SQLite file directly; use the backup API.
+- Do not print user data, secrets, or tokens.
+- Do not push, release, notarize, or upload without an explicit request.
 
-- Golden fixture: `fixtures/legacy-fsrs7-golden.json`
-- Any scheduling change must keep the golden tests and scenario A/B/C tests passing
-- Do not claim VoiceOver/IME/Windows/Linux verification without an actual run
-- Screenshots live in `docs/screenshots/`; do not fabricate them
+## UI And Verification
 
-## UI conventions
-
-- Do not add rounded cards, gradients, glows, or decorative motion
-- Do not show scheduler internals during Study
-- Feedback must show correctness as text as well as color
-- Keep text inputs usable with Japanese IME; do not bind rating digits while an input is focused
-- Keep the sidebar hidden during Study
+- Keep GPUI dependencies pinned; do not mix crate versions. See `vendor/` and `docs/DECISIONS.md`.
+- Do not add decorative cards, gradients, glows, or motion. Keep the sidebar hidden during Study.
+- Do not show scheduler internals during Study. Feedback must use text as well as color.
+- Do not bind rating digits while a text input is focused; keep IME input usable.
+- Do not fabricate screenshots or claim VoiceOver, IME, Windows, or Linux verification without an actual run.
+- Screenshots live in `docs/screenshots/`; regenerate with `./scripts/capture-screenshots.sh`.
