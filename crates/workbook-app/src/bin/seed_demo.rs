@@ -5,7 +5,8 @@
 //!   cargo run -p workbook-app --bin seed_demo -- /tmp/workbook2-demo feedback
 //!
 //! Profiles: today, library, history, settings, study, feedback, result,
-//! v2-numeric, v2-ordering, v2-matching, v2-hotspot, v2-labeling, v2-near-miss.
+//! v2-numeric, v2-ordering, v2-matching, v2-hotspot, v2-labeling, v2-near-miss,
+//! v2-math.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -35,6 +36,11 @@ fn main() -> anyhow::Result<()> {
     let service = WorkbookService::open(&directory, clock.clone())?;
     if profile == "upcoming" {
         seed_upcoming(&service)?;
+        println!("seeded profile={} at {}", profile, directory.display());
+        return Ok(());
+    }
+    if profile == "v2-math" {
+        seed_math(&service)?;
         println!("seeded profile={} at {}", profile, directory.display());
         return Ok(());
     }
@@ -103,6 +109,50 @@ fn main() -> anyhow::Result<()> {
     println!("seeded profile={} at {}", profile, directory.display());
     Ok(())
 }
+
+/// Math, inline math, image fit, and compact option rendering for manual QA
+/// and the `docs/screenshots/math.png` capture.
+fn seed_math(service: &WorkbookService) -> anyhow::Result<()> {
+    let book = service.import_workbook_json(MATH_DEMO_JSON)?;
+    service.start_session(Mode::Practice, Some(&book))?;
+    let view = service.active_view()?.expect("active practice session");
+    wait_for_question(service, view)?;
+    Ok(())
+}
+
+const MATH_DEMO_JSON: &str = r#"{
+  "format":"workbook","schemaVersion":2,"id":"workbook-math-demo","revision":1,
+  "title":"数式と画像の表示確認","description":"数式の組版、インライン数式、contain と cover。",
+  "language":"ja","tags":["確認"],
+  "assets":[
+    {"id":"wide-diagram","alt":"横長の見本画像","mediaType":"image/svg+xml",
+     "data":"PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4MDAiIGhlaWdodD0iMzAwIiB2aWV3Qm94PSIwIDAgODAwIDMwMCI+PHJlY3Qgd2lkdGg9IjgwMCIgaGVpZ2h0PSIzMDAiIGZpbGw9IiNlOGVkZjUiLz48cmVjdCB4PSIwIiB5PSIwIiB3aWR0aD0iNDAwIiBoZWlnaHQ9IjMwMCIgZmlsbD0iIzlkYjRkNiIvPjxjaXJjbGUgY3g9IjYwMCIgY3k9IjE1MCIgcj0iOTAiIGZpbGw9IiNjOTZiNWEiLz48cmVjdCB4PSI4MCIgeT0iMTEwIiB3aWR0aD0iMjQwIiBoZWlnaHQ9IjgwIiBmaWxsPSIjNGY3YTUyIi8+PC9zdmc+"}
+  ],
+  "notes":[{"id":"n-math","title":"数式の表示","knowledgeCard":[
+    {"type":"math","text":"\\frac{1}{2}"},
+    {"type":"math","text":"x^2 + 2x + 1"},
+    {"type":"math","text":"\\sqrt{3}"}
+  ],"questions":[
+    {"id":"q-math","revision":1,"type":"single_choice",
+     "prompt":[
+       {"type":"math","text":"\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}"},
+       {"type":"math","text":"a_1 + a_2 + \\sum_{i=1}^{n} i"},
+       {"type":"math","text":"\\sin\\theta + |x| + \\text{速さ}"},
+       {"type":"markdown","text":"インライン数式: 速さは $v=\\frac{d}{t}$ です。"},
+       {"type":"image","asset":"wide-diagram","alt":"横長画像（contain）","fit":"contain"},
+       {"type":"image","asset":"wide-diagram","alt":"横長画像（cover）","fit":"cover"}
+     ],
+     "options":[
+       {"id":"a","content":[{"type":"math","text":"\\frac{1}{2}"}]},
+       {"id":"b","content":[{"type":"math","text":"x^2"}]},
+       {"id":"c","content":[{"type":"math","text":"\\sqrt{3}"}]}
+     ],
+     "answer":{"optionId":"b"},
+     "explanation":[
+       {"type":"math","text":"\\int_0^1 x\\,dx = \\frac{1}{2}"}
+     ]}
+  ]}]
+}"#;
 
 fn seed_expanded(service: &WorkbookService, target: &str) -> anyhow::Result<()> {
     let book = service.import_workbook_json(workbook_service::SAMPLE_WORKBOOK_V2_JSON)?;

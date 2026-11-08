@@ -98,7 +98,7 @@ fn print_help() {
          使い方:\n  workbook-lint <workbook.json | ディレクトリ> [--format text|json] [--strict]\n\n\
          ディレクトリには workbook.json を置くか、.json を1つだけ含めてください。\n\
          --strict は Warning も失敗として扱います（CI向け）。\n\
-         終了コード: 0=成功, 1=診断あり, 2=使い方/IOエラー"
+         終了コード: 0=成功, 1=教材検証エラー, 2=引数/IO/JSON出力エラー"
     );
 }
 
@@ -122,7 +122,9 @@ fn print_text(report: &LintReport) {
         "結果: {} error, {} warning, {} info",
         report.summary.errors, report.summary.warnings, report.summary.infos
     );
-    if report.ok {
+    if report.is_io_error() {
+        println!("NG: 入力ファイルまたはディレクトリを読み込めません");
+    } else if report.ok {
         println!("OK: インポート可能です");
     } else {
         println!("NG: Error を修正してください");

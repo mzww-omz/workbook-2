@@ -137,7 +137,30 @@ pub struct AssetView {
     pub alt: String,
     pub width: u32,
     pub height: u32,
+    /// Content fingerprint (bytes plus dimensions and media type). The UI
+    /// image cache keys on it so re-importing an asset with the same ID but
+    /// new content cannot reuse the old decoded texture.
+    pub fingerprint: u64,
     pub bytes: Arc<Vec<u8>>,
+}
+
+/// Stable, allocation-free fingerprint of an embedded asset. FNV-1a is enough
+/// for cache identity: a collision would only mean reusing an image whose
+/// bytes and metadata are already effectively identical.
+fn asset_fingerprint(media_type: &str, width: u32, height: u32, bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in media_type
+        .bytes()
+        .chain(width.to_le_bytes())
+        .chain(height.to_le_bytes())
+        .chain(bytes.iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1266,12 +1289,19 @@ impl WorkbookService {
             }
             for id in ids {
                 if let Some(asset) = storage.asset(workbook_id, &id)? {
+                    let fingerprint = asset_fingerprint(
+                        &asset.media_type,
+                        asset.width,
+                        asset.height,
+                        &asset.bytes,
+                    );
                     assets.push(AssetView {
                         id: asset.id,
                         media_type: asset.media_type,
                         alt: asset.alt,
                         width: asset.width,
                         height: asset.height,
+                        fingerprint,
                         bytes: Arc::new(asset.bytes),
                     });
                 }
@@ -1960,4 +1990,20 @@ pub fn theme_from_settings(settings: &Settings) -> ThemeSetting {
 
 pub fn is_short_term(state: CardState) -> bool {
     state.is_short_term()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asset_fingerprint;
+
+    #[test]
+    fn asset_fingerprint_changes_when_the_content_changes() {
+        let first = asset_fingerprint("image/svg+xml", 800, 300, b"<svg/>");
+        let same = asset_fingerprint("image/svg+xml", 800, 300, b"<svg/>");
+        let changed = asset_fingerprint("image/svg+xml", 800, 300, b"<svg>2</svg>");
+        let resized = asset_fingerprint("image/svg+xml", 801, 300, b"<svg/>");
+        assert_eq!(first, same);
+        assert_ne!(first, changed);
+        assert_ne!(first, resized);
+    }
 }

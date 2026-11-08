@@ -69,7 +69,12 @@
     オフラインのプレースホルダになる。教材画像には使わない。
   - `asset`: 同梱画像の ID。`assets` に存在しなければならない。
 - `alt` は必須。空文字は拒否。何が描かれているか分かる説明にする。
-- `caption` は任意。`fit` は `contain`（既定）または `cover`。
+- `caption` は任意。`fit` は `contain`（既定）または `cover`。`cover` は 4:3 で
+  中央クロップする。Hotspot / Labeling は座標のため常に `contain`。
+- `math` の `text` は LaTeX サブセット。`\frac`、`^`、`_`、`\sqrt`、`\left...\right`、
+  ギリシャ文字、`\sin` などの関数、`\sum`、`\text{}` に対応する。行列・
+  `\begin{...}` などは未対応で、その場合は生の文字列と理由が表示される。
+  文字列中のインライン数式は `$...$` または `\(...\)`。
 - Markdown / Math / Code / Image は同じ Content 内で混在できる。
 
 ## 同梱画像 (assets)

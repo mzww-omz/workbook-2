@@ -105,10 +105,19 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
 - Content の画像は `ImageSource::Url`（HTTPS・外部取得なし）と
   `ImageSource::Asset`（教材同梱）を型で区別する。アセットは `StudyView.assets` として
   Service が SQLite から読み、UI はアセット ID で参照する。UI は SQLite を直接触らない。
-- 画像は `workbook-ui/src/content.rs` でワークブック ID + アセット ID をキーに
-  `Arc<Image>` をキャッシュし、毎フレームのデコードを避ける。表示サイズは
-  `ui_logic::fit_image` でアスペクト比を維持して計算する。Hotspot のクリック座標も
-  同じ表示矩形を使う。
+- 画像は `workbook-ui/src/content.rs` でワークブック ID + アセット ID + 内容
+  フィンガープリントをキーに `Arc<Image>` を LRU キャッシュし（推定デコードメモリ
+  64MiB・最大 24 件）、毎フレームのデコードと問題切替ごとの再デコードを避ける。
+  追い出した画像は `App::remove_asset` で GPUI のアセットキャッシュからも解放する。
+  再インポート・アセット更新・Workbook 削除・バックアップ復元で無効化する。
+- 画像の表示領域は `ui_logic::image_box` で求める。`contain` は画像全体を
+  アスペクト比維持で shrink-wrap し、`cover` は 4:3 のビューポートを画像で埋めて
+  中央基準で切り抜く。Hotspot / Labeling は座標精度のため常に `contain`。
+  Hotspot のクリック座標は実測 bounds と同じ表示矩形を使う。
+- 数式は `workbook-ui/src/math.rs` で LaTeX サブセットを解析し、分数・根号・
+  上下付き・大型演算子・括弧・本文テキストのレイアウトツリーへ変換して GPUI の
+  flex / text 要素で描画する。WebView やブラウザエンジンは使わない。解析不能な
+  入力は生の LaTeX と理由を表示し、元の LaTeX をアクセシビリティラベルにする。
 - UI は採点しない。採点と Near Miss の判定は `workbook-domain::grading` が持つ。
 
 ## SQLite

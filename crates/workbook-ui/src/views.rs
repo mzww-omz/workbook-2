@@ -2652,7 +2652,7 @@ impl WorkbookApp {
     fn render_question_image(&self, asset: &AssetView, _cx: &Context<Self>) -> gpui_kit::Div {
         self.content_images().render_asset_div(
             asset,
-            workbook_domain::ImageFit::Contain,
+            crate::ui_logic::annotation_image_fit(),
             640.0,
             380.0,
         )

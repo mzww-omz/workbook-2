@@ -108,3 +108,124 @@ fn usage_errors_exit_with_two() {
     let output = run(&["--format", "yaml", "somewhere"]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn missing_path_is_an_io_error_not_a_workbook_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.json");
+    let output = run(&[missing.to_str().unwrap(), "--format", "json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["diagnostics"][0]["code"], "WB-IO-001");
+    assert_eq!(value["summary"]["errors"], 1);
+}
+
+#[test]
+fn directory_without_a_workbook_is_an_io_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run(&[dir.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("読み込めません"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_file_is_an_io_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_workbook(
+        dir.path(),
+        "workbook.json",
+        "昼間の空は青く見えます。理由は光の散乱です。",
+    );
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    // Root can read the file regardless of mode; there is nothing to verify
+    // in that environment.
+    let unreadable = std::fs::read(&path).is_err();
+    let output = if unreadable {
+        Some(run(&[path.to_str().unwrap(), "--format", "json"]))
+    } else {
+        None
+    };
+    // Restore before asserting so the tempdir can always be cleaned up.
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    let Some(output) = output else {
+        return;
+    };
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["diagnostics"][0]["code"], "WB-IO-001");
+}
+
+#[test]
+fn malformed_json_and_invalid_workbooks_exit_with_one() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let malformed = dir.path().join("malformed.json");
+    std::fs::write(&malformed, "{not json").unwrap();
+    let output = run(&[malformed.to_str().unwrap(), "--format", "json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["diagnostics"][0]["code"], "WB-JSON-001");
+
+    let invalid = dir.path().join("invalid.json");
+    std::fs::write(
+        &invalid,
+        r#"{"format":"workbook","schemaVersion":2,"id":"w1","revision":1,
+            "title":"x","description":"","language":"ja","tags":[],"notes":[]}"#,
+    )
+    .unwrap();
+    let output = run(&[invalid.to_str().unwrap(), "--format", "json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], false);
+    assert!(value["summary"]["errors"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn warning_only_workbooks_succeed_unless_strict() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_workbook(dir.path(), "workbook.json", "短い");
+    let normal = run(&[path.to_str().unwrap()]);
+    assert_eq!(normal.status.code(), Some(0));
+    let strict = run(&[path.to_str().unwrap(), "--strict"]);
+    assert_eq!(strict.status.code(), Some(1));
+}
+
+#[test]
+fn json_output_contract_stays_stable_for_every_exit_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid = write_workbook(
+        dir.path(),
+        "workbook.json",
+        "昼間の空は青く見えます。理由は光の散乱です。",
+    );
+    let missing = dir.path().join("missing.json");
+
+    for (path, expected_code, expected_errors) in
+        [(valid.as_path(), 0_u8, 0_u64), (missing.as_path(), 2, 1)]
+    {
+        let output = run(&[path.to_str().unwrap(), "--format", "json"]);
+        assert_eq!(
+            output.status.code().map(|code| code as u8),
+            Some(expected_code),
+            "{}",
+            path.display()
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["version"], 1);
+        assert!(value["path"].as_str().is_some());
+        assert_eq!(value["summary"]["errors"], expected_errors);
+        assert!(value["diagnostics"].is_array());
+        // Internal report kind must never leak into the JSON contract.
+        assert!(value.get("kind").is_none());
+    }
+}

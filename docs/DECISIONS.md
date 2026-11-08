@@ -77,7 +77,13 @@
 
 - 外部画像は取得しない。既存の image ブロックは alt / caption / URL を表示
 - Hotspot / Labeling 用の画像は教材に同梱し、SQLite の `assets` テーブルへ取り込む
-- mathブロックは等幅テキスト。KaTeX相当の組版はv1では未実装
+- mathブロックは `workbook-ui/src/math.rs` のLaTeXサブセット解析 + GPUIレイアウトで組版する。
+  依存crateを増やさず、WebViewやブラウザエンジンも使わない。分数・根号・上下付き・
+  大型演算子・括弧・本文テキストに対応し、解析不能時は生LaTeXを理由付きで表示する
+- 画像の `contain` は全体表示、`cover` は4:3ビューポートへの中央クロップ。Hotspot /
+  Labelingは座標精度のため常に `contain`
+- デコード済み画像は workbook + asset + 内容フィンガープリントのLRU（64MiB / 24件）。
+  問題切替では消さず、再インポート・更新・削除・復元で無効化する
 - MarkdownはGPUIのrich text。HTMLは実行しない
 
 ## 11. バックアップ

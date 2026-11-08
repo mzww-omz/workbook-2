@@ -38,8 +38,16 @@ cargo run -p workbook-lint -- ./my-workbook/ --strict
 | code | 意味 |
 |---|---|
 | 0 | Error なし（`--strict` では Warning もなし） |
-| 1 | Error あり、または `--strict` で Warning あり |
-| 2 | 引数・IO・JSON出力のエラー |
+| 1 | Workbook の構造・内容・アセット検証エラー、JSON 構文エラー、`--strict` 時の Warning |
+| 2 | CLI 引数エラー、入力ファイル／ディレクトリの IO エラー、JSON 出力自体の失敗 |
+
+判定は「Workbook を読めたか」で行います。
+
+- `WB-JSON-001`（JSON 構文不正）と `WB-JSON-002`（サイズ超過）は、ファイルを
+  読めたうえでの教材検証エラーなので **1**。
+- `WB-IO-001`（存在しないパス、読み取り不能、JSON が無いディレクトリ、複数候補）は
+  **2**。診断 JSON 自体は同じ形式で出力します（`version: 1`、`ok: false`）。
+- `--format json` のシリアライズに失敗した場合も **2**。
 
 ## 診断形式
 
@@ -182,8 +190,9 @@ Domain が行い、`WB-ANSWER-001` または `WB-VALIDATION-001` として報告
 cargo run -q -p workbook-lint -- ./workbooks --format json --strict > lint.json
 ```
 
-`ok: false` または終了コード 1 で失敗させます。JSON は `version` と
-`diagnostics[].code` を契約として扱えます。
+`ok: false`、終了コード 1（教材の問題）または 2（入力の IO 問題）で失敗させます。
+JSON は `version` と `diagnostics[].code` を契約として扱えます。終了コード 2 でも
+`WB-IO-001` を含む同じ形の JSON を出力するため、ログから原因を区別できます。
 
 ## 制限
 

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use workbook_domain::HotspotShape;
+use workbook_domain::ImageFit;
 
 /// Moves `id` so it lands at `target` in the resulting list.
 pub(crate) fn move_order(order: &mut Vec<String>, id: &str, target: usize) -> bool {
@@ -32,6 +33,97 @@ pub(crate) fn fit_image(width: u32, height: u32, max_width: f32, max_height: f32
     let height = height.max(1) as f32;
     let scale = (max_width / width).min(max_height / height).min(1.0);
     ((width * scale).max(1.0), (height * scale).max(1.0))
+}
+
+/// Aspect ratio of the viewport used by `ImageFit::Cover`.
+///
+/// `cover` has to crop, so it needs a display area whose aspect ratio is
+/// independent of the image. A 4:3 frame is the classroom-friendly default
+/// (diagrams and photos fit well) and fits inside the body/option height
+/// limits.
+pub(crate) const COVER_ASPECT: f32 = 4.0 / 3.0;
+
+/// Hotspot and Labeling store normalized coordinates relative to the whole
+/// image. Cropping would move those coordinates, so annotation images are
+/// always displayed with `contain`, regardless of any content-level fit.
+pub(crate) fn annotation_image_fit() -> ImageFit {
+    ImageFit::Contain
+}
+
+/// Returns the element box `(width, height)` for a Content image.
+///
+/// * `contain` shrink-wraps the whole image (never cropped, never upscaled);
+///   the surrounding layout supplies the padding.
+/// * `cover` always uses a 4:3 viewport bounded by the available width and
+///   height, and the image is cropped to fill it. A wide image therefore gets
+///   a shorter `contain` box and a taller, cropped `cover` box.
+pub(crate) fn image_box(
+    width: u32,
+    height: u32,
+    fit: ImageFit,
+    max_width: f32,
+    max_height: f32,
+) -> (f32, f32) {
+    let max_width = max_width.max(1.0);
+    let max_height = max_height.max(1.0);
+    match fit {
+        ImageFit::Contain => fit_image(width, height, max_width, max_height),
+        ImageFit::Cover => {
+            let width = max_width;
+            let height = width / COVER_ASPECT;
+            if height <= max_height {
+                (width, height)
+            } else {
+                let height = max_height;
+                (height * COVER_ASPECT, height)
+            }
+        }
+    }
+}
+
+/// The normalized source rectangle `(x, y, width, height)` of the image that
+/// is visible inside the element box.
+///
+/// `contain` shows the whole image. `cover` crops symmetrically (GPUI's
+/// `ObjectFit::Cover` centres the image). This is used by tests and keeps the
+/// crop math next to the layout math; Hotspot/Labeling deliberately use
+/// `contain`, so their normalized coordinates are never affected by cropping.
+#[cfg(test)]
+pub(crate) fn visible_source_rect(
+    box_width: f32,
+    box_height: f32,
+    image_width: u32,
+    image_height: u32,
+    fit: ImageFit,
+) -> Option<(f32, f32, f32, f32)> {
+    if !box_width.is_finite()
+        || !box_height.is_finite()
+        || box_width <= 0.0
+        || box_height <= 0.0
+        || image_width == 0
+        || image_height == 0
+    {
+        return None;
+    }
+    if fit == ImageFit::Contain {
+        return Some((0.0, 0.0, 1.0, 1.0));
+    }
+    let image_width = image_width as f32;
+    let image_height = image_height as f32;
+    let scale = (box_width / image_width).max(box_height / image_height);
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let drawn_width = image_width * scale;
+    let drawn_height = image_height * scale;
+    let left = (box_width - drawn_width) / 2.0;
+    let top = (box_height - drawn_height) / 2.0;
+    Some((
+        (-left / drawn_width).clamp(0.0, 1.0),
+        (-top / drawn_height).clamp(0.0, 1.0),
+        (box_width / drawn_width).clamp(0.0, 1.0),
+        (box_height / drawn_height).clamp(0.0, 1.0),
+    ))
 }
 
 /// The rectangle the image actually occupies inside its element when drawn
@@ -334,6 +426,134 @@ mod tests {
         let (width, height) = fit_image(100, 1000, 640.0, 380.0);
         assert!(height <= 380.0);
         assert!((width / height - 0.1).abs() < 0.001);
+    }
+
+    fn box_for(width: u32, height: u32, fit: ImageFit) -> (f32, f32) {
+        image_box(width, height, fit, 640.0, 480.0)
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    #[test]
+    fn contain_and_cover_produce_different_layouts_for_wide_images() {
+        let (contain_w, contain_h) = box_for(1000, 200, ImageFit::Contain);
+        let (cover_w, cover_h) = box_for(1000, 200, ImageFit::Cover);
+        assert!(close(contain_w, 640.0));
+        assert!(close(contain_h, 128.0));
+        assert!(close(cover_w, 640.0));
+        assert!(close(cover_h, 480.0));
+        assert!((contain_h - cover_h).abs() > 300.0);
+        assert!(contain_w <= 640.0 && contain_h <= 480.0);
+        assert!(cover_w <= 640.0 && cover_h <= 480.0);
+    }
+
+    #[test]
+    fn contain_and_cover_produce_different_layouts_for_tall_images() {
+        let (contain_w, contain_h) = box_for(200, 1000, ImageFit::Contain);
+        let (cover_w, cover_h) = box_for(200, 1000, ImageFit::Cover);
+        assert!(close(contain_w, 96.0));
+        assert!(close(contain_h, 480.0));
+        assert!(close(cover_w, 640.0));
+        assert!(close(cover_h, 480.0));
+        assert!(cover_w > contain_w * 5.0);
+    }
+
+    #[test]
+    fn square_and_small_images_still_differ_between_contain_and_cover() {
+        let (contain_w, contain_h) = box_for(200, 200, ImageFit::Contain);
+        assert!(close(contain_w, 200.0) && close(contain_h, 200.0));
+        let (cover_w, cover_h) = box_for(200, 200, ImageFit::Cover);
+        assert!(close(cover_w, 640.0) && close(cover_h, 480.0));
+
+        // Small images are not upscaled by contain, but cover fills its frame.
+        let (contain_w, contain_h) = box_for(50, 40, ImageFit::Contain);
+        assert!(close(contain_w, 50.0) && close(contain_h, 40.0));
+        let (cover_w, cover_h) = box_for(50, 40, ImageFit::Cover);
+        assert!(cover_w > contain_w && cover_h > contain_h);
+    }
+
+    #[test]
+    fn cover_uses_available_space_in_narrow_and_wide_containers() {
+        let (width, height) = image_box(1000, 200, ImageFit::Cover, 100.0, 480.0);
+        assert!(close(width, 100.0) && close(height, 75.0));
+        let (width, height) = image_box(1000, 200, ImageFit::Cover, 2000.0, 2000.0);
+        assert!(close(width, 2000.0) && close(height, 1500.0));
+        // The frame keeps its aspect ratio when the window changes.
+        for max_width in [320.0, 640.0, 1120.0] {
+            let (width, height) = image_box(1000, 200, ImageFit::Cover, max_width, 480.0);
+            assert!(close(width / height, COVER_ASPECT), "{max_width}");
+        }
+    }
+
+    #[test]
+    fn large_images_are_bounded_by_the_available_box() {
+        let (width, height) = image_box(4000, 3000, ImageFit::Contain, 640.0, 480.0);
+        assert!(close(width, 640.0) && close(height, 480.0));
+        let (width, height) = image_box(4000, 1000, ImageFit::Contain, 640.0, 480.0);
+        assert!(close(width, 640.0) && close(height, 160.0));
+        let (width, height) = image_box(4000, 1000, ImageFit::Cover, 640.0, 480.0);
+        assert!(width <= 640.0 && height <= 480.0);
+        assert!(close(width / height, COVER_ASPECT));
+    }
+
+    #[test]
+    fn labeling_and_hotspot_images_always_use_contain() {
+        assert_eq!(annotation_image_fit(), ImageFit::Contain);
+    }
+
+    #[test]
+    fn cover_crops_the_source_symmetrically_and_contain_shows_everything() {
+        assert_eq!(
+            visible_source_rect(640.0, 480.0, 1000, 200, ImageFit::Contain),
+            Some((0.0, 0.0, 1.0, 1.0))
+        );
+        let (x, y, width, height) =
+            visible_source_rect(640.0, 480.0, 1000, 200, ImageFit::Cover).unwrap();
+        // Scale is 2.4, the drawn width is 2400 and only 640 is visible.
+        assert!(close(x, 880.0 / 2400.0));
+        assert!(close(y, 0.0));
+        assert!(close(width, 640.0 / 2400.0));
+        assert!(close(height, 1.0));
+        assert!(x > 0.0 && x + width < 1.0 + 1e-6);
+
+        let (x, y, width, height) =
+            visible_source_rect(640.0, 480.0, 200, 1000, ImageFit::Cover).unwrap();
+        assert!(close(x, 0.0));
+        assert!(close(y, 1360.0 / 3200.0));
+        assert!(close(width, 1.0));
+        assert!(close(height, 480.0 / 3200.0));
+    }
+
+    #[test]
+    fn image_boxes_are_resolution_independent() {
+        // All math is in logical pixels, so a Retina window (2x backing scale)
+        // produces the same numbers for the same logical bounds.
+        let logical = image_box(1000, 200, ImageFit::Cover, 640.0, 480.0);
+        assert!(close(logical.0, 640.0) && close(logical.1, 480.0));
+        assert_eq!(
+            visible_source_rect(640.0, 480.0, 1000, 200, ImageFit::Cover),
+            visible_source_rect(640.0, 480.0, 1000, 200, ImageFit::Cover)
+        );
+    }
+
+    #[test]
+    fn image_boxes_reject_invalid_dimensions() {
+        assert_eq!(
+            visible_source_rect(0.0, 10.0, 10, 10, ImageFit::Cover),
+            None
+        );
+        assert_eq!(
+            visible_source_rect(10.0, 10.0, 0, 10, ImageFit::Cover),
+            None
+        );
+        assert_eq!(
+            visible_source_rect(f32::NAN, 10.0, 10, 10, ImageFit::Contain),
+            None
+        );
+        let (width, height) = image_box(0, 0, ImageFit::Contain, 640.0, 480.0);
+        assert!(width >= 1.0 && height >= 1.0);
     }
 
     #[test]

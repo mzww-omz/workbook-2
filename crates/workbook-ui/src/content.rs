@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui_kit::component::{Theme, text::TextView};
@@ -9,6 +8,8 @@ use gpui_kit::{
 };
 use workbook_domain::{Content, ContentBlock, ImageBlock, ImageFit, ImageSource as BlockSource};
 use workbook_service::AssetView;
+
+use crate::image_cache::{ImageCache, ImageKey, decoded_bytes};
 
 /// Text metrics used by the shared content renderer. Question bodies use the
 /// normal scale; answer options use the compact scale so rich options still fit
@@ -20,6 +21,10 @@ pub(crate) struct ContentScale {
     pub code_size: f32,
     pub code_line_height: f32,
     pub math_size: f32,
+    /// Compact rows (answer options, matching/labeling cells) use smaller
+    /// scripts and inline-style limits so a math expression stays inside the
+    /// row.
+    pub compact: bool,
     /// Compact option rows bound tall image placeholders so a list row stays
     /// readable. Body content leaves the placeholder unbounded.
     pub image_max_height: Option<f32>,
@@ -31,7 +36,8 @@ impl ContentScale {
         line_height: 27.0,
         code_size: 13.0,
         code_line_height: 20.0,
-        math_size: 14.0,
+        math_size: 16.0,
+        compact: false,
         image_max_height: None,
     };
 
@@ -40,7 +46,8 @@ impl ContentScale {
         line_height: 23.0,
         code_size: 12.0,
         code_line_height: 18.0,
-        math_size: 13.0,
+        math_size: 14.0,
+        compact: true,
         image_max_height: Some(120.0),
     };
 }
@@ -50,20 +57,20 @@ impl ContentScale {
 /// read SQLite or the filesystem from the renderer.
 pub(crate) struct ContentImages<'a> {
     assets: &'a [AssetView],
-    cache: &'a RefCell<BTreeMap<String, Arc<Image>>>,
-    cache_prefix: &'a str,
+    cache: &'a RefCell<ImageCache>,
+    workbook_id: &'a str,
 }
 
 impl<'a> ContentImages<'a> {
     pub(crate) fn new(
         assets: &'a [AssetView],
-        cache: &'a RefCell<BTreeMap<String, Arc<Image>>>,
-        cache_prefix: &'a str,
+        cache: &'a RefCell<ImageCache>,
+        workbook_id: &'a str,
     ) -> Self {
         Self {
             assets,
             cache,
-            cache_prefix,
+            workbook_id,
         }
     }
 
@@ -71,21 +78,22 @@ impl<'a> ContentImages<'a> {
         self.assets.iter().find(|asset| asset.id == id)
     }
 
-    /// Decodes an asset at most once per workbook/asset pair. GPUI keeps the
-    /// decoded image alive through the returned `Arc`, so scrolling and
-    /// re-rendering do not decode the same PNG or SVG every frame.
+    /// Returns the decoded image for this workbook asset, reusing the LRU
+    /// cache entry. The key includes a content fingerprint, so a re-imported
+    /// asset with the same ID but new bytes is treated as a different image.
     pub(crate) fn image(&self, asset: &AssetView) -> Arc<Image> {
-        let format = match asset.media_type.as_str() {
-            "image/jpeg" => ImageFormat::Jpeg,
-            "image/svg+xml" => ImageFormat::Svg,
-            _ => ImageFormat::Png,
-        };
-        let key = format!("{}:{}", self.cache_prefix, asset.id);
-        let mut cache = self.cache.borrow_mut();
-        cache
-            .entry(key)
-            .or_insert_with(|| Arc::new(Image::from_bytes(format, asset.bytes.as_ref().clone())))
-            .clone()
+        let key = ImageKey::new(self.workbook_id, &asset.id, asset.fingerprint);
+        let estimate = decoded_bytes(asset.width, asset.height);
+        self.cache
+            .borrow_mut()
+            .get_or_insert_with(key, estimate, || {
+                let format = match asset.media_type.as_str() {
+                    "image/jpeg" => ImageFormat::Jpeg,
+                    "image/svg+xml" => ImageFormat::Svg,
+                    _ => ImageFormat::Png,
+                };
+                Arc::new(Image::from_bytes(format, asset.bytes.as_ref().clone()))
+            })
     }
 
     /// Shared image element used by rich content and by Hotspot/Labeling.
@@ -97,7 +105,7 @@ impl<'a> ContentImages<'a> {
         max_height: f32,
     ) -> gpui_kit::Div {
         let (width, height) =
-            crate::ui_logic::fit_image(asset.width, asset.height, max_width, max_height);
+            crate::ui_logic::image_box(asset.width, asset.height, fit, max_width, max_height);
         let image = self.image(asset);
         let alt = asset.alt.clone();
         let object_fit = match fit {
@@ -170,7 +178,7 @@ fn render_content_scaled(
     images: &ContentImages<'_>,
 ) -> AnyElement {
     match content {
-        Content::Text(text) => markdown(prefix, text, scale),
+        Content::Text(text) => render_text(prefix, text, theme, scale),
         Content::Blocks(blocks) => {
             let mut column = div().flex().flex_col().gap_2().min_w(px(0.0));
             for (index, block) in blocks.iter().enumerate() {
@@ -185,6 +193,46 @@ fn render_content_scaled(
             column.into_any_element()
         }
     }
+}
+
+/// Renders text, splitting inline math (`$...$` and `\(...\)`) out of the
+/// Markdown run. Text without math keeps the original single `TextView` so
+/// heading/list/paragraph layout is unchanged.
+fn render_text(prefix: &str, text: &str, theme: &Theme, scale: ContentScale) -> AnyElement {
+    let segments = crate::math::split_inline_math(text);
+    let has_math = segments
+        .iter()
+        .any(|segment| matches!(segment, crate::math::InlineSegment::Math(_)));
+    if !has_math {
+        return markdown(prefix, text, scale);
+    }
+    let mut row = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .min_w(px(0.0))
+        .max_w_full();
+    for (index, segment) in segments.iter().enumerate() {
+        match segment {
+            crate::math::InlineSegment::Text(text) => {
+                row = row.child(div().flex_shrink_1().min_w(px(0.0)).child(markdown(
+                    &format!("{prefix}-text-{index}"),
+                    text,
+                    scale,
+                )));
+            }
+            crate::math::InlineSegment::Math(text) => {
+                row = row.child(crate::math::render_math(
+                    text,
+                    theme,
+                    scale.math_size,
+                    crate::math::MathMode::Inline,
+                ));
+            }
+        }
+    }
+    row.into_any_element()
 }
 
 fn markdown(prefix: &str, text: &str, scale: ContentScale) -> AnyElement {
@@ -202,7 +250,7 @@ fn render_block(
     images: &ContentImages<'_>,
 ) -> AnyElement {
     match block {
-        ContentBlock::Markdown { text } => markdown(prefix, text, scale),
+        ContentBlock::Markdown { text } => render_text(prefix, text, theme, scale),
         ContentBlock::Code { text, language } => {
             let label = language.clone().unwrap_or_else(|| "code".to_string());
             div()
@@ -230,10 +278,20 @@ fn render_block(
         ContentBlock::Math { text } => div()
             .p_2()
             .bg(theme.secondary)
-            .font_family(theme.mono_font_family.clone())
-            .text_size(px(scale.math_size))
-            .overflow_hidden()
-            .child(text.clone())
+            .flex()
+            .flex_col()
+            .min_w(px(0.0))
+            .max_w_full()
+            .child(crate::math::render_math(
+                text,
+                theme,
+                scale.math_size,
+                if scale.compact {
+                    crate::math::MathMode::Inline
+                } else {
+                    crate::math::MathMode::Display
+                },
+            ))
             .into_any_element(),
         ContentBlock::Image(image) => render_image(prefix, image, theme, scale, images),
     }
@@ -306,4 +364,20 @@ fn render_image(
     }
     let _ = prefix;
     box_.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_scale_shrinks_math_and_bounds_images() {
+        let body = ContentScale::BODY;
+        let option = ContentScale::OPTION;
+        assert!(body.math_size > option.math_size);
+        assert!(!body.compact);
+        assert!(option.compact);
+        assert_eq!(body.image_max_height, None);
+        assert!(option.image_max_height.is_some());
+    }
 }

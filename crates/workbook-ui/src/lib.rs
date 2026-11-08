@@ -4,6 +4,8 @@
 //! only owns transient view state (focus, draft widgets, dialogs).
 
 mod content;
+mod image_cache;
+mod math;
 mod modal;
 mod ui_logic;
 mod views;
@@ -21,7 +23,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, Context, Entity, FocusHandle, Focusable as _, Hsla, Image, IntoElement, KeyDownEvent,
+    App, Context, Entity, FocusHandle, Focusable as _, Hsla, IntoElement, KeyDownEvent,
     ParentElement, Render, SharedString, Styled, Subscription, Window, WindowAppearance,
     WindowBounds, WindowOptions, div, px, rgb, size,
 };
@@ -31,6 +33,8 @@ use workbook_domain::{
 };
 use workbook_import::LegacyPreview;
 use workbook_service::{BookSummary, Snapshot, StudyView, TodaySummary, WorkbookService};
+
+use crate::image_cache::ImageCache;
 
 /// Window-space rectangle `(x, y, width, height)` in logical pixels.
 pub(crate) type HotspotImageBounds = (f32, f32, f32, f32);
@@ -111,7 +115,7 @@ pub struct WorkbookApp {
     pub(crate) hotspot_list_open: bool,
     pub(crate) labeling: BTreeMap<String, String>,
     pub(crate) labeling_label: Option<String>,
-    pub(crate) image_cache: Rc<RefCell<BTreeMap<String, Arc<Image>>>>,
+    pub(crate) image_cache: Rc<RefCell<ImageCache>>,
     pub(crate) rating_picker_open: bool,
     pub(crate) notice: Option<Notice>,
     pub(crate) modal: Option<Modal>,
@@ -195,7 +199,7 @@ impl WorkbookApp {
             hotspot_list_open: false,
             labeling: BTreeMap::new(),
             labeling_label: None,
-            image_cache: Rc::new(RefCell::new(BTreeMap::new())),
+            image_cache: Rc::new(RefCell::new(ImageCache::default())),
             hotspot_image_bounds: Rc::new(Cell::new(None)),
             rating_picker_open: false,
             notice: None,
@@ -287,6 +291,30 @@ impl WorkbookApp {
             kind: NoticeKind::Error,
             text: text.into(),
         });
+    }
+
+    /// Frees decoded textures that [`ImageCache`] evicted during rendering.
+    /// The renderer cannot call `App::remove_asset`, so question preparation
+    /// and command handlers drain the queue here.
+    pub(crate) fn drain_image_removals(&mut self, cx: &mut Context<Self>) {
+        let removed = self.image_cache.borrow_mut().take_removals();
+        for image in removed {
+            image.remove_asset(cx);
+        }
+    }
+
+    /// Drops cached images for one workbook after delete or re-import.
+    pub(crate) fn invalidate_workbook_images(&mut self, workbook_id: &str, cx: &mut Context<Self>) {
+        self.image_cache
+            .borrow_mut()
+            .invalidate_workbook(workbook_id);
+        self.drain_image_removals(cx);
+    }
+
+    /// Drops every cached image after a restore or a bulk import.
+    pub(crate) fn clear_image_cache(&mut self, cx: &mut Context<Self>) {
+        self.image_cache.borrow_mut().clear();
+        self.drain_image_removals(cx);
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -849,7 +877,12 @@ impl WorkbookApp {
         self.hotspot_list_open = false;
         self.labeling.clear();
         self.labeling_label = None;
-        self.image_cache.borrow_mut().clear();
+        // Images are intentionally not cleared here: the LRU cache is keyed by
+        // workbook, asset and content fingerprint, so switching questions
+        // reuses decoded textures. Only the next question's asset bytes are
+        // re-read from SQLite.
+        self.image_cache.borrow_mut().trim();
+        self.drain_image_removals(cx);
         self.rating_picker_open = false;
         self.answer_subscriptions.clear();
         self.answer_subscriptions.push(cx.subscribe_in(
@@ -1282,6 +1315,7 @@ impl WorkbookApp {
     ) {
         match self.service.import_workbook_file(&path) {
             Ok(_) => {
+                self.clear_image_cache(cx);
                 self.modal = None;
                 self.refresh(cx);
                 self.notice_success("教材をインポートしました");
@@ -1298,6 +1332,7 @@ impl WorkbookApp {
             .import_workbook_json(workbook_service::SAMPLE_WORKBOOK_JSON)
         {
             Ok(_) => {
+                self.clear_image_cache(cx);
                 self.refresh(cx);
                 self.notice_success("サンプル教材を追加しました");
             }
@@ -1312,6 +1347,7 @@ impl WorkbookApp {
             .import_workbook_json(workbook_service::SAMPLE_WORKBOOK_V2_JSON)
         {
             Ok(_) => {
+                self.clear_image_cache(cx);
                 self.refresh(cx);
                 self.notice_success("拡張問題形式のサンプル教材を追加しました");
             }
@@ -1328,6 +1364,7 @@ impl WorkbookApp {
     ) {
         match self.service.delete_workbook(&id) {
             Ok(()) => {
+                self.invalidate_workbook_images(&id, cx);
                 self.modal = None;
                 if self.selected_book.as_deref() == Some(id.as_str()) {
                     self.selected_book = None;
@@ -1391,6 +1428,7 @@ impl WorkbookApp {
     ) {
         match self.service.restore_from(&path) {
             Ok(()) => {
+                self.clear_image_cache(cx);
                 self.modal = None;
                 self.route = Route::Today;
                 self.study = None;
@@ -1429,6 +1467,7 @@ impl WorkbookApp {
     ) {
         match self.service.import_legacy(&path) {
             Ok(preview) => {
+                self.clear_image_cache(cx);
                 self.modal = None;
                 self.refresh(cx);
                 let warnings = if preview.warnings.is_empty() {

@@ -63,7 +63,9 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 - Do not show scheduler internals during Study. Feedback must use text as well as color.
 - Hotspot answers use the real pointer position normalized to the drawn image area. Do not reintroduce a fixed click grid; keep the coordinate math in `workbook-ui/src/ui_logic.rs` and tested.
 - Ordering, Matching, and Labeling options must render `Content` through the shared `content.rs` renderer. Do not flatten them to `plain_text()` or add per-format content renderers.
-- Rich-content images use the typed `asset` source; do not infer bundled assets from URL prefixes. Serve bundled images from `StudyView.assets` and cache decoded images by workbook + asset ID.
+- Math blocks are typeset by `workbook-ui/src/math.rs` (LaTeX subset -> layout tree -> GPUI flex/text). Do not render raw LaTeX as the normal path and do not add a WebView. Unknown syntax must fall back to readable source text plus a reason, with the LaTeX exposed as the accessibility label. Keep the parser and layout decisions in pure functions with tests.
+- Rich-content images use the typed `asset` source; do not infer bundled assets from URL prefixes. Serve bundled images from `StudyView.assets` and cache decoded images by workbook + asset + content fingerprint in the bounded LRU in `workbook-ui/src/image_cache.rs`. Do not clear the cache merely because the question changed. Invalidate on import, asset content change, workbook delete, and restore, and free evicted textures with `Image::remove_asset`.
+- Image display boxes come from `workbook-ui/src/ui_logic.rs::image_box`. `contain` shows the whole image; `cover` fills a 4:3 viewport and crops. Hotspot and Labeling must keep using `contain` so normalized coordinates cannot shift under cropping.
 - Do not bind rating digits while a text input is focused; keep IME input usable.
 - Do not fabricate screenshots or claim VoiceOver, IME, Windows, or Linux verification without an actual run.
 - Screenshots live in `docs/screenshots/`; regenerate with `./scripts/capture-screenshots.sh`.

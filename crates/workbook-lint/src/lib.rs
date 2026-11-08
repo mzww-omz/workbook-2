@@ -67,6 +67,15 @@ pub struct Summary {
     pub infos: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReportKind {
+    /// The workbook content was parsed and checked, even if it is invalid.
+    #[default]
+    Workbook,
+    /// The CLI could not read the input path at all.
+    Io,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LintReport {
@@ -76,6 +85,11 @@ pub struct LintReport {
     pub ok: bool,
     pub summary: Summary,
     pub diagnostics: Vec<Diagnostic>,
+    /// Internal result class. Not serialized, so the JSON contract above does
+    /// not change. It lets the CLI distinguish "invalid workbook" (exit 1)
+    /// from "could not read the input" (exit 2).
+    #[serde(skip)]
+    pub kind: ReportKind,
 }
 
 impl LintReport {
@@ -101,13 +115,24 @@ impl LintReport {
         self
     }
 
-    /// CI-friendly exit status. `--strict` promotes warnings to failures.
+    /// CI-friendly exit status.
+    ///
+    /// * `0` — no errors (and no warnings in `--strict` mode)
+    /// * `1` — workbook validation errors, or warnings in `--strict` mode
+    /// * `2` — the input path could not be read at all
     pub fn exit_code(&self, strict: bool) -> i32 {
+        if self.kind == ReportKind::Io {
+            return 2;
+        }
         if self.summary.errors > 0 || (strict && self.summary.warnings > 0) {
             1
         } else {
             0
         }
+    }
+
+    pub fn is_io_error(&self) -> bool {
+        self.kind == ReportKind::Io
     }
 }
 
@@ -147,38 +172,29 @@ pub fn resolve_workbook_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Report for a path that could not be read. These exit with status 2, not 1:
+/// they are CLI/IO failures, not workbook validation errors.
+fn io_report(path: impl Into<String>, message: impl Into<String>) -> LintReport {
+    LintReport {
+        version: DIAGNOSTIC_FORMAT_VERSION,
+        path: path.into(),
+        ok: false,
+        summary: Summary::default(),
+        diagnostics: vec![Diagnostic::new("WB-IO-001", Severity::Error, "$", message)],
+        kind: ReportKind::Io,
+    }
+    .finish()
+}
+
 pub fn lint_path(path: &Path) -> LintReport {
     let workbook_path = match resolve_workbook_path(path) {
         Ok(path) => path,
-        Err(message) => {
-            return LintReport {
-                version: DIAGNOSTIC_FORMAT_VERSION,
-                path: path.display().to_string(),
-                ok: false,
-                summary: Summary::default(),
-                diagnostics: vec![Diagnostic::new("WB-IO-001", Severity::Error, "$", message)],
-            }
-            .finish();
-        }
+        Err(message) => return io_report(path.display().to_string(), message),
     };
     let display_path = workbook_path.display().to_string();
     let metadata = match fs::metadata(&workbook_path) {
         Ok(metadata) => metadata,
-        Err(error) => {
-            return LintReport {
-                version: DIAGNOSTIC_FORMAT_VERSION,
-                path: display_path,
-                ok: false,
-                summary: Summary::default(),
-                diagnostics: vec![Diagnostic::new(
-                    "WB-IO-001",
-                    Severity::Error,
-                    "$",
-                    format!("ファイルを読めません: {error}"),
-                )],
-            }
-            .finish();
-        }
+        Err(error) => return io_report(display_path, format!("ファイルを読めません: {error}")),
     };
     if metadata.len() > MAX_JSON_BYTES as u64 {
         return LintReport {
@@ -195,26 +211,13 @@ pub fn lint_path(path: &Path) -> LintReport {
                     MAX_JSON_BYTES / (1024 * 1024)
                 ),
             )],
+            kind: ReportKind::Workbook,
         }
         .finish();
     }
     let raw = match fs::read_to_string(&workbook_path) {
         Ok(raw) => raw,
-        Err(error) => {
-            return LintReport {
-                version: DIAGNOSTIC_FORMAT_VERSION,
-                path: display_path,
-                ok: false,
-                summary: Summary::default(),
-                diagnostics: vec![Diagnostic::new(
-                    "WB-IO-001",
-                    Severity::Error,
-                    "$",
-                    format!("ファイルを読めません: {error}"),
-                )],
-            }
-            .finish();
-        }
+        Err(error) => return io_report(display_path, format!("ファイルを読めません: {error}")),
     };
     lint_raw(&raw, &display_path, Some(&workbook_path))
 }
@@ -304,6 +307,7 @@ fn finish(path: &str, diagnostics: Vec<Diagnostic>) -> LintReport {
         ok: false,
         summary: Summary::default(),
         diagnostics,
+        kind: ReportKind::Workbook,
     }
     .finish()
 }
@@ -1038,6 +1042,23 @@ mod tests {
         let report = lint("{not json");
         assert_eq!(report.diagnostics[0].code, "WB-JSON-001");
         assert_eq!(report.exit_code(false), 1);
+        assert_eq!(report.kind, ReportKind::Workbook);
+    }
+
+    #[test]
+    fn unreadable_inputs_exit_with_two() {
+        let missing = std::path::Path::new("/definitely/not/a/workbook/path.json");
+        let report = lint_path(missing);
+        assert_eq!(report.diagnostics[0].code, "WB-IO-001");
+        assert_eq!(report.kind, ReportKind::Io);
+        assert!(report.is_io_error());
+        assert_eq!(report.exit_code(false), 2);
+        assert_eq!(report.exit_code(true), 2);
+
+        let empty = tempfile::tempdir().unwrap();
+        let report = lint_path(empty.path());
+        assert_eq!(report.diagnostics[0].code, "WB-IO-001");
+        assert_eq!(report.exit_code(false), 2);
     }
 
     #[test]
