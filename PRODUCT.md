@@ -18,13 +18,15 @@ macOS / Apple Silicon first. Rust + GPUI + SQLite. Offline only, no WebView, no 
 
 - Today: 期限到来Review、Learning短期、新規、Workbook別内訳、次の期限
 - Library: 検索、詳細、JSON import/validation/preview、独立コピー、安全な削除
-- Study: New/Review/Practice、6形式、ヒント、わからない、スキップ、評価、訂正、終了、再開
+- Study: New/Review/Practice、v1 6形式 + v2 5形式（数値・並べ替え・対応付け・画像領域・ラベル）、ヒント、わからない、スキップ、評価、訂正、終了、再開
 - History: 異なる問題数 / 総回答 / 短期再学習 / 初回正答率 / スキップ / 学習時間
 - Settings: retention、新規上限、テーマ、タイムゾーン、バックアップ、復元、旧DB移行、整合性、履歴リセット
 - FSRS-7 automatic scheduling、Learn Ahead 20分、午前4日境界
 - 回答の正誤からFSRS評価を自動決定（既定ON）。Easyは自動判定せず、手動訂正を残す
+- Near Miss（おしい回答）は未確定のまま再回答を促し、補助後の正解はHard、不正解はAgain
 - 自動採点できない問題は手動評価へフォールバック
 - 新規は既定10問/日。Skip・Practice・未確定評価はカウントしない
+- 画像アセットは教材JSONに同梱（base64または相対ファイル）し、SQLiteへ取り込む。外部取得はしない
 
 ## Constraints
 

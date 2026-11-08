@@ -30,13 +30,17 @@
 - Today の復習/新規/短期再学習件数、Workbook別内訳、次の期限
 - 起動時・セッション開始/再開・回答確定後の再評価、ウィンドウ再アクティブ時と期限タイマーによる更新
 - JSON教材の検証・プレビュー・独立コピー・安全な削除
+- schemaVersion 2 の5形式: 数値入力（分数・単位・許容誤差・有効数字）、並べ替え、対応付け、画像領域選択、図のラベル付け
+- Near Miss（おしい回答）: 構造化された理由、再回答、補助後のHard、未確定のままFSRSを書かない
+- 教材同梱画像（PNG/JPEG、制限付き静的SVG。base64または相対ファイル）をSQLiteへ取り込み、バックアップ／復元に含める
+- 拡張サンプル教材（数学・英語・社会・理科の5形式、画像2枚）をアプリから追加可能
 - 旧 Electron v1 DB の読み取り専用ステージング検査と移行
 - 完全バックアップ、7世代の日次バックアップ、復元前/削除前/移行前/リセット前の安全バックアップ
 - Light / Dark / System、Cyanアクセント、キーボード操作、GPUI Kit の IME対応 Input
 
 ### 意図的な制約
 
-- 外部画像は取得せず、代替テキストとURLを表示します（オフライン優先）
+- 外部画像は取得しません。教材に同梱した PNG/JPEG/静的SVG だけを SQLite に取り込み、Hotspot / Labeling で表示します。既存の HTTPS 画像ブロックは代替テキストとURLを表示します（オフライン優先）
 - Markdown は GPUI の rich text で表示します。KaTeX 相当の数式組版は行わず、math ブロックは等幅テキストで表示します
 - VoiceOver を使った全画面手動監査、日本語IMEの実機手動確認、Developer ID署名・公証は未実施です。実装は GPUI Kit の AccessKit / IME 対応に依存しています
 - Windows / Linux は設計上分離していますが、ビルド・実機検証はしていません
@@ -82,6 +86,15 @@ open "dist/Workbook 2.app"
 
 すべての操作はマウスからも実行できます。テキスト入力中は数字キーを評価に使いません。
 
+### 新しい問題形式の操作
+
+- 数値: テキスト欄に `3.0A`、`1/2m` のように入力（IME対応）
+- 並べ替え: 行をドラッグ、または各行の ↑↓ ボタン（Tab + Enterでも操作）
+- 対応付け: 左の項目を選び、対応する右の項目を選ぶ
+- 画像領域: 画像をクリック、または領域名ボタンを選ぶ
+- ラベル付け: ラベルを選んで配置先をクリック／ドラッグ。画像下の配置先ボタンでも操作可能
+- Near Miss: 「もう一度」で入力を保持したまま再回答
+
 ## FSRS 自動化の流れ
 
 1. `EvaluateAnswer`: 正誤・ヒント・「わからない」を確定し、自動評価ポリシーで rating を決定（手動評価時は FSRS/Attempt をまだ書かない）
@@ -94,6 +107,10 @@ open "dist/Workbook 2.app"
 8. Today とタイマーが SQLite の期限から件数・次の期限を再計算
 
 自動評価の rating は `attempts.rating_source` に `automatic` / `manual` として保存します。評価を訂正した場合は同じAttempt行を更新し、評価前状態からFSRSを再計算します。自動評価でもFSRSの数式・ステップ・キューは変わりません。
+
+Near Miss は正解・不正解とは別の未確定状態です。数値の有効数字・単位・形式、並べ替えや対応付けの未完成などを構造化して返し、正解や解説を表示せず再回答を促します。Near Miss の時点では Attempt も FSRS 状態も書きません。再回答で正解した場合は Hard、不正解なら Again です。
+
+問題形式のデータ仕様は [docs/QUESTION-FORMATS.md](docs/QUESTION-FORMATS.md) を参照してください。拡張サンプルは Today / Library の「拡張サンプル（5形式）」から追加できます。
 
 詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) と [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
@@ -124,6 +141,10 @@ cargo check --workspace
 - 自動評価の再起動復旧、設定の途中変更、v1 DBの安全なスキーマ移行
 - 旧v1 DB移行、バックアップ/復元、破損DB拒否、7世代保持
 - 独立コピーと削除
+- v2 5形式の検証・正解/不正解・境界値・複数正解・単位変換・有効数字・Near Miss・再現性
+- v2 5形式のAttempt保存、自動評価、Near Missの未確定／再回答、再起動復元、Practiceの非更新
+- 画像アセットの同梱・サイズ・形式・パストラバーサル拒否、バックアップ/復元への同梱
+- UIの並べ替え・重複割当て防止・アスペクト比計算の単体テスト
 
 ## スクリーンショット
 
@@ -142,6 +163,25 @@ cargo check --workspace
 | Settings | 短期再学習待ち |
 |---|---|
 | ![](docs/screenshots/settings.png) | ![](docs/screenshots/upcoming.png) |
+
+### 拡張問題形式
+
+| Numeric | Ordering |
+|---|---|
+| ![](docs/screenshots/numeric.png) | ![](docs/screenshots/ordering.png) |
+
+| Matching | Hotspot（SVG地図） |
+|---|---|
+| ![](docs/screenshots/matching.png) | ![](docs/screenshots/hotspot.png) |
+
+| Labeling | Near Miss |
+|---|---|
+| ![](docs/screenshots/labeling.png) | ![](docs/screenshots/near-miss.png) |
+
+地図は `assets/japan-regions.svg` を同梱しています。出典は
+`assets/japan-regions.NOTICE.md` を参照してください。
+`assets/sample-v2.workbook.json` は `python3 scripts/generate-sample-v2.py`、
+地図SVGは `python3 scripts/generate-japan-map.py <japan.geojson>` で再生成できます。
 
 ## データ安全性
 

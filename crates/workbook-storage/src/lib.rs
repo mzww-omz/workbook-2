@@ -8,8 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 use workbook_domain::{
-    CardState, Mode, Phase, RatingSource, SessionItemStatus, SessionStatus, Settings, StoredCard,
-    StudyCalendar, ThemeSetting, Workbook, parse_workbook,
+    AssetContent, AssistState, CardState, Mode, Phase, RatingSource, SessionItemStatus,
+    SessionStatus, Settings, StoredCard, StudyCalendar, ThemeSetting, Workbook, parse_workbook,
 };
 use workbook_import::{
     LegacyAttempt, LegacyPlan, LegacySession, LegacySessionItem, LegacySessionWorkbook,
@@ -58,6 +58,16 @@ pub struct WorkbookRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct AssetData {
+    pub id: String,
+    pub media_type: String,
+    pub alt: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 pub struct SessionCandidate {
     pub workbook_id: String,
     pub note_id: String,
@@ -84,6 +94,7 @@ pub struct SessionRow {
     pub question_started_at: Option<DateTime<Utc>>,
     pub question_elapsed_ms: i64,
     pub cursor_kind: String,
+    pub assist_json: Option<String>,
     pub revision: u64,
 }
 
@@ -125,6 +136,7 @@ pub struct AttemptRow {
     pub after_state_json: Option<String>,
     pub state_revision: u64,
     pub short_term: bool,
+    pub assist_json: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -215,7 +227,8 @@ impl Storage {
                         "Workbook 2のapplication_idがありません".to_string(),
                     ));
                 }
-                let expected: BTreeSet<&str> = schema::EXPECTED_TABLES.iter().copied().collect();
+                let expected: BTreeSet<&str> =
+                    schema::expected_tables(version).iter().copied().collect();
                 let actual: BTreeSet<&str> = tables.iter().map(String::as_str).collect();
                 if expected != actual {
                     return Err(StorageError::Unsupported(
@@ -351,15 +364,21 @@ impl Storage {
             .map_err(|error| StorageError::Validation(error.to_string()))
     }
 
-    pub fn import_workbook(&mut self, workbook: &Workbook, now: DateTime<Utc>) -> Result<String> {
+    pub fn import_workbook(
+        &mut self,
+        workbook: &Workbook,
+        assets: &[AssetContent],
+        now: DateTime<Utc>,
+    ) -> Result<String> {
         let local_id = Uuid::new_v4().to_string();
-        self.import_workbook_with_id(workbook, now, &local_id)?;
+        self.import_workbook_with_id(workbook, assets, now, &local_id)?;
         Ok(local_id)
     }
 
     fn import_workbook_with_id(
         &mut self,
         workbook: &Workbook,
+        assets: &[AssetContent],
         now: DateTime<Utc>,
         local_id: &str,
     ) -> Result<()> {
@@ -393,8 +412,57 @@ impl Storage {
                 )?;
             }
         }
+        for asset in assets {
+            transaction.execute(
+                "INSERT INTO assets(workbook_id,asset_id,media_type,alt,width,height,bytes)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    local_id,
+                    asset.id,
+                    asset.media_type,
+                    asset.alt,
+                    asset.width,
+                    asset.height,
+                    asset.bytes
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn asset(&self, workbook_id: &str, asset_id: &str) -> Result<Option<AssetData>> {
+        let row = self
+            .connection()?
+            .query_row(
+                "SELECT asset_id,media_type,alt,width,height,bytes
+                 FROM assets WHERE workbook_id=?1 AND asset_id=?2",
+                params![workbook_id, asset_id],
+                |row| {
+                    Ok(AssetData {
+                        id: row.get(0)?,
+                        media_type: row.get(1)?,
+                        alt: row.get(2)?,
+                        width: row.get::<_, i64>(3)? as u32,
+                        height: row.get::<_, i64>(4)? as u32,
+                        bytes: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn asset_ids(&self, workbook_id: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare("SELECT asset_id FROM assets WHERE workbook_id=?1")?;
+        let rows = statement.query_map([workbook_id], |row| row.get::<_, String>(0))?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
     }
 
     pub fn delete_workbook(&mut self, local_id: &str) -> Result<()> {
@@ -767,7 +835,7 @@ impl Storage {
             .query_row(
                 "SELECT id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,phase,
                         draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
-                        question_started_at,question_elapsed_ms,cursor_kind,revision
+                        question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision
                  FROM sessions WHERE id=?1",
                 [session_id],
                 map_session,
@@ -902,7 +970,7 @@ impl Storage {
         let mut statement = connection.prepare(
             "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
                     elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                    state_revision,short_term,created_at
+                    state_revision,short_term,assist_json,created_at
              FROM attempts WHERE session_id=?1 ORDER BY answered_at, created_at, rowid",
         )?;
         let rows = statement.query_map([session_id], map_attempt)?;
@@ -919,7 +987,7 @@ impl Storage {
             .query_row(
                 "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
                         elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                        state_revision,short_term,created_at
+                        state_revision,short_term,assist_json,created_at
                  FROM attempts WHERE id=?1",
                 [attempt_id],
                 map_attempt,
@@ -938,7 +1006,7 @@ impl Storage {
             .query_row(
                 "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
                         elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                        state_revision,short_term,created_at
+                        state_revision,short_term,assist_json,created_at
                  FROM attempts WHERE session_id=?1 AND question_id=?2
                  ORDER BY answered_at DESC, created_at DESC, rowid DESC LIMIT 1",
                 params![session_id, question_id],
@@ -953,7 +1021,7 @@ impl Storage {
         let mut statement = connection.prepare(
             "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
                     elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                    state_revision,short_term,created_at
+                    state_revision,short_term,assist_json,created_at
              FROM attempts WHERE answered_at>=?1 ORDER BY answered_at",
         )?;
         let rows = statement.query_map([format_ts(since)], map_attempt)?;
@@ -1050,7 +1118,7 @@ impl Storage {
         }
         transaction.execute(
             "UPDATE attempts SET correct=?1,unknown=?2,rating=?3,rating_source=?4,after_state_json=?5,
-                    state_revision=?6 WHERE id=?7",
+                    state_revision=?6,assist_json=?7 WHERE id=?8",
             params![
                 write.attempt.correct.map(i64::from),
                 i64::from(write.attempt.unknown),
@@ -1058,6 +1126,7 @@ impl Storage {
                 write.attempt.rating_source.as_str(),
                 write.attempt.after_state_json,
                 write.attempt.state_revision as i64,
+                write.attempt.assist_json,
                 write.attempt.id
             ],
         )?;
@@ -1179,7 +1248,7 @@ impl Storage {
             )));
         }
         let tables = table_names(&connection)?;
-        let expected: BTreeSet<&str> = schema::EXPECTED_TABLES.iter().copied().collect();
+        let expected: BTreeSet<&str> = schema::expected_tables(version).iter().copied().collect();
         let actual: BTreeSet<&str> = tables.iter().map(String::as_str).collect();
         if expected != actual {
             return Err(StorageError::Unsupported(
@@ -1212,16 +1281,77 @@ impl Storage {
                 "バックアップの外部キーに不整合があります".to_string(),
             ));
         }
-        let mut statement = connection.prepare("SELECT content_json FROM workbooks")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut statement = connection.prepare("SELECT local_id,content_json FROM workbooks")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         for row in rows {
-            parse_workbook(&row?).map_err(|error| StorageError::Validation(error.to_string()))?;
+            let (local_id, content_json) = row?;
+            let workbook = parse_workbook(&content_json)
+                .map_err(|error| StorageError::Validation(error.to_string()))?;
+            if version >= 3 {
+                let mut asset_statement =
+                    connection.prepare("SELECT asset_id FROM assets WHERE workbook_id=?1")?;
+                let stored: BTreeSet<String> = asset_statement
+                    .query_map([&local_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                let required: BTreeSet<String> = workbook
+                    .assets
+                    .iter()
+                    .map(|asset| asset.id.clone())
+                    .collect();
+                if stored != required {
+                    return Err(StorageError::Validation(format!(
+                        "教材 {local_id} の画像アセットが一致しません"
+                    )));
+                }
+            }
+        }
+        if version >= 3 {
+            let mut statement =
+                connection.prepare("SELECT media_type,width,height,bytes FROM assets")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (media_type, width, height, bytes) = row?;
+                if bytes.len() > workbook_domain::MAX_ASSET_BYTES {
+                    return Err(StorageError::Validation(
+                        "画像アセットがサイズ上限を超えています".to_string(),
+                    ));
+                }
+                let (actual_width, actual_height) =
+                    workbook_domain::inspect_image(&bytes, &media_type, "assets")
+                        .map_err(|error| StorageError::Validation(error.to_string()))?;
+                if actual_width != width as u32 || actual_height != height as u32 {
+                    return Err(StorageError::Validation(
+                        "画像アセットのサイズ情報が一致しません".to_string(),
+                    ));
+                }
+            }
         }
         let mut statement = connection.prepare("SELECT data FROM settings")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
             Settings::from_json(&row?)
                 .map_err(|error| StorageError::Validation(error.to_string()))?;
+        }
+        if version >= 3 {
+            let mut statement = connection.prepare(
+                "SELECT assist_json FROM attempts WHERE assist_json IS NOT NULL
+                 UNION ALL
+                 SELECT assist_json FROM sessions WHERE assist_json IS NOT NULL",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                serde_json::from_str::<AssistState>(&row?)
+                    .map_err(|error| StorageError::Validation(format!("assist_json: {error}")))?;
+            }
         }
         let mut statement = connection.prepare(
             "SELECT state,stability,stability_fast,difficulty,due_at,last_review_at,reps,lapses,
@@ -1448,6 +1578,7 @@ fn insert_legacy_session(
         question_started_at: session.question_started_at,
         question_elapsed_ms: session.question_elapsed_ms,
         cursor_kind: session.cursor_kind.clone(),
+        assist_json: None,
         revision: session.revision,
     };
     insert_session(transaction, &row)?;
@@ -1503,6 +1634,7 @@ fn legacy_attempt_to_row(session_id: &str, attempt: &LegacyAttempt) -> AttemptRo
         after_state_json: attempt.after_state_json.clone(),
         state_revision: attempt.state_revision,
         short_term: attempt.short_term,
+        assist_json: None,
         created_at: attempt.created_at,
     }
 }
@@ -1511,8 +1643,8 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
     transaction.execute(
         "INSERT INTO sessions(id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,
                 phase,draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
-                question_started_at,question_elapsed_ms,cursor_kind,revision)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![
             session.id,
             session.mode.as_str(),
@@ -1534,6 +1666,7 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
             session.question_started_at.map(format_ts),
             session.question_elapsed_ms,
             session.cursor_kind,
+            session.assist_json,
             session.revision as i64
         ],
     )?;
@@ -1545,7 +1678,7 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
         "UPDATE sessions SET mode=?1,status=?2,started_at=?3,ended_at=?4,current_workbook_id=?5,
                 current_item_id=?6,phase=?7,draft_json=?8,hint=?9,revealed=?10,pending_correct=?11,
                 pending_unknown=?12,pending_at=?13,question_started_at=?14,question_elapsed_ms=?15,
-                cursor_kind=?16,revision=?17 WHERE id=?18",
+                cursor_kind=?16,assist_json=?17,revision=?18 WHERE id=?19",
         params![
             session.mode.as_str(),
             match session.status {
@@ -1566,6 +1699,7 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
             session.question_started_at.map(format_ts),
             session.question_elapsed_ms,
             session.cursor_kind,
+            session.assist_json,
             session.revision as i64,
             session.id
         ],
@@ -1614,8 +1748,8 @@ fn insert_attempt(transaction: &rusqlite::Transaction<'_>, attempt: &AttemptRow)
     transaction.execute(
         "INSERT INTO attempts(id,session_id,workbook_id,note_id,question_id,answered_at,correct,
                 unknown,hint,elapsed_ms,rating,rating_source,answer_json,before_state_json,
-                after_state_json,state_revision,short_term,created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                after_state_json,state_revision,short_term,assist_json,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![
             attempt.id,
             attempt.session_id,
@@ -1634,6 +1768,7 @@ fn insert_attempt(transaction: &rusqlite::Transaction<'_>, attempt: &AttemptRow)
             attempt.after_state_json,
             attempt.state_revision as i64,
             i64::from(attempt.short_term),
+            attempt.assist_json,
             format_ts(attempt.created_at)
         ],
     )?;
@@ -1854,7 +1989,8 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
             .map_err(to_sql_error)?,
         question_elapsed_ms: row.get(15)?,
         cursor_kind: row.get(16)?,
-        revision: row.get::<_, i64>(17)? as u64,
+        assist_json: row.get(17)?,
+        revision: row.get::<_, i64>(18)? as u64,
     })
 }
 
@@ -1891,7 +2027,8 @@ fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
         after_state_json: row.get(14)?,
         state_revision: row.get::<_, i64>(15)? as u64,
         short_term: row.get::<_, i64>(16)? != 0,
-        created_at: parse_ts(&row.get::<_, String>(17)?).map_err(to_sql_error)?,
+        assist_json: row.get(17)?,
+        created_at: parse_ts(&row.get::<_, String>(18)?).map_err(to_sql_error)?,
     })
 }
 
@@ -1947,6 +2084,22 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
     if from < 2 {
         transaction.execute_batch(
             "ALTER TABLE attempts ADD COLUMN rating_source TEXT NOT NULL DEFAULT 'manual';",
+        )?;
+    }
+    if from < 3 {
+        transaction.execute_batch(
+            "ALTER TABLE attempts ADD COLUMN assist_json TEXT;
+             ALTER TABLE sessions ADD COLUMN assist_json TEXT;
+             CREATE TABLE assets(
+               workbook_id TEXT NOT NULL REFERENCES workbooks(local_id) ON DELETE CASCADE,
+               asset_id TEXT NOT NULL,
+               media_type TEXT NOT NULL,
+               alt TEXT NOT NULL,
+               width INTEGER NOT NULL,
+               height INTEGER NOT NULL,
+               bytes BLOB NOT NULL,
+               PRIMARY KEY(workbook_id, asset_id)
+             );",
         )?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;

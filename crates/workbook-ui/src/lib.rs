@@ -5,10 +5,13 @@
 
 mod content;
 mod modal;
+mod ui_logic;
 mod views;
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use chrono_tz::Tz;
@@ -18,7 +21,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, Context, Entity, FocusHandle, Focusable as _, Hsla, IntoElement, KeyDownEvent,
+    App, Context, Entity, FocusHandle, Focusable as _, Hsla, Image, IntoElement, KeyDownEvent,
     ParentElement, Render, SharedString, Styled, Subscription, Window, WindowAppearance,
     WindowBounds, WindowOptions, div, px, rgb, size,
 };
@@ -61,7 +64,7 @@ pub(crate) enum Modal {
     },
     ImportJson {
         workbook: Workbook,
-        raw: String,
+        path: PathBuf,
         source: String,
     },
     Restore {
@@ -93,6 +96,15 @@ pub struct WorkbookApp {
     pub(crate) multiple_choice: BTreeSet<String>,
     pub(crate) true_false: Option<bool>,
     pub(crate) self_correct: Option<bool>,
+    pub(crate) numeric_input: Entity<InputState>,
+    pub(crate) ordering: Vec<String>,
+    pub(crate) matching: BTreeMap<String, String>,
+    pub(crate) matching_left: Option<String>,
+    pub(crate) hotspot_point: Option<(f64, f64)>,
+    pub(crate) hotspot_list_open: bool,
+    pub(crate) labeling: BTreeMap<String, String>,
+    pub(crate) labeling_label: Option<String>,
+    pub(crate) image_cache: Rc<RefCell<BTreeMap<String, Arc<Image>>>>,
     pub(crate) rating_picker_open: bool,
     pub(crate) notice: Option<Notice>,
     pub(crate) modal: Option<Modal>,
@@ -141,6 +153,8 @@ impl WorkbookApp {
         let root_focus = cx.focus_handle();
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("教材を検索"));
         let short_input = cx.new(|cx| InputState::new(window, cx).placeholder("回答を入力"));
+        let numeric_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("数値と単位を入力（例: 1.5m）"));
         let retention = format!("{:.2}", snapshot.settings.retention);
         let new_limit = snapshot.settings.new_limit.to_string();
         let settings_retention =
@@ -166,6 +180,15 @@ impl WorkbookApp {
             multiple_choice: BTreeSet::new(),
             true_false: None,
             self_correct: None,
+            numeric_input,
+            ordering: Vec::new(),
+            matching: BTreeMap::new(),
+            matching_left: None,
+            hotspot_point: None,
+            hotspot_list_open: false,
+            labeling: BTreeMap::new(),
+            labeling_label: None,
+            image_cache: Rc::new(RefCell::new(BTreeMap::new())),
             rating_picker_open: false,
             notice: None,
             modal: None,
@@ -192,6 +215,15 @@ impl WorkbookApp {
             }
         });
         app.answer_subscriptions.push(draft_subscription);
+
+        let numeric = app.numeric_input.clone();
+        let numeric_subscription =
+            cx.subscribe_in(&numeric, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.persist_draft(window, cx);
+                }
+            });
+        app.answer_subscriptions.push(numeric_subscription);
 
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
             if this.snapshot.settings.theme == ThemeSetting::System {
@@ -405,6 +437,19 @@ impl WorkbookApp {
                 }
                 Some(Answer::Blanks(values))
             }
+            QuestionType::Numeric => Some(Answer::Text(
+                self.numeric_input.read(cx).value().to_string(),
+            )),
+            QuestionType::Ordering => Some(Answer::Ordering {
+                order: self.ordering.clone(),
+            }),
+            QuestionType::Matching => Some(Answer::Matching {
+                matches: self.matching.clone(),
+            }),
+            QuestionType::Hotspot => self.hotspot_point.map(|(x, y)| Answer::Hotspot { x, y }),
+            QuestionType::Labeling => Some(Answer::Labels {
+                labels: self.labeling.clone(),
+            }),
             QuestionType::Flashcard => self.self_correct.map(Answer::Bool),
         }
     }
@@ -495,6 +540,12 @@ impl WorkbookApp {
         match view.phase {
             Phase::Intro => self.begin_question(window, cx),
             Phase::Feedback => {
+                if view.feedback.as_ref().is_some_and(|feedback| {
+                    feedback.status == workbook_domain::GradeStatus::NearMiss
+                }) {
+                    self.retry_question(window, cx);
+                    return;
+                }
                 if view
                     .feedback
                     .as_ref()
@@ -589,6 +640,24 @@ impl WorkbookApp {
         }
     }
 
+    pub(crate) fn retry_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.study.clone() else {
+            return;
+        };
+        match self.service.retry_answer(&view.session_id, view.revision) {
+            Ok(updated) => {
+                self.rating_picker_open = false;
+                self.study = Some(updated);
+                self.focus_answer(window, cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn mark_unknown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.study.clone() else {
             return;
@@ -616,6 +685,9 @@ impl WorkbookApp {
         let Some(feedback) = view.feedback.as_ref() else {
             return;
         };
+        if feedback.status == workbook_domain::GradeStatus::NearMiss {
+            return;
+        }
         let result = if feedback.committed {
             match feedback.attempt_id.as_deref() {
                 Some(attempt_id) => self.service.correct_attempt(
@@ -762,10 +834,27 @@ impl WorkbookApp {
         self.multiple_choice.clear();
         self.true_false = None;
         self.self_correct = None;
+        self.ordering.clear();
+        self.matching.clear();
+        self.matching_left = None;
+        self.hotspot_point = None;
+        self.hotspot_list_open = false;
+        self.labeling.clear();
+        self.labeling_label = None;
+        self.image_cache.borrow_mut().clear();
         self.rating_picker_open = false;
         self.answer_subscriptions.clear();
         self.answer_subscriptions.push(cx.subscribe_in(
             &self.short_input.clone(),
+            window,
+            |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.persist_draft(window, cx);
+                }
+            },
+        ));
+        self.answer_subscriptions.push(cx.subscribe_in(
+            &self.numeric_input.clone(),
             window,
             |this, _, event, window, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -843,6 +932,36 @@ impl WorkbookApp {
                     None
                 };
             }
+            QuestionType::Numeric => {
+                let value = match view.draft.clone() {
+                    Some(Answer::Text(value)) => value,
+                    _ => String::new(),
+                };
+                let input = self.numeric_input.clone();
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+            QuestionType::Ordering => {
+                let from_draft = match view.draft.clone() {
+                    Some(Answer::Ordering { order }) => Some(order),
+                    _ => None,
+                };
+                self.ordering = from_draft.unwrap_or_else(|| question.display_order());
+            }
+            QuestionType::Matching => {
+                if let Some(Answer::Matching { matches }) = view.draft.clone() {
+                    self.matching = matches;
+                }
+            }
+            QuestionType::Hotspot => {
+                if let Some(Answer::Hotspot { x, y }) = view.draft.clone() {
+                    self.hotspot_point = Some((x, y));
+                }
+            }
+            QuestionType::Labeling => {
+                if let Some(Answer::Labels { labels }) = view.draft.clone() {
+                    self.labeling = labels;
+                }
+            }
         }
         self.focus_answer(window, cx);
     }
@@ -859,6 +978,10 @@ impl WorkbookApp {
         match view.question.as_ref().map(|question| question.kind) {
             Some(QuestionType::ShortText) => {
                 let input = self.short_input.clone();
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+            Some(QuestionType::Numeric) => {
+                let input = self.numeric_input.clone();
                 input.update(cx, |state, cx| state.focus(window, cx));
             }
             Some(QuestionType::Cloze) => {
@@ -879,6 +1002,11 @@ impl WorkbookApp {
             .read(cx)
             .focus_handle(cx)
             .is_focused(window)
+            || self
+                .numeric_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
             || self
                 .search_input
                 .read(cx)
@@ -964,10 +1092,10 @@ impl WorkbookApp {
             }
             && self.study.as_ref().is_some_and(|view| {
                 view.phase == Phase::Feedback
-                    && view
-                        .feedback
-                        .as_ref()
-                        .is_some_and(|feedback| !feedback.committed || self.rating_picker_open)
+                    && view.feedback.as_ref().is_some_and(|feedback| {
+                        feedback.status != workbook_domain::GradeStatus::NearMiss
+                            && (!feedback.committed || self.rating_picker_open)
+                    })
             })
         {
             self.rate_question(rating, window, cx);
@@ -1125,19 +1253,11 @@ impl WorkbookApp {
         else {
             return;
         };
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                self.notice_error(format!("ファイルを読めません: {error}"));
-                cx.notify();
-                return;
-            }
-        };
-        match self.service.preview_workbook(&raw) {
+        match self.service.preview_workbook_file(&path) {
             Ok(workbook) => {
                 self.modal = Some(Modal::ImportJson {
                     workbook,
-                    raw,
+                    path: path.clone(),
                     source: path.display().to_string(),
                 });
             }
@@ -1148,11 +1268,11 @@ impl WorkbookApp {
 
     pub(crate) fn confirm_import(
         &mut self,
-        raw: String,
+        path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.service.import_workbook_json(&raw) {
+        match self.service.import_workbook_file(&path) {
             Ok(_) => {
                 self.modal = None;
                 self.refresh(cx);
@@ -1172,6 +1292,20 @@ impl WorkbookApp {
             Ok(_) => {
                 self.refresh(cx);
                 self.notice_success("サンプル教材を追加しました");
+            }
+            Err(error) => self.notice_error(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn import_expanded_sample(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        match self
+            .service
+            .import_workbook_json(workbook_service::SAMPLE_WORKBOOK_V2_JSON)
+        {
+            Ok(_) => {
+                self.refresh(cx);
+                self.notice_success("拡張問題形式のサンプル教材を追加しました");
             }
             Err(error) => self.notice_error(error.to_string()),
         }

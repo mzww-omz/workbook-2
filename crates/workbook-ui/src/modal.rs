@@ -76,7 +76,7 @@ impl WorkbookApp {
             ),
             Modal::ImportJson {
                 workbook,
-                raw,
+                path,
                 source,
             } => {
                 let note_count = workbook.notes.len();
@@ -131,7 +131,7 @@ impl WorkbookApp {
                                 .label("インポート")
                                 .primary()
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_import(raw.clone(), window, cx);
+                                    this.confirm_import(path.clone(), window, cx);
                                 })),
                         )
                         .into_any_element(),

@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -29,6 +29,17 @@ CREATE TABLE questions(
   FOREIGN KEY(workbook_id, note_id) REFERENCES notes(workbook_id, note_id) ON DELETE CASCADE
 );
 CREATE INDEX questions_note ON questions(workbook_id, note_id);
+
+CREATE TABLE assets(
+  workbook_id TEXT NOT NULL REFERENCES workbooks(local_id) ON DELETE CASCADE,
+  asset_id TEXT NOT NULL,
+  media_type TEXT NOT NULL,
+  alt TEXT NOT NULL,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  PRIMARY KEY(workbook_id, asset_id)
+);
 
 CREATE TABLE review_states(
   workbook_id TEXT NOT NULL,
@@ -69,6 +80,7 @@ CREATE TABLE sessions(
   question_started_at TEXT,
   question_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   cursor_kind TEXT NOT NULL DEFAULT 'initial',
+  assist_json TEXT,
   revision INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX one_active_session ON sessions(status) WHERE status = 'active';
@@ -111,6 +123,7 @@ CREATE TABLE attempts(
   after_state_json TEXT,
   state_revision INTEGER NOT NULL,
   short_term INTEGER NOT NULL,
+  assist_json TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX attempts_session ON attempts(session_id, answered_at);
@@ -127,7 +140,7 @@ CREATE TABLE meta(
 );
 "#;
 
-pub const EXPECTED_TABLES: &[&str] = &[
+pub const EXPECTED_TABLES_V1: &[&str] = &[
     "attempts",
     "meta",
     "notes",
@@ -139,3 +152,25 @@ pub const EXPECTED_TABLES: &[&str] = &[
     "settings",
     "workbooks",
 ];
+
+pub const EXPECTED_TABLES: &[&str] = &[
+    "assets",
+    "attempts",
+    "meta",
+    "notes",
+    "questions",
+    "review_states",
+    "session_items",
+    "session_workbooks",
+    "sessions",
+    "settings",
+    "workbooks",
+];
+
+pub fn expected_tables(version: i64) -> &'static [&'static str] {
+    if version < 3 {
+        EXPECTED_TABLES_V1
+    } else {
+        EXPECTED_TABLES
+    }
+}

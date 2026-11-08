@@ -32,6 +32,11 @@ fn daily_backups_keep_seven_generations_and_private_permissions() {
 fn v1_schema_sql() -> String {
     workbook_storage::schema::SCHEMA_SQL
         .replace("  rating_source TEXT NOT NULL DEFAULT 'manual',\n", "")
+        .replace("  assist_json TEXT,\n", "")
+        .replace(
+            "CREATE TABLE assets(\n  workbook_id TEXT NOT NULL REFERENCES workbooks(local_id) ON DELETE CASCADE,\n  asset_id TEXT NOT NULL,\n  media_type TEXT NOT NULL,\n  alt TEXT NOT NULL,\n  width INTEGER NOT NULL,\n  height INTEGER NOT NULL,\n  bytes BLOB NOT NULL,\n  PRIMARY KEY(workbook_id, asset_id)\n);\n\n",
+            "",
+        )
 }
 
 fn create_v1_database(path: &std::path::Path) {

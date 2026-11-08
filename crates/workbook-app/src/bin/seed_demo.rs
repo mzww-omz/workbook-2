@@ -4,7 +4,8 @@
 //!   cargo run -p workbook-app --bin seed_demo -- /tmp/workbook2-demo today
 //!   cargo run -p workbook-app --bin seed_demo -- /tmp/workbook2-demo feedback
 //!
-//! Profiles: today, library, history, settings, study, feedback, result.
+//! Profiles: today, library, history, settings, study, feedback, result,
+//! v2-numeric, v2-ordering, v2-matching, v2-hotspot, v2-labeling, v2-near-miss.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,6 +35,11 @@ fn main() -> anyhow::Result<()> {
     let service = WorkbookService::open(&directory, clock.clone())?;
     if profile == "upcoming" {
         seed_upcoming(&service)?;
+        println!("seeded profile={} at {}", profile, directory.display());
+        return Ok(());
+    }
+    if let Some(target) = profile.strip_prefix("v2-") {
+        seed_expanded(&service, target)?;
         println!("seeded profile={} at {}", profile, directory.display());
         return Ok(());
     }
@@ -96,6 +102,47 @@ fn main() -> anyhow::Result<()> {
 
     println!("seeded profile={} at {}", profile, directory.display());
     Ok(())
+}
+
+fn seed_expanded(service: &WorkbookService, target: &str) -> anyhow::Result<()> {
+    let book = service.import_workbook_json(workbook_service::SAMPLE_WORKBOOK_V2_JSON)?;
+    service.start_session(Mode::Practice, Some(&book))?;
+    let mut view = service.active_view()?.expect("active practice session");
+    let wanted = match target {
+        "numeric" | "near-miss" => QuestionType::Numeric,
+        "ordering" => QuestionType::Ordering,
+        "matching" => QuestionType::Matching,
+        "hotspot" => QuestionType::Hotspot,
+        "labeling" => QuestionType::Labeling,
+        other => anyhow::bail!("unknown expanded profile: {other}"),
+    };
+    for _ in 0..100 {
+        match view.phase {
+            Phase::Intro => {
+                view = service.begin_question(&view.session_id, view.revision)?;
+            }
+            Phase::Question => {
+                let kind = view.question.as_ref().map(|question| question.kind);
+                if kind == Some(wanted) {
+                    if target == "near-miss" {
+                        let pending = service.evaluate_answer(
+                            &view.session_id,
+                            Some(&Answer::Text("3A".to_string())),
+                            false,
+                            None,
+                            false,
+                            view.revision,
+                        )?;
+                        assert_eq!(pending.phase, Phase::Feedback);
+                    }
+                    return Ok(());
+                }
+                view = service.skip(&view.session_id, view.revision)?;
+            }
+            _ => anyhow::bail!("expanded target not found"),
+        }
+    }
+    anyhow::bail!("expanded target not found")
 }
 
 fn seed_upcoming(service: &WorkbookService) -> anyhow::Result<()> {
@@ -249,5 +296,56 @@ fn correct_answer(question: &Question) -> (Option<Answer>, Option<bool>) {
             (Some(Answer::Blanks(blanks)), None)
         }
         QuestionType::Flashcard => (Some(Answer::Bool(true)), Some(true)),
+        QuestionType::Numeric => {
+            let spec = question.numeric_spec();
+            let answer = spec.and_then(|spec| {
+                let value = spec.value.value().ok()?;
+                let text = match spec.unit {
+                    Some(unit) => format!("{value}{unit}"),
+                    None => format!("{value}"),
+                };
+                Some(Answer::Text(text))
+            });
+            (answer, None)
+        }
+        QuestionType::Ordering => {
+            let order = question
+                .ordering_spec()
+                .and_then(|spec| spec.orders.first().cloned());
+            (order.map(|order| Answer::Ordering { order }), None)
+        }
+        QuestionType::Matching => {
+            let matches = question.matching_spec().map(|spec| {
+                spec.pairs
+                    .into_iter()
+                    .map(|pair| (pair.left, pair.right))
+                    .collect()
+            });
+            (matches.map(|matches| Answer::Matching { matches }), None)
+        }
+        QuestionType::Hotspot => {
+            let point = question
+                .hotspot
+                .as_ref()
+                .and_then(|hotspot| hotspot.regions.first())
+                .map(|region| match &region.shape {
+                    workbook_domain::HotspotShape::Circle { cx, cy, .. } => (*cx, *cy),
+                    workbook_domain::HotspotShape::Rect { x, y, w, h } => {
+                        (x + w / 2.0, y + h / 2.0)
+                    }
+                    workbook_domain::HotspotShape::Polygon { points } => {
+                        let count = points.len().max(1) as f64;
+                        (
+                            points.iter().map(|point| point[0]).sum::<f64>() / count,
+                            points.iter().map(|point| point[1]).sum::<f64>() / count,
+                        )
+                    }
+                });
+            (point.map(|(x, y)| Answer::Hotspot { x, y }), None)
+        }
+        QuestionType::Labeling => {
+            let labels = question.labeling_spec().map(|spec| spec.pairs);
+            (labels.map(|labels| Answer::Labels { labels }), None)
+        }
     }
 }

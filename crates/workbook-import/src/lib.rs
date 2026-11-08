@@ -18,8 +18,8 @@ use tempfile::TempDir;
 use thiserror::Error;
 use uuid::Uuid;
 use workbook_domain::{
-    Mode, Phase, SessionItemStatus, SessionStatus, Settings, StoredCard, ThemeSetting, Workbook,
-    parse_workbook,
+    AssetContent, MAX_JSON_BYTES, Mode, Phase, SessionItemStatus, SessionStatus, Settings,
+    StoredCard, ThemeSetting, Workbook, inspect_image, parse_workbook,
 };
 use workbook_scheduler::{ALGORITHM, POLICY_VERSION};
 
@@ -38,6 +38,76 @@ pub enum ImportError {
     Workbook(String),
     #[error("JSONの読み取りに失敗しました: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Reads a workbook JSON file and resolves bundled image assets relative to
+/// its directory. External file paths must stay inside the workbook folder
+/// after canonicalization; this blocks `..`, absolute paths, and symlink
+/// escapes. Embedded base64 assets are decoded here.
+pub fn load_workbook_file(path: &Path) -> Result<(Workbook, Vec<AssetContent>), ImportError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_JSON_BYTES as u64 {
+        return Err(ImportError::Workbook(format!(
+            "JSONは{}MB以下にしてください",
+            MAX_JSON_BYTES / (1024 * 1024)
+        )));
+    }
+    let raw = fs::read_to_string(path)?;
+    let workbook =
+        parse_workbook(&raw).map_err(|error| ImportError::Workbook(error.to_string()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let base_canonical = base.canonicalize()?;
+    let mut assets = Vec::new();
+    let mut total_bytes = 0usize;
+    for asset in &workbook.assets {
+        let bytes = if let Some(bytes) = asset
+            .embedded_bytes()
+            .map_err(|error| ImportError::Workbook(format!("assets.{}: {error}", asset.id)))?
+        {
+            bytes
+        } else {
+            let file = asset.file.as_deref().ok_or_else(|| {
+                ImportError::Workbook(format!("assets.{}: 画像パスがありません", asset.id))
+            })?;
+            let candidate = base.join(file);
+            let canonical = candidate.canonicalize().map_err(|_| {
+                ImportError::Workbook(format!("assets.{}: 画像が見つかりません", asset.id))
+            })?;
+            if !canonical.starts_with(&base_canonical) {
+                return Err(ImportError::Workbook(format!(
+                    "assets.{}: 教材フォルダの外を参照しています",
+                    asset.id
+                )));
+            }
+            let metadata = fs::metadata(&canonical)?;
+            if metadata.len() > workbook_domain::MAX_ASSET_BYTES as u64 {
+                return Err(ImportError::Workbook(format!(
+                    "assets.{}: 画像は{}MB以下にしてください",
+                    asset.id,
+                    workbook_domain::MAX_ASSET_BYTES / (1024 * 1024)
+                )));
+            }
+            fs::read(&canonical)?
+        };
+        let (width, height) =
+            inspect_image(&bytes, &asset.media_type, &format!("assets.{}", asset.id))
+                .map_err(|error| ImportError::Workbook(error.to_string()))?;
+        total_bytes += bytes.len();
+        if total_bytes > workbook_domain::MAX_TOTAL_ASSET_BYTES {
+            return Err(ImportError::Workbook(
+                "画像アセットの合計サイズが上限を超えています".to_string(),
+            ));
+        }
+        assets.push(AssetContent {
+            id: asset.id.clone(),
+            alt: asset.alt.clone(),
+            media_type: asset.media_type.clone(),
+            width,
+            height,
+            bytes,
+        });
+    }
+    Ok((workbook, assets))
 }
 
 #[derive(Clone, Debug)]
@@ -954,5 +1024,56 @@ mod tests {
             Some(("a".to_string(), "b/question".to_string()))
         );
         assert_eq!(split_outcome_key("invalid"), None);
+    }
+
+    const PNG_2X2: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xfd,
+        0xd4, 0x9a, 0x73, 0x00, 0x00, 0x00, 0x0e, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0x0f, 0x06, 0x0c, 0x10, 0x0a, 0x00, 0x53, 0xba, 0x0b, 0xf5, 0x98, 0xac, 0x20, 0x67, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn file_workbook(asset_path: &str) -> String {
+        format!(
+            r#"{{"format":"workbook","schemaVersion":2,"id":"w","revision":1,
+            "title":"T","description":"","language":"ja","tags":[],
+            "assets":[{{"id":"img","alt":"図","mediaType":"image/png","file":"{asset_path}"}}],
+            "notes":[{{"id":"n","title":"N","knowledgeCard":"c","questions":[
+              {{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e",
+                "hotspot":{{"asset":"img","regions":[{{"id":"r","alt":"R",
+                  "shape":{{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}}}}]}},
+                "answer":{{"regionIds":["r"]}}}}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn file_assets_are_resolved_relative_to_the_workbook() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("figure.png"), PNG_2X2).unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(&path, file_workbook("figure.png")).unwrap();
+        let (workbook, assets) = load_workbook_file(&path).unwrap();
+        assert_eq!(workbook.assets.len(), 1);
+        assert_eq!(assets.len(), 1);
+        assert_eq!((assets[0].width, assets[0].height), (2, 2));
+        assert_eq!(assets[0].bytes, PNG_2X2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_assets_cannot_escape_the_workbook_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.png"), PNG_2X2).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.png"),
+            dir.path().join("link.png"),
+        )
+        .unwrap();
+        let path = dir.path().join("book.json");
+        std::fs::write(&path, file_workbook("link.png")).unwrap();
+        let error = load_workbook_file(&path).unwrap_err();
+        assert!(error.to_string().contains("教材フォルダの外"));
     }
 }

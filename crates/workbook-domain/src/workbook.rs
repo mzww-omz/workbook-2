@@ -5,6 +5,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::content::{Content, ContentError, validate_https_url};
+use crate::question_format::{
+    AssetRef, HotspotAnswerSpec, HotspotSpec, LabelingAnswerSpec, LabelingSpec, MatchingAnswerSpec,
+    MatchingSpec, NumericAnswerSpec, OrderingAnswerSpec, inspect_image,
+};
 
 pub const MAX_JSON_BYTES: usize = 10 * 1024 * 1024;
 
@@ -39,6 +43,11 @@ pub enum QuestionType {
     ShortText,
     Cloze,
     Flashcard,
+    Numeric,
+    Ordering,
+    Matching,
+    Hotspot,
+    Labeling,
 }
 
 impl QuestionType {
@@ -50,11 +59,24 @@ impl QuestionType {
             Self::ShortText => "short_text",
             Self::Cloze => "cloze",
             Self::Flashcard => "flashcard",
+            Self::Numeric => "numeric",
+            Self::Ordering => "ordering",
+            Self::Matching => "matching",
+            Self::Hotspot => "hotspot",
+            Self::Labeling => "labeling",
         }
     }
 
     pub fn is_choice(self) -> bool {
         matches!(self, Self::SingleChoice | Self::MultipleChoice)
+    }
+
+    /// Formats added in workbook schema version 2.
+    pub fn requires_schema_v2(self) -> bool {
+        matches!(
+            self,
+            Self::Numeric | Self::Ordering | Self::Matching | Self::Hotspot | Self::Labeling
+        )
     }
 }
 
@@ -69,6 +91,11 @@ impl std::str::FromStr for QuestionType {
             "short_text" => Ok(Self::ShortText),
             "cloze" => Ok(Self::Cloze),
             "flashcard" => Ok(Self::Flashcard),
+            "numeric" => Ok(Self::Numeric),
+            "ordering" => Ok(Self::Ordering),
+            "matching" => Ok(Self::Matching),
+            "hotspot" => Ok(Self::Hotspot),
+            "labeling" => Ok(Self::Labeling),
             _ => Err(()),
         }
     }
@@ -103,6 +130,20 @@ pub struct Question {
     pub front: Option<Content>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back: Option<Content>,
+    /// Display order for `ordering` questions. When absent the authored
+    /// `options` order is shown.
+    #[serde(
+        rename = "initialOrder",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub initial_order: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matching: Option<MatchingSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotspot: Option<HotspotSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labeling: Option<LabelingSpec>,
 }
 
 impl Question {
@@ -197,6 +238,37 @@ impl Question {
         ids
     }
 
+    pub fn numeric_spec(&self) -> Option<NumericAnswerSpec> {
+        serde_json::from_value(self.answer.clone()?).ok()
+    }
+
+    pub fn ordering_spec(&self) -> Option<OrderingAnswerSpec> {
+        serde_json::from_value(self.answer.clone()?).ok()
+    }
+
+    pub fn matching_spec(&self) -> Option<MatchingAnswerSpec> {
+        serde_json::from_value(self.answer.clone()?).ok()
+    }
+
+    pub fn hotspot_spec(&self) -> Option<HotspotAnswerSpec> {
+        serde_json::from_value(self.answer.clone()?).ok()
+    }
+
+    pub fn labeling_spec(&self) -> Option<LabelingAnswerSpec> {
+        serde_json::from_value(self.answer.clone()?).ok()
+    }
+
+    /// Item IDs in the order they should first appear on screen.
+    pub fn display_order(&self) -> Vec<String> {
+        if let Some(initial) = &self.initial_order {
+            return initial.clone();
+        }
+        self.options
+            .as_ref()
+            .map(|options| options.iter().map(|option| option.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn answer_summary(&self) -> String {
         match self.kind {
             QuestionType::SingleChoice => self
@@ -241,7 +313,122 @@ impl Question {
                 .as_ref()
                 .map(Content::plain_text)
                 .unwrap_or_default(),
+            QuestionType::Numeric => match self.numeric_spec() {
+                Some(spec) => {
+                    let value = spec
+                        .value
+                        .value()
+                        .map(format_number)
+                        .unwrap_or_else(|_| "?".to_string());
+                    let mut text = match spec.unit {
+                        Some(unit) => format!("{value} {unit}"),
+                        None => value,
+                    };
+                    if let Some(sig) = spec.significant_figures {
+                        text.push_str(&format!("（有効数字{sig}桁）"));
+                    }
+                    text
+                }
+                None => "（正解なし）".to_string(),
+            },
+            QuestionType::Ordering => match self.ordering_spec() {
+                Some(spec) => spec
+                    .orders
+                    .first()
+                    .map(|order| {
+                        order
+                            .iter()
+                            .enumerate()
+                            .map(|(index, id)| {
+                                let label = self
+                                    .options
+                                    .as_ref()
+                                    .and_then(|options| {
+                                        options
+                                            .iter()
+                                            .find(|option| &option.id == id)
+                                            .map(|option| option.content.plain_text())
+                                    })
+                                    .unwrap_or_else(|| id.clone());
+                                format!("{}. {label}", index + 1)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default(),
+                None => "（正解なし）".to_string(),
+            },
+            QuestionType::Matching => match (self.matching_spec(), self.matching.as_ref()) {
+                (Some(spec), Some(matching)) => spec
+                    .pairs
+                    .iter()
+                    .map(|pair| {
+                        let left = matching
+                            .left
+                            .iter()
+                            .find(|item| item.id == pair.left)
+                            .map(|item| item.content.plain_text())
+                            .unwrap_or_else(|| pair.left.clone());
+                        let right = matching
+                            .right
+                            .iter()
+                            .find(|item| item.id == pair.right)
+                            .map(|item| item.content.plain_text())
+                            .unwrap_or_else(|| pair.right.clone());
+                        format!("{left} → {right}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => "（正解なし）".to_string(),
+            },
+            QuestionType::Hotspot => match (self.hotspot_spec(), self.hotspot.as_ref()) {
+                (Some(spec), Some(hotspot)) => spec
+                    .region_ids
+                    .iter()
+                    .map(|id| {
+                        hotspot
+                            .regions
+                            .iter()
+                            .find(|region| &region.id == id)
+                            .map(|region| region.alt.clone())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+                _ => "（正解なし）".to_string(),
+            },
+            QuestionType::Labeling => match (self.labeling_spec(), self.labeling.as_ref()) {
+                (Some(spec), Some(labeling)) => {
+                    let mut parts = Vec::new();
+                    for (target, label) in &spec.pairs {
+                        let target_text = labeling
+                            .targets
+                            .iter()
+                            .find(|item| &item.id == target)
+                            .map(|item| item.alt.clone())
+                            .unwrap_or_else(|| target.clone());
+                        let label_text = labeling
+                            .labels
+                            .iter()
+                            .find(|item| &item.id == label)
+                            .map(|item| item.content.plain_text())
+                            .unwrap_or_else(|| label.clone());
+                        parts.push(format!("{target_text} → {label_text}"));
+                    }
+                    parts.join("\n")
+                }
+                _ => "（正解なし）".to_string(),
+            },
         }
+    }
+}
+
+fn format_number(value: f64) -> String {
+    if (value - value.round()).abs() < 1e-9 {
+        format!("{}", value.round() as i64)
+    } else {
+        let text = format!("{value}");
+        text
     }
 }
 
@@ -266,6 +453,8 @@ pub struct Workbook {
     pub description: String,
     pub language: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<AssetRef>,
     pub notes: Vec<Note>,
 }
 
@@ -300,10 +489,10 @@ impl Workbook {
                 "workbook を指定してください",
             ));
         }
-        if self.schema_version != 1 {
+        if !(1..=2).contains(&self.schema_version) {
             return Err(ValidationError::new(
                 "schemaVersion",
-                "schemaVersion 1 のみ対応しています",
+                "schemaVersion 1 または 2 に対応しています",
             ));
         }
         validate_id(&self.id, "id")?;
@@ -326,6 +515,40 @@ impl Workbook {
         }
         for (i, tag) in self.tags.iter().enumerate() {
             validate_required_text(tag, &format!("tags[{i}]"))?;
+        }
+        if self.schema_version == 1 && !self.assets.is_empty() {
+            return Err(ValidationError::new(
+                "assets",
+                "schemaVersion 1 では画像アセットを使用できません",
+            ));
+        }
+        if self.assets.len() > crate::question_format::MAX_ASSETS {
+            return Err(ValidationError::new(
+                "assets",
+                format!(
+                    "画像アセットは{}個以下にしてください",
+                    crate::question_format::MAX_ASSETS
+                ),
+            ));
+        }
+        let mut asset_ids = BTreeSet::new();
+        for (index, asset) in self.assets.iter().enumerate() {
+            let path = format!("assets[{index}]");
+            asset.validate(&path)?;
+            if !asset_ids.insert(asset.id.clone()) {
+                return Err(ValidationError::new(
+                    format!("{path}.id"),
+                    "画像アセットIDが重複しています",
+                ));
+            }
+            if let Some(data) = asset.data.as_ref()
+                && data.len() > crate::question_format::MAX_ASSET_BYTES * 2
+            {
+                return Err(ValidationError::new(
+                    format!("{path}.data"),
+                    "埋め込み画像が大きすぎます",
+                ));
+            }
         }
         if self.notes.is_empty() {
             return Err(ValidationError::new("notes", "Noteを1つ以上含めてください"));
@@ -365,7 +588,7 @@ impl Workbook {
             }
             for (qi, question) in note.questions.iter().enumerate() {
                 let qpath = format!("{path}.questions[{qi}]");
-                question.validate(&qpath)?;
+                question.validate(&qpath, self.schema_version, &asset_ids)?;
                 if !question_ids.insert(question.id.as_str()) {
                     return Err(ValidationError::new(
                         format!("{qpath}.id"),
@@ -376,16 +599,78 @@ impl Workbook {
         }
         Ok(())
     }
+
+    /// Decodes embedded images. External file references are resolved by the
+    /// import layer from the workbook's directory.
+    pub fn embedded_assets(&self) -> Result<Vec<crate::AssetContent>, ValidationError> {
+        let mut output = Vec::new();
+        let mut total_bytes = 0usize;
+        for asset in &self.assets {
+            let Some(bytes) = asset.embedded_bytes()? else {
+                return Err(ValidationError::new(
+                    format!("assets.{}", asset.id),
+                    "file 参照の画像は教材ファイルからインポートしてください",
+                ));
+            };
+            total_bytes += bytes.len();
+            if total_bytes > crate::MAX_TOTAL_ASSET_BYTES {
+                return Err(ValidationError::new(
+                    "assets",
+                    "画像アセットの合計サイズが上限を超えています",
+                ));
+            }
+            let (width, height) =
+                inspect_image(&bytes, &asset.media_type, &format!("assets.{}", asset.id))?;
+            output.push(crate::AssetContent {
+                id: asset.id.clone(),
+                alt: asset.alt.clone(),
+                media_type: asset.media_type.clone(),
+                width,
+                height,
+                bytes,
+            });
+        }
+        Ok(output)
+    }
 }
 
 impl Question {
-    fn validate(&self, path: &str) -> Result<(), ValidationError> {
+    fn validate(
+        &self,
+        path: &str,
+        schema_version: u32,
+        asset_ids: &BTreeSet<String>,
+    ) -> Result<(), ValidationError> {
         validate_id(&self.id, &format!("{path}.id"))?;
         if self.revision <= 0 {
             return Err(ValidationError::new(
                 format!("{path}.revision"),
                 "1以上の整数にしてください",
             ));
+        }
+        if schema_version == 1 && self.kind.requires_schema_v2() {
+            return Err(ValidationError::new(
+                format!("{path}.type"),
+                "この問題形式は schemaVersion 2 でのみ使用できます",
+            ));
+        }
+        if schema_version < 2 && !asset_ids.is_empty() {
+            return Err(ValidationError::new(
+                path.to_string(),
+                "画像アセットは schemaVersion 2 でのみ使用できます",
+            ));
+        }
+        if self.kind != QuestionType::Ordering {
+            ensure_absent(self.initial_order.as_ref(), &format!("{path}.initialOrder"))?;
+        }
+        if self.kind != QuestionType::Matching {
+            ensure_absent(self.matching.as_ref(), &format!("{path}.matching"))?;
+        }
+        if self.kind != QuestionType::Hotspot {
+            ensure_absent(self.hotspot.as_ref(), &format!("{path}.hotspot"))?;
+        }
+        if self.kind != QuestionType::Labeling {
+            ensure_absent(self.labeling.as_ref(), &format!("{path}.labeling"))?;
         }
         if let Some(hint) = &self.hint {
             hint.validate(&format!("{path}.hint"))?;
@@ -591,9 +876,228 @@ impl Question {
                 front.validate(&format!("{path}.front"))?;
                 back.validate(&format!("{path}.back"))?;
             }
+            QuestionType::Numeric => {
+                require_prompt(self, path)?;
+                ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
+                ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
+                ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
+                let spec: NumericAnswerSpec = parse_answer_spec(self, path)?;
+                spec.validate(&format!("{path}.answer"))?;
+            }
+            QuestionType::Ordering => {
+                require_prompt(self, path)?;
+                ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
+                ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
+                let options = self.options.as_ref().ok_or_else(|| {
+                    ValidationError::new(format!("{path}.options"), "並べ替える項目が必要です")
+                })?;
+                if !(2..=crate::question_format::MAX_ORDERING_ITEMS).contains(&options.len()) {
+                    return Err(ValidationError::new(
+                        format!("{path}.options"),
+                        format!(
+                            "項目は2〜{}個にしてください",
+                            crate::question_format::MAX_ORDERING_ITEMS
+                        ),
+                    ));
+                }
+                let mut ids = BTreeSet::new();
+                for (index, option) in options.iter().enumerate() {
+                    validate_id(&option.id, &format!("{path}.options[{index}].id"))?;
+                    if !ids.insert(option.id.clone()) {
+                        return Err(ValidationError::new(
+                            format!("{path}.options[{index}].id"),
+                            "選択肢IDが重複しています",
+                        ));
+                    }
+                    option
+                        .content
+                        .validate(&format!("{path}.options[{index}].content"))?;
+                }
+                if let Some(initial) = self.initial_order.as_ref()
+                    && (initial.len() != ids.len()
+                        || initial.iter().collect::<BTreeSet<_>>().len() != initial.len()
+                        || initial.iter().any(|id| !ids.contains(id)))
+                {
+                    return Err(ValidationError::new(
+                        format!("{path}.initialOrder"),
+                        "すべての項目IDを1回ずつ指定してください",
+                    ));
+                }
+                let spec: OrderingAnswerSpec = parse_answer_spec(self, path)?;
+                spec.validate(&format!("{path}.answer"), &ids)?;
+            }
+            QuestionType::Matching => {
+                require_prompt(self, path)?;
+                ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
+                ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
+                ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
+                let matching = self.matching.as_ref().ok_or_else(|| {
+                    ValidationError::new(format!("{path}.matching"), "対応付けの項目が必要です")
+                })?;
+                if !(2..=12).contains(&matching.left.len())
+                    || !(2..=12).contains(&matching.right.len())
+                    || matching.left.len() != matching.right.len()
+                {
+                    return Err(ValidationError::new(
+                        format!("{path}.matching"),
+                        "左右それぞれ2〜12個の同数の項目にしてください",
+                    ));
+                }
+                let mut ids = BTreeSet::new();
+                for (side, items) in [("left", &matching.left), ("right", &matching.right)] {
+                    for (index, item) in items.iter().enumerate() {
+                        validate_id(&item.id, &format!("{path}.matching.{side}[{index}].id"))?;
+                        if !ids.insert(item.id.clone()) {
+                            return Err(ValidationError::new(
+                                format!("{path}.matching.{side}[{index}].id"),
+                                "項目IDが重複しています",
+                            ));
+                        }
+                        item.content
+                            .validate(&format!("{path}.matching.{side}[{index}].content"))?;
+                    }
+                }
+                let left: BTreeSet<String> =
+                    matching.left.iter().map(|item| item.id.clone()).collect();
+                let right: BTreeSet<String> =
+                    matching.right.iter().map(|item| item.id.clone()).collect();
+                let spec: MatchingAnswerSpec = parse_answer_spec(self, path)?;
+                spec.validate(&format!("{path}.answer"), &left, &right)?;
+            }
+            QuestionType::Hotspot => {
+                require_prompt(self, path)?;
+                ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
+                ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
+                ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
+                let hotspot = self.hotspot.as_ref().ok_or_else(|| {
+                    ValidationError::new(format!("{path}.hotspot"), "領域データが必要です")
+                })?;
+                if !asset_ids.contains(&hotspot.asset) {
+                    return Err(ValidationError::new(
+                        format!("{path}.hotspot.asset"),
+                        "assets に存在する画像IDを指定してください",
+                    ));
+                }
+                if !(1..=100).contains(&hotspot.regions.len()) {
+                    return Err(ValidationError::new(
+                        format!("{path}.hotspot.regions"),
+                        "領域は1〜100個にしてください",
+                    ));
+                }
+                let mut ids = BTreeSet::new();
+                for (index, region) in hotspot.regions.iter().enumerate() {
+                    let region_path = format!("{path}.hotspot.regions[{index}]");
+                    validate_id(&region.id, &format!("{region_path}.id"))?;
+                    if !ids.insert(region.id.clone()) {
+                        return Err(ValidationError::new(
+                            format!("{region_path}.id"),
+                            "領域IDが重複しています",
+                        ));
+                    }
+                    if region.alt.trim().is_empty() || region.alt.chars().count() > 2_000 {
+                        return Err(ValidationError::new(
+                            format!("{region_path}.alt"),
+                            "領域名を1〜2000文字で指定してください",
+                        ));
+                    }
+                    region.shape.validate(&format!("{region_path}.shape"))?;
+                }
+                let spec: HotspotAnswerSpec = parse_answer_spec(self, path)?;
+                spec.validate(&format!("{path}.answer"), &ids)?;
+            }
+            QuestionType::Labeling => {
+                require_prompt(self, path)?;
+                ensure_absent(self.options.as_ref(), &format!("{path}.options"))?;
+                ensure_absent(self.front.as_ref(), &format!("{path}.front"))?;
+                ensure_absent(self.back.as_ref(), &format!("{path}.back"))?;
+                let labeling = self.labeling.as_ref().ok_or_else(|| {
+                    ValidationError::new(format!("{path}.labeling"), "ラベルデータが必要です")
+                })?;
+                if !asset_ids.contains(&labeling.asset) {
+                    return Err(ValidationError::new(
+                        format!("{path}.labeling.asset"),
+                        "assets に存在する画像IDを指定してください",
+                    ));
+                }
+                if !(1..=50).contains(&labeling.targets.len())
+                    || !(1..=50).contains(&labeling.labels.len())
+                    || labeling.targets.len() != labeling.labels.len()
+                {
+                    return Err(ValidationError::new(
+                        format!("{path}.labeling"),
+                        "配置先とラベルを1〜50個の同数にしてください",
+                    ));
+                }
+                let mut target_ids = BTreeSet::new();
+                for (index, target) in labeling.targets.iter().enumerate() {
+                    let target_path = format!("{path}.labeling.targets[{index}]");
+                    validate_id(&target.id, &format!("{target_path}.id"))?;
+                    if !target_ids.insert(target.id.clone()) {
+                        return Err(ValidationError::new(
+                            format!("{target_path}.id"),
+                            "配置先IDが重複しています",
+                        ));
+                    }
+                    if !target.x.is_finite()
+                        || !target.y.is_finite()
+                        || !(0.0..=1.0).contains(&target.x)
+                        || !(0.0..=1.0).contains(&target.y)
+                    {
+                        return Err(ValidationError::new(
+                            &target_path,
+                            "0〜1の正規化座標で指定してください",
+                        ));
+                    }
+                    if target.alt.trim().is_empty() || target.alt.chars().count() > 2_000 {
+                        return Err(ValidationError::new(
+                            format!("{target_path}.alt"),
+                            "配置先の名前を1〜2000文字で指定してください",
+                        ));
+                    }
+                }
+                let mut label_ids = BTreeSet::new();
+                for (index, label) in labeling.labels.iter().enumerate() {
+                    let label_path = format!("{path}.labeling.labels[{index}]");
+                    validate_id(&label.id, &format!("{label_path}.id"))?;
+                    if !label_ids.insert(label.id.clone()) {
+                        return Err(ValidationError::new(
+                            format!("{label_path}.id"),
+                            "ラベルIDが重複しています",
+                        ));
+                    }
+                    label.content.validate(&format!("{label_path}.content"))?;
+                }
+                let spec: LabelingAnswerSpec = parse_answer_spec(self, path)?;
+                spec.validate(&format!("{path}.answer"), &target_ids, &label_ids)?;
+            }
         }
         Ok(())
     }
+}
+
+fn require_prompt(question: &Question, path: &str) -> Result<(), ValidationError> {
+    let prompt = question
+        .prompt
+        .as_ref()
+        .ok_or_else(|| ValidationError::new(format!("{path}.prompt"), "問題文が必要です"))?;
+    prompt.validate(&format!("{path}.prompt"))?;
+    Ok(())
+}
+
+fn parse_answer_spec<T: serde::de::DeserializeOwned>(
+    question: &Question,
+    path: &str,
+) -> Result<T, ValidationError> {
+    let answer = question
+        .answer
+        .as_ref()
+        .ok_or_else(|| ValidationError::new(format!("{path}.answer"), "正解が必要です"))?;
+    serde_json::from_value(answer.clone()).map_err(|error| {
+        ValidationError::new(
+            format!("{path}.answer"),
+            format!("回答仕様が不正です: {error}"),
+        )
+    })
 }
 
 fn validate_accepted(value: Option<&Value>, path: &str, min: usize) -> Result<(), ValidationError> {
@@ -761,5 +1265,121 @@ mod tests {
         let raw = MINIMAL.replace("\"title\":\"T\"", "\"title\":\"T\",\"extra\":1");
         let error = parse_workbook(&raw).unwrap_err();
         assert!(error.path.contains("extra") || error.message.contains("unknown"));
+    }
+
+    fn v2_raw(question: &str) -> String {
+        format!(
+            r#"{{"format":"workbook","schemaVersion":2,"id":"w1","revision":1,
+            "title":"T","description":"","language":"ja","tags":[],
+            "assets":[{{"id":"img","alt":"図","mediaType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII="}}],
+            "notes":[{{"id":"n1","title":"N","knowledgeCard":"card","questions":[{question}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn schema_v1_rejects_new_question_types() {
+        let raw = MINIMAL.replace(
+            r#""type":"true_false","prompt":"p","answer":true"#,
+            r#""type":"numeric","prompt":"p","answer":{"value":3,"unit":"A"}"#,
+        );
+        let error = parse_workbook(&raw).unwrap_err();
+        assert!(error.message.contains("schemaVersion 2"));
+    }
+
+    #[test]
+    fn schema_v2_accepts_each_new_question_type() {
+        let numeric = r#"{"id":"q","revision":1,"type":"numeric","prompt":"p","explanation":"e","answer":{"value":"3/2","unit":"m","significantFigures":2}}"#;
+        let ordering = r#"{"id":"q","revision":1,"type":"ordering","prompt":"p","explanation":"e","options":[{"id":"a","content":"A"},{"id":"b","content":"B"}],"initialOrder":["b","a"],"answer":{"orders":[["a","b"]]}}"#;
+        let matching = r#"{"id":"q","revision":1,"type":"matching","prompt":"p","explanation":"e","matching":{"left":[{"id":"l1","content":"A"},{"id":"l2","content":"B"}],"right":[{"id":"r1","content":"1"},{"id":"r2","content":"2"}]},"answer":{"pairs":[{"left":"l1","right":"r1"},{"left":"l2","right":"r2"}]}}"#;
+        let hotspot = r#"{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e","hotspot":{"asset":"img","regions":[{"id":"r","alt":"領域","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.2}}]},"answer":{"regionIds":["r"]}}"#;
+        let labeling = r#"{"id":"q","revision":1,"type":"labeling","prompt":"p","explanation":"e","labeling":{"asset":"img","targets":[{"id":"t","x":0.5,"y":0.5,"alt":"配置先"}],"labels":[{"id":"l","content":"ラベル"}]},"answer":{"pairs":{"t":"l"}}}"#;
+        for question in [numeric, ordering, matching, hotspot, labeling] {
+            parse_workbook(&v2_raw(question)).unwrap();
+        }
+    }
+
+    #[test]
+    fn schema_v2_rejects_duplicate_option_and_region_ids() {
+        let ordering = r#"{"id":"q","revision":1,"type":"ordering","prompt":"p","explanation":"e","options":[{"id":"a","content":"A"},{"id":"a","content":"B"}],"answer":{"orders":[["a","a"]]}}"#;
+        assert!(
+            parse_workbook(&v2_raw(ordering))
+                .unwrap_err()
+                .message
+                .contains("重複")
+        );
+        let hotspot = r#"{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e","hotspot":{"asset":"img","regions":[{"id":"r","alt":"A","shape":{"type":"rect","x":0.0,"y":0.0,"w":0.5,"h":0.5}},{"id":"r","alt":"B","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}}]},"answer":{"regionIds":["r"]}}"#;
+        assert!(
+            parse_workbook(&v2_raw(hotspot))
+                .unwrap_err()
+                .message
+                .contains("重複")
+        );
+    }
+
+    #[test]
+    fn schema_v2_rejects_out_of_range_hotspot_coordinates() {
+        let hotspot = r#"{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e","hotspot":{"asset":"img","regions":[{"id":"r","alt":"A","shape":{"type":"rect","x":1.2,"y":0.0,"w":0.5,"h":0.5}}]},"answer":{"regionIds":["r"]}}"#;
+        let error = parse_workbook(&v2_raw(hotspot)).unwrap_err();
+        assert!(error.message.contains("正規化"));
+    }
+
+    #[test]
+    fn schema_v2_rejects_matching_assignments_that_are_not_bijections() {
+        let matching = r#"{"id":"q","revision":1,"type":"matching","prompt":"p","explanation":"e","matching":{"left":[{"id":"l1","content":"A"},{"id":"l2","content":"B"}],"right":[{"id":"r1","content":"1"},{"id":"r2","content":"2"}]},"answer":{"pairs":[{"left":"l1","right":"r1"},{"left":"l2","right":"r1"}]}}"#;
+        let error = parse_workbook(&v2_raw(matching)).unwrap_err();
+        assert!(error.message.contains("重複"));
+    }
+
+    #[test]
+    fn repeated_asset_ids_are_rejected() {
+        let raw = v2_raw(
+            r#"{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e","hotspot":{"asset":"img","regions":[{"id":"r","alt":"A","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}}]},"answer":{"regionIds":["r"]}}"#,
+        )
+        .replace(
+            r#""assets":[{"id":"img","alt":"図","mediaType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII="}]"#,
+            r#""assets":[{"id":"img","alt":"図","mediaType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII="},{"id":"img","alt":"図2","mediaType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII="}]"#,
+        );
+        let error = parse_workbook(&raw).unwrap_err();
+        assert!(error.message.contains("重複"));
+    }
+
+    #[test]
+    fn unsafe_asset_paths_and_media_type_mismatches_are_rejected() {
+        for path in ["../secret.png", "/tmp/a.png", "images/../../a.png", "a.svg"] {
+            let raw = v2_raw(
+                r#"{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e","hotspot":{"asset":"img","regions":[{"id":"r","alt":"A","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}}]},"answer":{"regionIds":["r"]}}"#,
+            )
+            .replace(
+                r#"{"id":"img","alt":"図","mediaType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII="}"#,
+                &format!(r#"{{"id":"img","alt":"図","mediaType":"image/png","file":"{path}"}}"#),
+            );
+            assert!(parse_workbook(&raw).is_err(), "{path} should be rejected");
+        }
+    }
+
+    #[test]
+    fn safe_svg_assets_are_accepted_at_parse_time() {
+        let raw = v2_raw(
+            r#"{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e","hotspot":{"asset":"img","regions":[{"id":"r","alt":"A","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}}]},"answer":{"regionIds":["r"]}}"#,
+        )
+        .replace(
+            r#"{"id":"img","alt":"図","mediaType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII="}"#,
+            r#"{"id":"img","alt":"図","mediaType":"image/svg+xml","file":"map.svg"}"#,
+        );
+        let workbook = parse_workbook(&raw).unwrap();
+        assert_eq!(workbook.assets[0].media_type, "image/svg+xml");
+    }
+
+    #[test]
+    fn embedded_assets_must_be_valid_images() {
+        let raw = v2_raw(
+            r#"{"id":"q","revision":1,"type":"hotspot","prompt":"p","explanation":"e","hotspot":{"asset":"img","regions":[{"id":"r","alt":"A","shape":{"type":"circle","cx":0.5,"cy":0.5,"r":0.1}}]},"answer":{"regionIds":["r"]}}"#,
+        )
+        .replace(
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII=",
+            "AA==",
+        );
+        let workbook = parse_workbook(&raw).unwrap();
+        assert!(workbook.embedded_assets().is_err());
     }
 }

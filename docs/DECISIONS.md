@@ -75,7 +75,8 @@
 
 ## 10. 画像・数式
 
-- 外部画像は取得しない。imageブロックは alt / caption / URL を表示
+- 外部画像は取得しない。既存の image ブロックは alt / caption / URL を表示
+- Hotspot / Labeling 用の画像は教材に同梱し、SQLite の `assets` テーブルへ取り込む
 - mathブロックは等幅テキスト。KaTeX相当の組版はv1では未実装
 - MarkdownはGPUIのrich text。HTMLは実行しない
 
@@ -106,3 +107,31 @@
 - 自動評価OFFでは従来の `CommitRating` を残す
 - 訂正は既存の `CorrectAttempt` を使い、Attemptを増やさず `rating_source=manual` にする
 - `attempts.rating_source` で automatic / manual を識別する
+
+## 14. schemaVersion 2 と v1 互換
+
+- v1 の6形式・JSON構造・採点結果は変更しない
+- 新しい5形式と `assets` は `schemaVersion: 2` でのみ許可
+- v1 で v2 形式を使うとインポート時にパス付きで拒否
+- v2 でも v1 の6形式を使える
+- Question の新規フィールドは `Option` と `skip_serializing_if` で、v1 を読み書きしても
+  JSON に空フィールドを増やさない
+- 回答は `Answer` の新しい variant として保存し、既存4 variant のシリアライズは不変
+
+## 15. 画像アセットはSQLiteへ取り込む
+
+- 教材JSONは `file`（相対パス）または `data`（base64）を宣言できる
+- インポート時に PNG/JPEG のマジックと実サイズ、SVGの安全な静的サブセットを検証し、バイト列をDBへ保存する
+- 学習中は教材ファイルのパスを読まない。パストラバーサルとsymlink escapeはインポート時に拒否
+- GIF/WebPは拒否。SVGはスクリプト・外部参照・イベントハンドラ・style・foreignObject・use/imageを拒否した静的SVGのみ
+- 画像がDBに入るため、SQLite backup APIのバックアップ／復元にそのまま含まれる
+- `file` 参照はJSON単体インポートでは解決できないため、ファイルからインポートする
+
+## 16. Near Miss は未確定状態
+
+- `correct/incorrect` の二値ではなく `correct/near_miss/incorrect/manual` を domain で返す
+- Near Miss は Attempt も FSRS 状態も書かない。`sessions.assist_json` に履歴だけ残す
+- `retry_answer` で Question に戻り、draft を保持する
+- 最終 Attempt に履歴を移し、`hint` または履歴がある正解は Hard
+- 補助メッセージは一般化し、正解値・単位・解説を出さない
+- 確実に判定できる理由だけを使う。自然言語の曖昧な回答は自動採点しない

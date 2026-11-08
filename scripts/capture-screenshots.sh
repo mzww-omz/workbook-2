@@ -12,6 +12,12 @@ cargo build -p workbook-app --bin workbook2 --bin seed_demo >/dev/null
 ./target/debug/seed_demo /tmp/wb2-feedback feedback >/dev/null
 ./target/debug/seed_demo /tmp/wb2-result result >/dev/null
 ./target/debug/seed_demo /tmp/wb2-upcoming upcoming >/dev/null
+./target/debug/seed_demo /tmp/wb2-v2-numeric v2-numeric >/dev/null
+./target/debug/seed_demo /tmp/wb2-v2-ordering v2-ordering >/dev/null
+./target/debug/seed_demo /tmp/wb2-v2-matching v2-matching >/dev/null
+./target/debug/seed_demo /tmp/wb2-v2-hotspot v2-hotspot >/dev/null
+./target/debug/seed_demo /tmp/wb2-v2-labeling v2-labeling >/dev/null
+./target/debug/seed_demo /tmp/wb2-v2-near-miss v2-near-miss >/dev/null
 
 caffeinate -d -t 180 &
 CAFFEINE=$!
@@ -49,3 +55,9 @@ capture study /tmp/wb2-study study
 capture feedback /tmp/wb2-feedback study
 capture result /tmp/wb2-result study
 capture upcoming /tmp/wb2-upcoming today
+capture numeric /tmp/wb2-v2-numeric study
+capture ordering /tmp/wb2-v2-ordering study
+capture matching /tmp/wb2-v2-matching study
+capture hotspot /tmp/wb2-v2-hotspot study
+capture labeling /tmp/wb2-v2-labeling study
+capture near-miss /tmp/wb2-v2-near-miss study

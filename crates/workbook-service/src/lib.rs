@@ -1,12 +1,14 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use thiserror::Error;
 use workbook_domain::{
-    Answer, CardState, Content, Mode, Phase, Question, QuestionType, Rating, RatingSource,
-    SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
-    answer_is_blank, automatic_rating, grade_answer, parse_workbook,
+    Answer, AssistState, CardState, Content, GradeResult, GradeStatus, Mode, NearMissReason,
+    NearMissRecord, Phase, Question, QuestionType, Rating, RatingSource, SessionItemStatus,
+    SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook, answer_is_blank,
+    automatic_rating, grade_answer_detailed, parse_workbook,
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{Clock, QueueInput, QueueKind, Scheduler, SchedulerSettings, select_next};
@@ -38,6 +40,7 @@ pub enum ServiceError {
 pub type Result<T> = std::result::Result<T, ServiceError>;
 
 pub const SAMPLE_WORKBOOK_JSON: &str = include_str!("../../../assets/sample.workbook.json");
+pub const SAMPLE_WORKBOOK_V2_JSON: &str = include_str!("../../../assets/sample-v2.workbook.json");
 
 #[derive(Clone, Debug)]
 pub struct BookSummary {
@@ -108,9 +111,15 @@ pub struct KnowledgeIntro {
 pub struct FeedbackView {
     pub attempt_id: Option<String>,
     pub committed: bool,
+    pub status: GradeStatus,
     pub correct: Option<bool>,
     pub unknown: bool,
     pub hint: bool,
+    pub assisted: bool,
+    pub retry_count: usize,
+    pub near_miss_reasons: Vec<NearMissReason>,
+    pub near_miss_messages: Vec<&'static str>,
+    pub diagnostic: Option<workbook_domain::GradeDiagnostic>,
     pub rating: Option<Rating>,
     pub rating_source: Option<RatingSource>,
     /// The rating the automatic policy would choose. `None` means the answer
@@ -120,6 +129,16 @@ pub struct FeedbackView {
     pub answer_summary: String,
     pub given_answer: String,
     pub elapsed_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AssetView {
+    pub id: String,
+    pub media_type: String,
+    pub alt: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,6 +179,7 @@ pub struct StudyView {
     pub note_title: Option<String>,
     pub item_kind: String,
     pub question: Option<Question>,
+    pub assets: Vec<AssetView>,
     pub intro: Option<KnowledgeIntro>,
     pub draft: Option<Answer>,
     pub hint: Option<Content>,
@@ -364,11 +384,24 @@ impl WorkbookService {
         Ok(parse_workbook(raw)?)
     }
 
+    pub fn preview_workbook_file(&self, path: &std::path::Path) -> Result<Workbook> {
+        let (workbook, _assets) = workbook_import::load_workbook_file(path)?;
+        Ok(workbook)
+    }
+
     pub fn import_workbook_json(&self, raw: &str) -> Result<String> {
         let workbook = parse_workbook(raw)?;
+        let assets = workbook.embedded_assets()?;
         let mut storage = self.storage()?;
         let now = self.clock.now();
-        Ok(storage.import_workbook(&workbook, now)?)
+        Ok(storage.import_workbook(&workbook, &assets, now)?)
+    }
+
+    pub fn import_workbook_file(&self, path: &std::path::Path) -> Result<String> {
+        let (workbook, assets) = workbook_import::load_workbook_file(path)?;
+        let mut storage = self.storage()?;
+        let now = self.clock.now();
+        Ok(storage.import_workbook(&workbook, &assets, now)?)
     }
 
     pub fn delete_workbook(&self, local_id: &str) -> Result<()> {
@@ -591,33 +624,64 @@ impl WorkbookService {
                 "解答を表示して自己評価してください".to_string(),
             ));
         }
-        let correct = if unknown {
-            Some(false)
-        } else if question.kind == QuestionType::Flashcard {
-            self_correct
-        } else {
-            grade_answer(&question, answer)
-        };
         if !unknown && question.kind != QuestionType::Flashcard && answer_is_blank(answer) {
             return Err(ServiceError::Invalid("回答を入力してください".to_string()));
         }
+        let grade = if unknown {
+            GradeResult::incorrect()
+        } else if question.kind == QuestionType::Flashcard {
+            match self_correct {
+                Some(true) => GradeResult::correct(),
+                Some(false) => GradeResult::incorrect(),
+                None => GradeResult::manual(),
+            }
+        } else {
+            grade_answer_detailed(&question, answer).unwrap_or_else(GradeResult::manual)
+        };
         record_time(&mut bundle.session, now);
         bundle.session.draft_json = answer
             .map(serde_json::to_value)
             .transpose()?
             .map(|value| value.to_string());
         bundle.session.hint |= hint;
-        bundle.session.pending_correct = correct;
+        let mut assist = AssistState::from_json(bundle.session.assist_json.as_deref());
         bundle.session.pending_unknown = unknown;
         bundle.session.pending_at = Some(now);
         bundle.session.phase = Phase::Feedback;
         bundle.session.revision += 1;
 
+        if grade.status == GradeStatus::NearMiss {
+            // A near miss is not an answer. Keep it as assistance evidence and
+            // stop before any FSRS state or attempt is written.
+            assist.history.push(NearMissRecord {
+                answer: answer.cloned(),
+                result: grade.clone(),
+                answered_at: now,
+            });
+            assist.pending = Some(grade.clone());
+            assist.final_grade = None;
+            bundle.session.pending_correct = None;
+            bundle.session.assist_json = Some(serde_json::to_string(&assist)?);
+            storage.update_session(&bundle.session)?;
+            return self.view_for(&storage, &bundle, &settings, &calendar, now);
+        }
+
+        assist.pending = None;
+        assist.final_grade = Some(grade.clone());
+        bundle.session.assist_json = Some(serde_json::to_string(&assist)?);
+        bundle.session.pending_correct = match grade.status {
+            GradeStatus::Correct => Some(true),
+            GradeStatus::Incorrect => Some(false),
+            GradeStatus::Manual => None,
+            GradeStatus::NearMiss => unreachable!(),
+        };
+
         // Automatic rating commits in the same service call. This keeps the
         // answer, FSRS state, attempt, and session cursor crash-safe: either
         // the whole answer is saved or none of it is.
+        let assisted = bundle.session.hint || assist.assisted();
         let automatic = if settings.automatic_rating {
-            automatic_rating_for(&question, correct, bundle.session.hint, unknown)
+            automatic_rating_for(&question, bundle.session.pending_correct, assisted, unknown)
         } else {
             None
         };
@@ -634,6 +698,42 @@ impl WorkbookService {
             )?,
             None => storage.update_session(&bundle.session)?,
         }
+        self.view_for(&storage, &bundle, &settings, &calendar, now)
+    }
+
+    /// Returns to the question after a near miss. The draft answer is kept so
+    /// the learner can fix it, and the near-miss history stays for the final
+    /// attempt and for backup/restore.
+    pub fn retry_answer(&self, session_id: &str, expected_revision: u64) -> Result<StudyView> {
+        let mut storage = self.storage()?;
+        let settings = storage.settings()?;
+        let calendar =
+            StudyCalendar::new(&settings.effective_timezone()).map_err(ServiceError::Invalid)?;
+        let now = self.clock.now();
+        let mut bundle = storage.session_bundle(session_id)?;
+        ensure_active(&bundle)?;
+        check_revision(&bundle.session, expected_revision)?;
+        if bundle.session.phase != Phase::Feedback {
+            return Err(ServiceError::Invalid(
+                "再回答できる画面ではありません".to_string(),
+            ));
+        }
+        let mut assist = AssistState::from_json(bundle.session.assist_json.as_deref());
+        if assist.pending.is_none() {
+            return Err(ServiceError::Invalid(
+                "再回答が必要な回答ではありません".to_string(),
+            ));
+        }
+        assist.pending = None;
+        assist.final_grade = None;
+        bundle.session.assist_json = Some(serde_json::to_string(&assist)?);
+        bundle.session.pending_correct = None;
+        bundle.session.pending_unknown = false;
+        bundle.session.pending_at = None;
+        bundle.session.phase = Phase::Question;
+        bundle.session.question_started_at = Some(now);
+        bundle.session.revision += 1;
+        storage.update_session(&bundle.session)?;
         self.view_for(&storage, &bundle, &settings, &calendar, now)
     }
 
@@ -663,6 +763,12 @@ impl WorkbookService {
         if bundle.session.phase != Phase::Feedback {
             return Err(ServiceError::Invalid(
                 "回答を確認してから評価してください".to_string(),
+            ));
+        }
+        let assist = AssistState::from_json(bundle.session.assist_json.as_deref());
+        if assist.pending.is_some() {
+            return Err(ServiceError::Invalid(
+                "おしい回答です。もう一度回答してください".to_string(),
             ));
         }
         self.commit_pending(
@@ -725,6 +831,7 @@ impl WorkbookService {
             .draft_json
             .clone()
             .unwrap_or_else(|| "null".to_string());
+        let assist_json = bundle.session.assist_json.clone();
         let before_json = before.as_ref().map(serde_json::to_string).transpose()?;
         let after_json = card.as_ref().map(serde_json::to_string).transpose()?;
         let attempt = AttemptRow {
@@ -745,6 +852,7 @@ impl WorkbookService {
             after_state_json: after_json,
             state_revision: card.as_ref().map(|card| card.revision).unwrap_or(0),
             short_term,
+            assist_json,
             created_at: now,
         };
         let bury_until = if bundle.session.mode == Mode::Review {
@@ -755,6 +863,7 @@ impl WorkbookService {
         bundle.session.pending_correct = None;
         bundle.session.pending_unknown = false;
         bundle.session.pending_at = None;
+        bundle.session.assist_json = None;
         bundle.session.revision += 1;
         let committed_attempt = attempt.clone();
         storage.commit_attempt(CommitWrite {
@@ -811,7 +920,9 @@ impl WorkbookService {
         if let Some(correct) = correct {
             new_correct = Some(correct);
             new_unknown = false;
-            if let Some(suggested) = automatic_rating(Some(correct), current.hint, false) {
+            let assisted =
+                current.hint || AssistState::from_json(current.assist_json.as_deref()).assisted();
+            if let Some(suggested) = automatic_rating(Some(correct), assisted, false) {
                 new_rating = suggested.value();
             }
         }
@@ -850,6 +961,19 @@ impl WorkbookService {
             Some(card)
         };
         let mut attempt = current.clone();
+        let mut assist = AssistState::from_json(attempt.assist_json.as_deref());
+        if let Some(grade) = assist.final_grade.as_mut() {
+            grade.status = match new_correct {
+                Some(true) => GradeStatus::Correct,
+                Some(false) => GradeStatus::Incorrect,
+                None => GradeStatus::Manual,
+            };
+            if grade.status == GradeStatus::Correct {
+                grade.diagnostic = None;
+                grade.reasons.clear();
+            }
+            attempt.assist_json = Some(serde_json::to_string(&assist)?);
+        }
         attempt.correct = new_correct;
         attempt.unknown = new_unknown;
         attempt.rating = new_rating;
@@ -970,6 +1094,7 @@ impl WorkbookService {
                 bundle.session.pending_correct = None;
                 bundle.session.pending_unknown = false;
                 bundle.session.pending_at = None;
+                bundle.session.assist_json = None;
                 bundle.session.question_started_at = Some(now);
                 bundle.session.question_elapsed_ms = 0;
             }
@@ -1063,6 +1188,7 @@ impl WorkbookService {
             bundle.session.pending_correct = None;
             bundle.session.pending_unknown = false;
             bundle.session.pending_at = None;
+            bundle.session.assist_json = None;
             bundle.session.question_started_at = Some(now);
             bundle.session.question_elapsed_ms = 0;
         } else {
@@ -1095,6 +1221,7 @@ impl WorkbookService {
         bundle.session.pending_correct = None;
         bundle.session.pending_unknown = false;
         bundle.session.pending_at = None;
+        bundle.session.assist_json = None;
         bundle.session.revision += 1;
         storage.update_session(&bundle.session)?;
         self.view_for(&storage, &bundle, &settings, &calendar, now)
@@ -1132,6 +1259,28 @@ impl WorkbookService {
                     .map(|(_, question)| question.clone())
             })
         });
+        let mut assets = Vec::new();
+        if let (Some(workbook_id), Some(question)) = (workbook_id.as_deref(), question.as_ref()) {
+            let mut ids = BTreeSet::new();
+            if let Some(hotspot) = question.hotspot.as_ref() {
+                ids.insert(hotspot.asset.clone());
+            }
+            if let Some(labeling) = question.labeling.as_ref() {
+                ids.insert(labeling.asset.clone());
+            }
+            for id in ids {
+                if let Some(asset) = storage.asset(workbook_id, &id)? {
+                    assets.push(AssetView {
+                        id: asset.id,
+                        media_type: asset.media_type,
+                        alt: asset.alt,
+                        width: asset.width,
+                        height: asset.height,
+                        bytes: Arc::new(asset.bytes),
+                    });
+                }
+            }
+        }
         let intro = if session.phase == Phase::Intro {
             note.map(|note| KnowledgeIntro {
                 note_title: note.title.clone(),
@@ -1206,6 +1355,7 @@ impl WorkbookService {
             note_title: note.map(|note| note.title.clone()),
             item_kind: session.cursor_kind.clone(),
             question: question.clone(),
+            assets,
             intro,
             draft,
             hint: question.as_ref().and_then(|question| question.hint.clone()),
@@ -1233,19 +1383,49 @@ impl WorkbookService {
             .as_deref()
             .map(serde_json::from_str::<Value>)
             .transpose()?;
-        if let Some(correct) = session.pending_correct {
-            let suggested = automatic_rating_for(
-                question,
-                Some(correct),
-                session.hint,
-                session.pending_unknown,
-            );
+        let assist = AssistState::from_json(session.assist_json.as_deref());
+        if let Some(pending) = assist.pending.as_ref() {
             return Ok(Some(FeedbackView {
                 attempt_id: None,
                 committed: false,
+                status: GradeStatus::NearMiss,
+                correct: None,
+                unknown: false,
+                hint: session.hint,
+                assisted: true,
+                retry_count: assist.retry_count(),
+                near_miss_reasons: pending.reasons.clone(),
+                near_miss_messages: pending.messages(),
+                diagnostic: pending.diagnostic.clone(),
+                rating: None,
+                rating_source: None,
+                suggested_rating: None,
+                explanation: question.explanation.clone(),
+                answer_summary: question.answer_summary(),
+                given_answer: format_given_answer(question, answer.as_ref()),
+                elapsed_ms: session.question_elapsed_ms,
+            }));
+        }
+        if let Some(correct) = session.pending_correct {
+            let assisted = session.hint || assist.assisted();
+            let suggested =
+                automatic_rating_for(question, Some(correct), assisted, session.pending_unknown);
+            return Ok(Some(FeedbackView {
+                attempt_id: None,
+                committed: false,
+                status: if correct {
+                    GradeStatus::Correct
+                } else {
+                    GradeStatus::Incorrect
+                },
                 correct: Some(correct),
                 unknown: session.pending_unknown,
                 hint: session.hint,
+                assisted,
+                retry_count: assist.retry_count(),
+                near_miss_reasons: Vec::new(),
+                near_miss_messages: Vec::new(),
+                diagnostic: None,
                 rating: None,
                 rating_source: None,
                 suggested_rating: suggested,
@@ -1266,18 +1446,38 @@ impl WorkbookService {
             return Ok(None);
         };
         let answer = serde_json::from_str::<Value>(&attempt.answer_json).ok();
+        let assist = AssistState::from_json(attempt.assist_json.as_deref());
+        let assisted = attempt.hint || assist.assisted();
+        let status = assist
+            .final_grade
+            .as_ref()
+            .map(|grade| grade.status)
+            .unwrap_or(match attempt.correct {
+                Some(true) => GradeStatus::Correct,
+                Some(false) => GradeStatus::Incorrect,
+                None => GradeStatus::Manual,
+            });
         Ok(Some(FeedbackView {
             attempt_id: Some(attempt.id.clone()),
             committed: true,
+            status,
             correct: attempt.correct,
             unknown: attempt.unknown,
             hint: attempt.hint,
+            assisted,
+            retry_count: assist.retry_count(),
+            near_miss_reasons: Vec::new(),
+            near_miss_messages: Vec::new(),
+            diagnostic: assist
+                .final_grade
+                .as_ref()
+                .and_then(|grade| grade.diagnostic.clone()),
             rating: Rating::from_value(attempt.rating),
             rating_source: Some(attempt.rating_source),
             suggested_rating: automatic_rating_for(
                 question,
                 attempt.correct,
-                attempt.hint,
+                assisted,
                 attempt.unknown,
             ),
             explanation: question.explanation.clone(),
@@ -1440,6 +1640,7 @@ fn build_session_bundle(
         question_started_at: Some(now),
         question_elapsed_ms: 0,
         cursor_kind: "initial".to_string(),
+        assist_json: None,
         revision: 0,
     };
     Ok((
@@ -1636,6 +1837,124 @@ fn format_given_answer(question: &Question, answer: Option<&Value>) -> String {
                 "（自己評価）".to_string()
             }
         }
+        workbook_domain::QuestionType::Numeric => answer
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| answer.to_string()),
+        workbook_domain::QuestionType::Ordering => answer
+            .get("order")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(|id| {
+                        question
+                            .options
+                            .as_ref()
+                            .and_then(|options| {
+                                options
+                                    .iter()
+                                    .find(|option| option.id == id)
+                                    .map(|option| option.content.plain_text())
+                            })
+                            .unwrap_or_else(|| id.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            })
+            .unwrap_or_else(|| answer.to_string()),
+        workbook_domain::QuestionType::Matching => answer
+            .get("matches")
+            .and_then(Value::as_object)
+            .map(|matches| {
+                matches
+                    .iter()
+                    .map(|(left, right)| {
+                        let left_text = question
+                            .matching
+                            .as_ref()
+                            .and_then(|matching| {
+                                matching
+                                    .left
+                                    .iter()
+                                    .find(|item| &item.id == left)
+                                    .map(|item| item.content.plain_text())
+                            })
+                            .unwrap_or_else(|| left.clone());
+                        let right_id = right.as_str().unwrap_or_default();
+                        let right_text = question
+                            .matching
+                            .as_ref()
+                            .and_then(|matching| {
+                                matching
+                                    .right
+                                    .iter()
+                                    .find(|item| item.id == right_id)
+                                    .map(|item| item.content.plain_text())
+                            })
+                            .unwrap_or_else(|| right_id.to_string());
+                        format!("{left_text} → {right_text}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| answer.to_string()),
+        workbook_domain::QuestionType::Hotspot => {
+            let x = answer.get("x").and_then(Value::as_f64);
+            let y = answer.get("y").and_then(Value::as_f64);
+            match (x, y) {
+                (Some(x), Some(y)) => {
+                    let region = question.hotspot.as_ref().and_then(|hotspot| {
+                        hotspot
+                            .regions
+                            .iter()
+                            .find(|region| region.shape.contains(x, y))
+                            .map(|region| region.alt.clone())
+                    });
+                    match region {
+                        Some(alt) => alt,
+                        None => format!("画像内 {:.0}% / {:.0}%", x * 100.0, y * 100.0),
+                    }
+                }
+                _ => "（未選択）".to_string(),
+            }
+        }
+        workbook_domain::QuestionType::Labeling => answer
+            .get("labels")
+            .and_then(Value::as_object)
+            .map(|labels| {
+                labels
+                    .iter()
+                    .map(|(target, label)| {
+                        let target_text = question
+                            .labeling
+                            .as_ref()
+                            .and_then(|labeling| {
+                                labeling
+                                    .targets
+                                    .iter()
+                                    .find(|item| &item.id == target)
+                                    .map(|item| item.alt.clone())
+                            })
+                            .unwrap_or_else(|| target.clone());
+                        let label_id = label.as_str().unwrap_or_default();
+                        let label_text = question
+                            .labeling
+                            .as_ref()
+                            .and_then(|labeling| {
+                                labeling
+                                    .labels
+                                    .iter()
+                                    .find(|item| item.id == label_id)
+                                    .map(|item| item.content.plain_text())
+                            })
+                            .unwrap_or_else(|| label_id.to_string());
+                        format!("{target_text}: {label_text}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| answer.to_string()),
     }
 }
 

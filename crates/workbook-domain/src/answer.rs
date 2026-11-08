@@ -2,17 +2,36 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::grading::{GradeStatus, grade_answer_detailed};
 use crate::session::Rating;
-use crate::workbook::{Question, QuestionType};
+use crate::workbook::Question;
 use unicode_normalization::UnicodeNormalization;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Answer {
     Text(String),
     Bool(bool),
     Choices(Vec<String>),
     Blanks(BTreeMap<String, String>),
+    /// Ordered option IDs. Never display text: the IDs can be replayed even
+    /// after an author edits labels.
+    Ordering {
+        order: Vec<String>,
+    },
+    /// Left item ID → right item ID.
+    Matching {
+        matches: BTreeMap<String, String>,
+    },
+    /// A point in normalized image coordinates (0..1, origin top-left).
+    Hotspot {
+        x: f64,
+        y: f64,
+    },
+    /// Target/slot ID → label ID.
+    Labels {
+        labels: BTreeMap<String, String>,
+    },
 }
 
 pub fn normalize_answer(value: &str) -> String {
@@ -34,72 +53,22 @@ pub fn answer_is_blank(answer: Option<&Answer>) -> bool {
         Some(Answer::Text(value)) => value.trim().is_empty(),
         Some(Answer::Choices(values)) => values.is_empty(),
         Some(Answer::Blanks(values)) => values.values().all(|value| value.trim().is_empty()),
+        Some(Answer::Ordering { order }) => order.is_empty(),
+        Some(Answer::Matching { matches }) => matches.is_empty(),
+        Some(Answer::Labels { labels }) => labels.is_empty(),
+        Some(Answer::Hotspot { .. }) => false,
         Some(Answer::Bool(_)) => false,
     }
 }
 
 /// Grades an answer. `None` means the question has no automatic correctness
 /// (flashcards), matching the legacy Workbook behaviour.
+///
+/// Near misses are reported as `Some(false)`: they are not final answers and
+/// the service layer stops before committing FSRS state. Use
+/// [`grade_answer_detailed`] when the near-miss reason is needed.
 pub fn grade_answer(question: &Question, answer: Option<&Answer>) -> Option<bool> {
-    match question.kind {
-        QuestionType::SingleChoice => {
-            let expected = question.single_choice_answer()?;
-            match answer {
-                Some(Answer::Text(value)) => Some(value == expected),
-                _ => Some(false),
-            }
-        }
-        QuestionType::TrueFalse => {
-            let expected = question.answer.as_ref()?.as_bool()?;
-            match answer {
-                Some(Answer::Bool(value)) => Some(*value == expected),
-                _ => Some(false),
-            }
-        }
-        QuestionType::MultipleChoice => {
-            let expected = question.multiple_choice_answers();
-            match answer {
-                Some(Answer::Choices(values)) => {
-                    let mut values = values.clone();
-                    values.sort();
-                    values.dedup();
-                    let mut expected = expected;
-                    expected.sort();
-                    Some(values == expected)
-                }
-                _ => Some(false),
-            }
-        }
-        QuestionType::ShortText => {
-            let accepted = question.short_text_answers();
-            match answer {
-                Some(Answer::Text(value)) => {
-                    let value = normalize_answer(value);
-                    Some(
-                        accepted
-                            .iter()
-                            .any(|candidate| normalize_answer(candidate) == value),
-                    )
-                }
-                _ => Some(false),
-            }
-        }
-        QuestionType::Cloze => {
-            let expected = question.cloze_blanks();
-            match answer {
-                Some(Answer::Blanks(values)) => Some(expected.iter().all(|(id, accepted)| {
-                    values.get(id).is_some_and(|value| {
-                        let value = normalize_answer(value);
-                        accepted
-                            .iter()
-                            .any(|candidate| normalize_answer(candidate) == value)
-                    })
-                })),
-                _ => Some(false),
-            }
-        }
-        QuestionType::Flashcard => None,
-    }
+    grade_answer_detailed(question, answer).map(|result| result.status == GradeStatus::Correct)
 }
 
 /// Conservative automatic rating derived only from a graded answer, the hint
@@ -163,7 +132,40 @@ mod tests {
         assert!(answer_is_blank(None));
         assert!(answer_is_blank(Some(&Answer::Text("   ".to_string()))));
         assert!(answer_is_blank(Some(&Answer::Choices(Vec::new()))));
+        assert!(answer_is_blank(Some(&Answer::Blanks(BTreeMap::new()))));
+        assert!(answer_is_blank(Some(&Answer::Ordering {
+            order: Vec::new()
+        })));
+        assert!(answer_is_blank(Some(&Answer::Matching {
+            matches: BTreeMap::new()
+        })));
+        assert!(answer_is_blank(Some(&Answer::Labels {
+            labels: BTreeMap::new()
+        })));
+        assert!(!answer_is_blank(Some(&Answer::Hotspot { x: 0.0, y: 0.0 })));
         assert!(!answer_is_blank(Some(&Answer::Bool(false))));
         assert!(!answer_is_blank(Some(&Answer::Text("x".to_string()))));
+    }
+
+    #[test]
+    fn new_answer_shapes_round_trip_without_colliding() {
+        let answers = [
+            Answer::Ordering {
+                order: vec!["a".into(), "b".into()],
+            },
+            Answer::Matching {
+                matches: BTreeMap::from([("l1".into(), "r1".into())]),
+            },
+            Answer::Hotspot { x: 0.25, y: 0.75 },
+            Answer::Labels {
+                labels: BTreeMap::from([("t1".into(), "l1".into())]),
+            },
+            Answer::Blanks(BTreeMap::from([("x".into(), "y".into())])),
+        ];
+        for answer in answers {
+            let json = serde_json::to_string(&answer).unwrap();
+            let parsed: Answer = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, answer);
+        }
     }
 }

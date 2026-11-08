@@ -5,8 +5,8 @@ workbook-app     macOS起動、データディレクトリ、メニュー
   └─ workbook-ui        GPUI Kit views / input / dialogs / theme
        └─ workbook-service    Application Service（コマンド、トランザクション境界）
             ├─ workbook-scheduler  FSRS-7 adapter / StepPolicy / QueueSelector / Clock
-            ├─ workbook-import     JSON v1 / 旧DB v1 の検証・移行計画
-            ├─ workbook-storage    SQLite schema / attempts / backup / restore
+            ├─ workbook-import     JSON v1/v2・画像アセット / 旧DB v1 の検証・移行計画
+            ├─ workbook-storage    SQLite schema / attempts / assets / backup / restore
             └─ workbook-domain     Content / Question / grading / Settings / 4時カレンダー
 ```
 
@@ -23,8 +23,9 @@ workbook-app     macOS起動、データディレクトリ、メニュー
 回答入力
   │
   ├─ EvaluateAnswer（サービス内）
-  │    correct/hint/unknown を計算、draft/elapsed/pending_at を session に保存
-  │    自動評価ONなら automatic_rating（domainの純粋関数）で rating を決定
+  │    grade_answer_detailed で correct / near_miss / incorrect / manual を判定
+  │    Near Miss なら assist_json に履歴を追記し、Attempt も FSRS も書かず Feedback
+  │    correct/incorrect は automatic_rating（domainの純粋関数）で rating を決定
   │    rating が決まる場合は 1 トランザクションで CommitRating 相当まで実行
   │    （Attempt・FSRS状態・Sessionを同時に保存）
   │    自動採点不可なら Feedback の未確定状態で止め、手動評価へフォールバック
@@ -52,10 +53,14 @@ workbook-app     macOS起動、データディレクトリ、メニュー
 | 状況 | rating |
 |---|---|
 | 不正解 / 「わからない」 | Again |
-| ヒント使用後の正解 | Hard |
+| ヒント使用後の正解 / Near Miss 後に正解 | Hard |
 | ヒントなしの正解 | Good |
 | 明確に容易（自動では判定しない） | Easy（手動のみ） |
 | 自動採点不可（フラッシュカード） | 手動フォールバック |
+
+Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Question に戻る。
+最終 Attempt に `attempts.assist_json` として履歴を保存する。Near Miss の段階では
+`attempts` も `review_states` も変更しない。
 
 - 同一Attempt IDの再送は既存Attemptを返し、FSRSを二度更新しない
 - 自動評価は評価と確定を同じトランザクションで行うため、クラッシュ時に未確定の回答だけが残らない
@@ -87,18 +92,19 @@ workbook-app     macOS起動、データディレクトリ、メニュー
 
 ## SQLite
 
-`application_id = 1463962418`（`"WBK2"`）、`user_version = 2`。
+`application_id = 1463962418`（`"WBK2"`）、`user_version = 3`。
 
 | Table | 役割 |
 |---|---|
 | `workbooks` | ローカルUUID、教材JSON、import日時、last_used |
 | `notes` | Note、初回学習済み |
 | `questions` | Question、関連問題の延期 |
+| `assets` | 教材同梱画像（media type、alt、実サイズ、バイト列） |
 | `review_states` | FSRS状態、due、revision |
-| `sessions` | mode/status/cursor/phase/draft/pending/revision |
+| `sessions` | mode/status/cursor/phase/draft/pending/assist/revision |
 | `session_items` | セッションの初期対象と状態 |
 | `session_workbooks` | 複数WorkbookのResult順序 |
-| `attempts` | 回答ごとの独立UUID、正誤、評価、評価元（automatic/manual）、前後状態、時刻 |
+| `attempts` | 回答ごとの独立UUID、正誤、評価、評価元（automatic/manual）、前後状態、Near Miss履歴、時刻 |
 | `settings` | JSON設定 |
 | `meta` | アプリ識別情報 |
 
@@ -106,7 +112,10 @@ workbook-app     macOS起動、データディレクトリ、メニュー
 `WAL`, `synchronous=FULL`, `foreign_keys=ON`, `trusted_schema=OFF`, `busy_timeout=5000`。
 
 スキーマ移行:
-`user_version=1` のDBは起動時に `attempts.rating_source` を追加し、`user_version=2` へ更新する。変更前に `backups/pre-migration-v1-*.sqlite` をSQLite backup APIで作成する。v1のバックアップも復元時に同じ移行を行う。
+`user_version=1` のDBは起動時に `attempts.rating_source`、`assist_json` 列、`sessions.assist_json`、
+`assets` テーブルを追加し `user_version=3` へ更新する。`user_version=2` のDBも同じ
+v3 移行を行う。変更前に `backups/pre-migration-v{1,2}-*.sqlite` をSQLite backup APIで作成する。
+v1/v2のバックアップも復元時に同じ移行を行う。
 
 ## 再評価タイミング
 

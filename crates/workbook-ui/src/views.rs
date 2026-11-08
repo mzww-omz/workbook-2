@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use gpui_kit::component::{
@@ -7,13 +10,49 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, px,
+    AnyElement, Context, FontWeight, Image, ImageFormat, ImageSource, IntoElement, ObjectFit,
+    ParentElement, Render, SharedString, Styled, div, img, px, relative,
 };
 use workbook_domain::{
-    Content, Mode, Phase, Question, QuestionType, Rating, RatingSource, ThemeSetting,
+    Content, GradeStatus, Mode, Phase, Question, QuestionType, Rating, RatingSource, ThemeSetting,
 };
+use workbook_service::AssetView;
 
 use crate::{NoticeKind, Route, WorkbookApp};
+
+struct DragGhost {
+    label: String,
+}
+
+impl Render for DragGhost {
+    fn render(
+        &mut self,
+        _window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .px(px(12.0))
+            .py(px(8.0))
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.background)
+            .text_size(px(14.0))
+            .child(self.label.clone())
+    }
+}
+
+#[derive(Clone)]
+struct OrderDrag {
+    id: String,
+    label: String,
+}
+
+#[derive(Clone)]
+struct LabelDrag {
+    id: String,
+    label: String,
+}
 
 fn format_duration(ms: i64) -> String {
     let seconds = ms.max(0) / 1000;
@@ -508,6 +547,14 @@ impl WorkbookApp {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.import_sample(window, cx);
                             })),
+                    )
+                    .child(
+                        Button::new("today-sample-v2")
+                            .label("拡張サンプル（5形式）")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.import_expanded_sample(window, cx);
+                            })),
                     ),
             );
             return page.into_any_element();
@@ -739,12 +786,25 @@ impl WorkbookApp {
             });
             if self.snapshot.books.is_empty() {
                 page = page.child(
-                    Button::new("library-sample")
-                        .label("サンプルで試す")
-                        .secondary()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.import_sample(window, cx);
-                        })),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("library-sample")
+                                .label("サンプルで試す")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_sample(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("library-sample-v2")
+                                .label("拡張サンプル（5形式）")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_expanded_sample(window, cx);
+                                })),
+                        ),
                 );
             }
             return page.into_any_element();
@@ -1398,21 +1458,28 @@ impl WorkbookApp {
             .child(self.study_top_bar(view, cx))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
+                    .id("study-scroll")
+                    .flex_1()
                     .w_full()
-                    .max_w(px(760.0))
-                    .mx_auto()
-                    .px(px(32.0))
-                    .py(px(40.0))
-                    .gap_6()
-                    .child(match view.phase {
-                        Phase::Intro => self.render_intro(view, cx),
-                        Phase::Question => self.render_question(view, cx),
-                        Phase::Feedback => self.render_feedback(view, cx),
-                        Phase::WorkbookResult => self.render_workbook_result(view, cx),
-                        Phase::OverallResult => self.render_overall_result(view, cx),
-                    }),
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .max_w(px(760.0))
+                            .mx_auto()
+                            .px(px(32.0))
+                            .py(px(40.0))
+                            .gap_6()
+                            .child(match view.phase {
+                                Phase::Intro => self.render_intro(view, cx),
+                                Phase::Question => self.render_question(view, cx),
+                                Phase::Feedback => self.render_feedback(view, cx),
+                                Phase::WorkbookResult => self.render_workbook_result(view, cx),
+                                Phase::OverallResult => self.render_overall_result(view, cx),
+                            }),
+                    ),
             );
         if let Some(notice) = self.notice.clone() {
             page = page.child(div().px(px(32.0)).child(self.render_notice(notice, cx)));
@@ -1838,8 +1905,583 @@ impl WorkbookApp {
                 }
                 list.into_any_element()
             }
+            QuestionType::Numeric => {
+                let theme = cx.theme().clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child("数値と単位（分数も使えます）"),
+                    )
+                    .child(
+                        Input::new(&self.numeric_input)
+                            .id("numeric-answer")
+                            .w_full()
+                            .h(px(48.0)),
+                    )
+                    .into_any_element()
+            }
+            QuestionType::Ordering => self.render_ordering(question, cx),
+            QuestionType::Matching => self.render_matching(question, cx),
+            QuestionType::Hotspot => self.render_hotspot(question, cx),
+            QuestionType::Labeling => self.render_labeling(question, cx),
             QuestionType::Flashcard => div().into_any_element(),
         }
+    }
+
+    fn render_ordering(&self, question: &Question, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let labels: BTreeMap<&str, String> = question
+            .options
+            .as_ref()
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|option| (option.id.as_str(), option.content.plain_text()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut list = div().flex().flex_col().gap_2();
+        for (index, id) in self.ordering.iter().enumerate() {
+            let id = id.clone();
+            let label = labels
+                .get(id.as_str())
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            let target_index = index;
+            let up_id = id.clone();
+            let down_id = id.clone();
+            let drag_id = id.clone();
+            let drag_label = label.clone();
+            let row = div()
+                .id(SharedString::from(format!("order-row-{id}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .p_2()
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .w(px(24.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{}", index + 1)),
+                )
+                .child(div().flex_1().text_size(px(15.0)).child(label))
+                .child(
+                    Button::new(format!("order-up-{id}"))
+                        .label("↑")
+                        .ghost()
+                        .disabled(index == 0)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.move_ordering(&up_id, target_index.saturating_sub(1));
+                            this.persist_draft(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new(format!("order-down-{id}"))
+                        .label("↓")
+                        .ghost()
+                        .disabled(index + 1 >= self.ordering.len())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.move_ordering(&down_id, target_index + 1);
+                            this.persist_draft(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child("ドラッグ"),
+                )
+                .on_drag(
+                    OrderDrag {
+                        id: drag_id,
+                        label: drag_label,
+                    },
+                    |drag, _, _, cx| {
+                        let label = drag.label.clone();
+                        cx.new(|_| DragGhost { label })
+                    },
+                )
+                .on_drop::<OrderDrag>(cx.listener(move |this, drag: &OrderDrag, window, cx| {
+                    this.move_ordering(&drag.id, target_index);
+                    this.persist_draft(window, cx);
+                    cx.notify();
+                }));
+            list = list.child(row);
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("ドラッグ、または ↑↓ ボタンで並べ替えます"),
+            )
+            .child(list)
+            .into_any_element()
+    }
+
+    fn move_ordering(&mut self, id: &str, target: usize) {
+        crate::ui_logic::move_order(&mut self.ordering, id, target);
+    }
+
+    fn render_matching(&self, question: &Question, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(matching) = question.matching.as_ref() else {
+            return div().into_any_element();
+        };
+        let mut left_list = div().flex().flex_col().gap_2();
+        for item in &matching.left {
+            let id = item.id.clone();
+            let selected = self.matching_left.as_deref() == Some(item.id.as_str());
+            let assigned = self.matching.get(&item.id).and_then(|right| {
+                matching
+                    .right
+                    .iter()
+                    .find(|candidate| &candidate.id == right)
+                    .map(|candidate| candidate.content.plain_text())
+            });
+            left_list = left_list.child(
+                Button::new(format!("match-left-{}", item.id))
+                    .label(match assigned {
+                        Some(right) => format!("{} → {right}", item.content.plain_text()),
+                        None => item.content.plain_text(),
+                    })
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.secondary())
+                    .w_full()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.matching_left = if this.matching_left.as_deref() == Some(id.as_str()) {
+                            None
+                        } else {
+                            Some(id.clone())
+                        };
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut right_list = div().flex().flex_col().gap_2();
+        for item in &matching.right {
+            let right_id = item.id.clone();
+            let assigned_left = self
+                .matching
+                .iter()
+                .find(|(_, right)| **right == item.id)
+                .and_then(|(left, _)| {
+                    matching
+                        .left
+                        .iter()
+                        .find(|candidate| &candidate.id == left)
+                        .map(|candidate| candidate.content.plain_text())
+                });
+            let assigned = assigned_left.is_some();
+            right_list = right_list.child(
+                Button::new(format!("match-right-{}", item.id))
+                    .label(match assigned_left.as_ref() {
+                        Some(left) => format!("{left} → {}", item.content.plain_text()),
+                        None => item.content.plain_text(),
+                    })
+                    .when(assigned, |button| button.primary())
+                    .when(!assigned, |button| button.secondary())
+                    .w_full()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.assign_matching(&right_id);
+                        this.persist_draft(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("左の項目を選んでから、対応する右の項目を選びます"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(div().flex().flex_col().flex_1().gap_2().child(left_list))
+                    .child(div().flex().flex_col().flex_1().gap_2().child(right_list)),
+            )
+            .child(
+                Button::new("matching-clear")
+                    .label("対応をクリア")
+                    .ghost()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.matching.clear();
+                        this.matching_left = None;
+                        this.persist_draft(window, cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn assign_matching(&mut self, right: &str) {
+        let Some(left) = self.matching_left.take() else {
+            return;
+        };
+        crate::ui_logic::assign_pair(&mut self.matching, &left, right);
+    }
+
+    fn render_hotspot(&self, question: &Question, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(hotspot) = question.hotspot.as_ref() else {
+            return div().into_any_element();
+        };
+        let asset = self
+            .study
+            .as_ref()
+            .and_then(|view| view.assets.iter().find(|asset| asset.id == hotspot.asset))
+            .cloned();
+        let mut column = div().flex().flex_col().gap_3();
+        if let Some(asset) = asset {
+            let mut image = self.render_question_image(&asset, cx);
+            // Transparent 20x20 hit grid. It records a normalized point near
+            // the click without depending on window/scroll pixel coordinates.
+            const GRID: usize = 20;
+            for row in 0..GRID {
+                for col in 0..GRID {
+                    let x = (col as f64 + 0.5) / GRID as f64;
+                    let y = (row as f64 + 0.5) / GRID as f64;
+                    image = image.child(
+                        div()
+                            .id(SharedString::from(format!("hotspot-cell-{row}-{col}")))
+                            .absolute()
+                            .left(relative(col as f32 / GRID as f32))
+                            .top(relative(row as f32 / GRID as f32))
+                            .w(relative(1.0 / GRID as f32))
+                            .h(relative(1.0 / GRID as f32))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.hotspot_point = Some((x, y));
+                                this.persist_draft(window, cx);
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            column = column.child(match self.hotspot_point {
+                Some((x, y)) => image.child(
+                    div()
+                        .absolute()
+                        .left(relative(x as f32))
+                        .top(relative(y as f32))
+                        .ml(px(-7.0))
+                        .mt(px(-7.0))
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .bg(theme.accent),
+                ),
+                None => image,
+            });
+            column = column.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(asset.alt.clone()),
+            );
+        } else {
+            column = column.child(
+                div()
+                    .p_3()
+                    .border_1()
+                    .border_color(theme.danger)
+                    .text_size(px(13.0))
+                    .child("画像を読み込めません。「領域名で選ぶ」から選択してください。"),
+            );
+        }
+        if let Some((x, y)) = self.hotspot_point {
+            column = column.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(format!("選択位置: {:.0}% / {:.0}%", x * 100.0, y * 100.0)),
+            );
+        }
+        let mut regions = div().flex().flex_wrap().gap_2();
+        for region in &hotspot.regions {
+            let point = crate::ui_logic::region_center(&region.shape);
+            let selected = self
+                .hotspot_point
+                .is_some_and(|(x, y)| region.shape.contains(x, y));
+            regions = regions.child(
+                Button::new(format!("hotspot-{}", region.id))
+                    .label(region.alt.clone())
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.secondary())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.hotspot_point = Some(point);
+                        this.hotspot_list_open = false;
+                        this.persist_draft(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        column = column
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("画像をクリックするか、キーボードで領域名から選べます"),
+            )
+            .child(
+                Button::new("hotspot-region-toggle")
+                    .label(if self.hotspot_list_open {
+                        "領域名を閉じる"
+                    } else {
+                        "領域名で選ぶ"
+                    })
+                    .secondary()
+                    .w(px(200.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.hotspot_list_open = !this.hotspot_list_open;
+                        cx.notify();
+                    })),
+            );
+        if self.hotspot_list_open {
+            column = column.child(regions);
+        }
+        column.into_any_element()
+    }
+
+    fn render_labeling(&self, question: &Question, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(labeling) = question.labeling.as_ref() else {
+            return div().into_any_element();
+        };
+        let asset = self
+            .study
+            .as_ref()
+            .and_then(|view| view.assets.iter().find(|asset| asset.id == labeling.asset))
+            .cloned();
+        let label_text: BTreeMap<&str, String> = labeling
+            .labels
+            .iter()
+            .map(|label| (label.id.as_str(), label.content.plain_text()))
+            .collect();
+        let mut column = div().flex().flex_col().gap_3();
+        if let Some(asset) = asset {
+            let mut canvas_box = self.render_question_image(&asset, cx);
+            for target in &labeling.targets {
+                let assigned = self
+                    .labeling
+                    .get(&target.id)
+                    .and_then(|label| label_text.get(label.as_str()).cloned());
+                let target_id = target.id.clone();
+                let target_id_drop = target.id.clone();
+                let target_button = div()
+                    .id(SharedString::from(format!("label-target-{}", target.id)))
+                    .absolute()
+                    .left(relative(target.x as f32))
+                    .top(relative(target.y as f32))
+                    .ml(px(-30.0))
+                    .mt(px(-18.0))
+                    .min_w(px(60.0))
+                    .h(px(36.0))
+                    .px(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if assigned.is_some() {
+                        theme.accent.opacity(0.35)
+                    } else {
+                        theme.accent.opacity(0.16)
+                    })
+                    .border_1()
+                    .border_color(theme.accent)
+                    .text_size(px(12.0))
+                    .child(match assigned.clone() {
+                        Some(text) => text,
+                        None => "＋".to_string(),
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(label) = this.labeling_label.take() {
+                            this.assign_label(&target_id, &label);
+                            this.persist_draft(window, cx);
+                            cx.notify();
+                        }
+                    }))
+                    .on_drop::<LabelDrag>(cx.listener(
+                        move |this, drag: &LabelDrag, window, cx| {
+                            this.assign_label(&target_id_drop, &drag.id);
+                            this.labeling_label = None;
+                            this.persist_draft(window, cx);
+                            cx.notify();
+                        },
+                    ));
+                canvas_box = canvas_box.child(target_button);
+            }
+            column = column.child(canvas_box);
+            column = column.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(asset.alt.clone()),
+            );
+        } else {
+            column = column.child(
+                div()
+                    .p_3()
+                    .border_1()
+                    .border_color(theme.danger)
+                    .text_size(px(13.0))
+                    .child("画像を読み込めません。ラベルを選んでから配置先を選んでください。"),
+            );
+        }
+        let mut chips = div().flex().flex_wrap().gap_2();
+        for label in &labeling.labels {
+            let click_id = label.id.clone();
+            let drag_id = label.id.clone();
+            let text = label.content.plain_text();
+            let selected = self.labeling_label.as_deref() == Some(label.id.as_str());
+            let used = self.labeling.values().any(|value| value == &label.id);
+            chips = chips.child(
+                div()
+                    .id(SharedString::from(format!("label-drag-{}", label.id)))
+                    .on_drag(
+                        LabelDrag {
+                            id: drag_id,
+                            label: text.clone(),
+                        },
+                        |drag, _, _, cx| {
+                            let label = drag.label.clone();
+                            cx.new(|_| DragGhost { label })
+                        },
+                    )
+                    .child(
+                        Button::new(format!("label-{}", label.id))
+                            .label(if used {
+                                format!("✓ {text}")
+                            } else {
+                                text.clone()
+                            })
+                            .when(selected, |button| button.primary())
+                            .when(!selected, |button| button.secondary())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.labeling_label =
+                                    if this.labeling_label.as_deref() == Some(click_id.as_str()) {
+                                        None
+                                    } else {
+                                        Some(click_id.clone())
+                                    };
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        let targets: Vec<(String, String)> = labeling
+            .targets
+            .iter()
+            .map(|target| {
+                let assigned = self
+                    .labeling
+                    .get(&target.id)
+                    .and_then(|label| label_text.get(label.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| "未配置".to_string());
+                (target.id.clone(), format!("{}: {assigned}", target.alt))
+            })
+            .collect();
+        let mut target_buttons = div().flex().flex_wrap().gap_1();
+        for (target_id, line) in targets {
+            target_buttons = target_buttons.child(
+                Button::new(SharedString::from(format!("label-target-alt-{target_id}")))
+                    .label(line)
+                    .secondary()
+                    .w(relative(0.48))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(label) = this.labeling_label.take() {
+                            this.assign_label(&target_id, &label);
+                            this.persist_draft(window, cx);
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+        column
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("ラベルを選んで配置先をクリックするか、ラベルをドラッグします"),
+            )
+            .child(chips)
+            .child(target_buttons)
+            .into_any_element()
+    }
+
+    fn assign_label(&mut self, target: &str, label: &str) {
+        crate::ui_logic::assign_pair(&mut self.labeling, target, label);
+    }
+
+    fn render_question_image(&self, asset: &AssetView, cx: &Context<Self>) -> gpui_kit::Div {
+        let theme = cx.theme().clone();
+        let (width, height) = crate::ui_logic::fit_image(asset.width, asset.height, 640.0, 380.0);
+        let format = if asset.media_type == "image/jpeg" {
+            ImageFormat::Jpeg
+        } else if asset.media_type == "image/svg+xml" {
+            ImageFormat::Svg
+        } else {
+            ImageFormat::Png
+        };
+        let key = format!(
+            "{}:{}",
+            self.study
+                .as_ref()
+                .and_then(|view| view.workbook_id.as_deref())
+                .unwrap_or(""),
+            asset.id
+        );
+        let image = {
+            let mut cache = self.image_cache.borrow_mut();
+            cache
+                .entry(key)
+                .or_insert_with(|| {
+                    Arc::new(Image::from_bytes(format, asset.bytes.as_ref().clone()))
+                })
+                .clone()
+        };
+        let alt = asset.alt.clone();
+        div()
+            .relative()
+            .w(px(width))
+            .h(px(height))
+            .max_w_full()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                img(ImageSource::Image(image))
+                    .w_full()
+                    .h_full()
+                    .object_fit(ObjectFit::Contain)
+                    .with_fallback(move || {
+                        div()
+                            .flex()
+                            .size_full()
+                            .items_center()
+                            .justify_center()
+                            .p_4()
+                            .text_size(px(13.0))
+                            .child(format!("画像を表示できません: {alt}"))
+                            .into_any_element()
+                    }),
+            )
     }
 
     fn render_feedback(
@@ -1851,12 +2493,11 @@ impl WorkbookApp {
         let Some(feedback) = view.feedback.as_ref() else {
             return div().into_any_element();
         };
-        let (color, label) = if feedback.correct == Some(true) {
-            (theme.success, "正解")
-        } else if feedback.correct == Some(false) {
-            (theme.danger, "不正解")
-        } else {
-            (theme.accent, "自己評価")
+        let (color, label) = match feedback.status {
+            GradeStatus::Correct => (theme.success, "正解"),
+            GradeStatus::Incorrect => (theme.danger, "不正解"),
+            GradeStatus::NearMiss => (theme.accent, "おしい"),
+            GradeStatus::Manual => (theme.accent, "自己評価"),
         };
         let mut page = div().flex().flex_col().gap_5();
         if let Some(question) = view.question.as_ref() {
@@ -1875,51 +2516,105 @@ impl WorkbookApp {
                     }),
             );
         }
-        page = page
+        let status_row = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .p_4()
+            .border_l_3()
+            .border_color(color)
+            .bg(color.opacity(0.08))
+            .child(div().text_size(px(18.0)).child(label))
+            .when(feedback.unknown, |row| {
+                row.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child("「わからない」として回答"),
+                )
+            })
+            .when(feedback.hint, |row| {
+                row.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child("ヒント使用"),
+                )
+            })
+            .when(feedback.assisted && !feedback.hint, |row| {
+                row.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("再回答 {}回", feedback.retry_count)),
+                )
+            });
+        page = page.child(status_row);
+
+        let given = div()
+            .flex()
+            .flex_col()
+            .gap_2()
             .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .child("あなたの回答"),
+            )
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .child(feedback.given_answer.clone()),
+            );
+
+        if feedback.status == GradeStatus::NearMiss {
+            page = page.child(given);
+            for message in &feedback.near_miss_messages {
+                page = page.child(
+                    div()
+                        .p_4()
+                        .border_1()
+                        .border_color(theme.accent)
+                        .text_size(px(15.0))
+                        .child(message.to_string()),
+                );
+            }
+            page = page.child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .p_4()
-                    .border_l_3()
-                    .border_color(color)
-                    .bg(color.opacity(0.08))
-                    .child(div().text_size(px(18.0)).child(label))
-                    .when(feedback.unknown, |row| {
-                        row.child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(theme.muted_foreground)
-                                .child("「わからない」として回答"),
-                        )
-                    })
-                    .when(feedback.hint, |row| {
-                        row.child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(theme.muted_foreground)
-                                .child("ヒント使用"),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
+                    .justify_between()
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(px(12.0))
                             .text_color(theme.muted_foreground)
-                            .child("あなたの回答"),
+                            .child("この回答はまだ確定していません。"),
                     )
                     .child(
-                        div()
-                            .text_size(px(15.0))
-                            .child(feedback.given_answer.clone()),
+                        Button::new("feedback-retry")
+                            .label("もう一度  ⌘↩")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.retry_question(window, cx);
+                            })),
                     ),
-            )
+            );
+            return page.into_any_element();
+        }
+
+        page = page.child(given);
+        if let Some(diagnostic) = feedback.diagnostic.as_ref() {
+            page = page.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "一致: {} / {}",
+                        diagnostic.matched, diagnostic.total
+                    )),
+            );
+        }
+        page = page
             .child(
                 div()
                     .flex()
@@ -1966,12 +2661,12 @@ impl WorkbookApp {
                                         rating.label()
                                     )),
                             )
-                            .when(automatic, |row| {
+                            .when(feedback.assisted, |row| {
                                 row.child(
                                     div()
                                         .text_size(px(11.0))
                                         .text_color(theme.muted_foreground)
-                                        .child("正誤から自動で保存しました"),
+                                        .child("補助あり（自動評価はHard上限）"),
                                 )
                             }),
                     )
@@ -2012,6 +2707,16 @@ impl WorkbookApp {
                         .child(self.rating_button("rating-easy", Rating::Easy, feedback, cx)),
                 );
             }
+            page = page.child(
+                div().flex().justify_end().items_center().child(
+                    Button::new("feedback-next")
+                        .label("次へ  ⌘↩")
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.next_question(window, cx);
+                        })),
+                ),
+            );
         } else {
             page = page.child(
                 div()
@@ -2031,19 +2736,6 @@ impl WorkbookApp {
                     .child(self.rating_button("rating-hard", Rating::Hard, feedback, cx))
                     .child(self.rating_button("rating-good", Rating::Good, feedback, cx))
                     .child(self.rating_button("rating-easy", Rating::Easy, feedback, cx)),
-            );
-        }
-
-        if feedback.committed {
-            page = page.child(
-                div().flex().justify_end().items_center().child(
-                    Button::new("feedback-next")
-                        .label("次へ  ⌘↩")
-                        .primary()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.next_question(window, cx);
-                        })),
-                ),
             );
         }
 
@@ -2250,6 +2942,11 @@ fn type_label(kind: QuestionType) -> &'static str {
         QuestionType::ShortText => "記述",
         QuestionType::Cloze => "穴埋め",
         QuestionType::Flashcard => "フラッシュカード",
+        QuestionType::Numeric => "数値入力",
+        QuestionType::Ordering => "並べ替え",
+        QuestionType::Matching => "対応付け",
+        QuestionType::Hotspot => "領域選択",
+        QuestionType::Labeling => "ラベル付け",
     }
 }
 
