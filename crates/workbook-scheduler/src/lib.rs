@@ -2,10 +2,15 @@
 //! selection. This crate knows nothing about GPUI or SQLite.
 
 pub mod clock;
+pub mod planner;
 pub mod queue;
 pub mod step_policy;
 
 pub use clock::{Clock, FixedClock, SystemClock};
+pub use planner::{
+    ExamPlan, FieldAllocation, PlanCard, PlanCoverage, PlanFeasibility, PlanInput, PlanQuestion,
+    PlanReason, PlanWarning, PlannedQuestion, estimated_seconds, exam_deadline, plan_exam,
+};
 pub use queue::{QueueChoice, QueueInput, QueueKind, QueueQuestion, select_next};
 pub use step_policy::{SchedulerSettings, StepPolicy, next_learning_state};
 
@@ -52,6 +57,27 @@ impl Scheduler {
         let mut settings = self.settings.clone();
         settings.desired_retention = desired_retention;
         Self::new(settings)
+    }
+
+    /// Estimated probability of recalling a saved card at `at`, assuming no
+    /// further reviews. The forgetting curve stays inside `fsrs-rs`; the
+    /// planner only consumes the number.
+    pub fn retrievability_at(
+        &self,
+        card: &StoredCard,
+        now: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> f32 {
+        let anchor = card.last_review_at.unwrap_or(now);
+        let days = ((at - anchor).num_milliseconds() as f64 / 86_400_000.0).max(0.0) as f32;
+        self.fsrs.current_retrievability(
+            MemoryState {
+                stability: card.stability,
+                difficulty: card.difficulty,
+                stability_fast: card.stability_fast,
+            },
+            days,
+        )
     }
 
     /// Applies one confirmed answer. `before` is the saved state before the

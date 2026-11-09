@@ -72,6 +72,7 @@ fn v3_schema_sql() -> String {
   description TEXT,
   target_date TEXT,
   target_score REAL,
+  daily_minutes INTEGER NOT NULL DEFAULT 30,
   scope_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -219,6 +220,7 @@ fn v1_schema_sql() -> String {
   description TEXT,
   target_date TEXT,
   target_score REAL,
+  daily_minutes INTEGER NOT NULL DEFAULT 30,
   scope_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -363,4 +365,34 @@ fn next_due_at_only_returns_future_deadlines() {
         .unwrap();
     let next = service.next_wake_at().unwrap().expect("future due");
     assert!(next > clock.now());
+}
+
+#[test]
+fn version_four_backup_without_daily_minutes_is_validated_and_upgraded() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(workbook_storage::schema::SCHEMA_SQL)
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE exams DROP COLUMN daily_minutes;
+                 PRAGMA application_id=1463962418;
+                 PRAGMA user_version=4;
+                 INSERT INTO meta(key,value) VALUES('app','workbook-2');",
+            )
+            .unwrap();
+    }
+    // A v4 backup is still readable before the forward migration adds the
+    // column, and opening it applies the same default as new exams.
+    Storage::validate_backup(&path).unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    storage.close().unwrap();
 }

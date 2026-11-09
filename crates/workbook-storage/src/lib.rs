@@ -139,6 +139,8 @@ pub struct ExamPracticeStats {
 pub struct QuestionAttemptStat {
     pub attempts: usize,
     pub incorrect: usize,
+    /// Total recorded answer time across all attempts.
+    pub elapsed_ms: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -547,7 +549,7 @@ impl Storage {
     pub fn exams(&self, include_archived: bool) -> Result<Vec<Exam>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id,title,description,target_date,target_score,scope_json,
+            "SELECT id,title,description,target_date,target_score,daily_minutes,scope_json,
                     created_at,updated_at,archived_at
              FROM exams
              WHERE ?1=1 OR archived_at IS NULL
@@ -566,7 +568,7 @@ impl Storage {
     pub fn exam(&self, id: &str) -> Result<Exam> {
         self.connection()?
             .query_row(
-                "SELECT id,title,description,target_date,target_score,scope_json,
+                "SELECT id,title,description,target_date,target_score,daily_minutes,scope_json,
                         created_at,updated_at,archived_at
                  FROM exams WHERE id=?1",
                 [id],
@@ -579,15 +581,16 @@ impl Storage {
     pub fn insert_exam(&mut self, exam: &Exam) -> Result<()> {
         let scope_json = serde_json::to_string(&exam.scope)?;
         self.connection()?.execute(
-            "INSERT INTO exams(id,title,description,target_date,target_score,scope_json,
-                    created_at,updated_at,archived_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO exams(id,title,description,target_date,target_score,daily_minutes,
+                    scope_json,created_at,updated_at,archived_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 exam.id,
                 exam.title,
                 exam.description,
                 exam.target_date.map(|date| date.to_string()),
                 exam.target_score,
+                exam.daily_minutes,
                 scope_json,
                 format_ts(exam.created_at),
                 format_ts(exam.updated_at),
@@ -601,12 +604,13 @@ impl Storage {
         let scope_json = serde_json::to_string(&exam.scope)?;
         let changed = self.connection()?.execute(
             "UPDATE exams SET title=?1,description=?2,target_date=?3,target_score=?4,
-                    scope_json=?5,updated_at=?6,archived_at=?7 WHERE id=?8",
+                    daily_minutes=?5,scope_json=?6,updated_at=?7,archived_at=?8 WHERE id=?9",
             params![
                 exam.title,
                 exam.description,
                 exam.target_date.map(|date| date.to_string()),
                 exam.target_score,
+                exam.daily_minutes,
                 scope_json,
                 format_ts(exam.updated_at),
                 exam.archived_at.map(format_ts),
@@ -674,7 +678,8 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT workbook_id,question_id,COUNT(*),
-                    COALESCE(SUM(CASE WHEN correct=0 THEN 1 ELSE 0 END),0)
+                    COALESCE(SUM(CASE WHEN correct=0 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(elapsed_ms),0)
              FROM attempts GROUP BY workbook_id,question_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -684,6 +689,7 @@ impl Storage {
                 QuestionAttemptStat {
                     attempts: row.get::<_, i64>(2)? as usize,
                     incorrect: row.get::<_, i64>(3)? as usize,
+                    elapsed_ms: row.get::<_, i64>(4)?,
                 },
             ))
         })?;
@@ -710,6 +716,21 @@ impl Storage {
             graded: graded as usize,
             correct: correct as usize,
         })
+    }
+
+    /// Total time spent answering this exam's non-mock sessions since `since`.
+    /// The planner subtracts it from today's budget so finishing a session and
+    /// starting another does not silently grant a second full daily allowance.
+    pub fn exam_studied_ms_since(&self, exam_id: &str, since: DateTime<Utc>) -> Result<i64> {
+        let connection = self.connection()?;
+        let total: i64 = connection.query_row(
+            "SELECT COALESCE(SUM(a.elapsed_ms),0)
+             FROM attempts a JOIN sessions s ON s.id=a.session_id
+             WHERE s.exam_id=?1 AND s.mode<>'mock' AND a.answered_at>=?2",
+            params![exam_id, format_ts(since)],
+            |row| row.get(0),
+        )?;
+        Ok(total)
     }
 
     pub fn mock_answers_for_session(&self, session_id: &str) -> Result<Vec<MockAnswerRow>> {
@@ -1105,20 +1126,25 @@ impl Storage {
     ) -> Result<usize> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT DISTINCT a.question_id, a.answered_at
+            "SELECT DISTINCT a.workbook_id, a.question_id, a.answered_at
              FROM attempts a JOIN sessions s ON s.id=a.session_id
-             WHERE s.mode='new' AND a.answered_at>=?1",
+             WHERE s.mode IN ('new','plan') AND a.answered_at>=?1
+               AND a.before_state_json IS NULL",
         )?;
         let since = format_ts(now - chrono::Duration::hours(48));
         let rows = statement.query_map([since], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         let today = calendar.learning_day(now);
         let mut questions = BTreeSet::new();
         for row in rows {
-            let (question_id, answered_at) = row?;
+            let (workbook_id, question_id, answered_at) = row?;
             if calendar.learning_day(parse_ts(&answered_at)?) == today {
-                questions.insert(question_id);
+                questions.insert((workbook_id, question_id));
             }
         }
         Ok(questions.len())
@@ -1707,10 +1733,16 @@ impl Storage {
             }
         }
         if version >= 4 {
-            let mut statement = connection.prepare(
-                "SELECT id,title,description,target_date,target_score,scope_json,
-                        created_at,updated_at,archived_at FROM exams",
-            )?;
+            let sql = if version >= 5 {
+                "SELECT id,title,description,target_date,target_score,daily_minutes,scope_json,
+                        created_at,updated_at,archived_at FROM exams"
+            } else {
+                // v4 backups predate `daily_minutes`; validate them with the
+                // same default that the forward migration will apply.
+                "SELECT id,title,description,target_date,target_score,30,scope_json,
+                        created_at,updated_at,archived_at FROM exams"
+            };
+            let mut statement = connection.prepare(sql)?;
             let rows = statement.query_map([], map_exam)?;
             for row in rows {
                 let exam = row.map_err(|error| StorageError::Validation(error.to_string()))?;
@@ -2384,7 +2416,7 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
 
 fn map_exam(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exam> {
     let target_date: Option<String> = row.get(3)?;
-    let scope_json: String = row.get(5)?;
+    let scope_json: String = row.get(6)?;
     Ok(Exam {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -2399,13 +2431,14 @@ fn map_exam(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exam> {
                 ))
             })?,
         target_score: row.get(4)?,
+        daily_minutes: row.get::<_, i64>(5)?.clamp(0, 1_440) as u32,
         scope: serde_json::from_str::<ExamScope>(&scope_json)
             .map_err(StorageError::from)
             .map_err(to_sql_error)?,
-        created_at: parse_ts(&row.get::<_, String>(6)?).map_err(to_sql_error)?,
-        updated_at: parse_ts(&row.get::<_, String>(7)?).map_err(to_sql_error)?,
+        created_at: parse_ts(&row.get::<_, String>(7)?).map_err(to_sql_error)?,
+        updated_at: parse_ts(&row.get::<_, String>(8)?).map_err(to_sql_error)?,
         archived_at: row
-            .get::<_, Option<String>>(8)?
+            .get::<_, Option<String>>(9)?
             .as_deref()
             .map(parse_ts)
             .transpose()
@@ -2592,6 +2625,11 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
                duration_ms INTEGER NOT NULL
              );
              CREATE INDEX mock_results_exam ON mock_results(exam_id, submitted_at DESC);",
+        )?;
+    }
+    if from < 5 {
+        transaction.execute_batch(
+            "ALTER TABLE exams ADD COLUMN daily_minutes INTEGER NOT NULL DEFAULT 30;",
         )?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;

@@ -7,6 +7,9 @@ pub enum Mode {
     New,
     Review,
     Practice,
+    /// Deadline-aware exam study: new questions are introduced and every
+    /// answer advances FSRS exactly like New/Review.
+    Plan,
     /// Fixed-selection exam simulation. Never updates FSRS state.
     Mock,
 }
@@ -17,6 +20,7 @@ impl Mode {
             Self::New => "new",
             Self::Review => "review",
             Self::Practice => "practice",
+            Self::Plan => "plan",
             Self::Mock => "mock",
         }
     }
@@ -26,13 +30,17 @@ impl Mode {
             "new" => Some(Self::New),
             "review" => Some(Self::Review),
             "practice" => Some(Self::Practice),
+            "plan" => Some(Self::Plan),
             "mock" => Some(Self::Mock),
             _ => None,
         }
     }
 
     pub fn is_exam_mode(self) -> bool {
-        matches!(self, Self::Review | Self::Practice | Self::Mock)
+        matches!(
+            self,
+            Self::Review | Self::Practice | Self::Plan | Self::Mock
+        )
     }
 }
 

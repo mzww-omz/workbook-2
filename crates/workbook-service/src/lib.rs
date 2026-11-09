@@ -13,7 +13,8 @@ use workbook_domain::{
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{
-    Clock, QueueChoice, QueueInput, QueueKind, Scheduler, SchedulerSettings, select_next,
+    Clock, ExamPlan, PlanCard, PlanInput, PlanQuestion, QueueChoice, QueueInput, QueueKind,
+    Scheduler, SchedulerSettings, estimated_seconds, exam_deadline, plan_exam, select_next,
 };
 use workbook_storage::{
     AttemptRow, CommitWrite, CorrectionWrite, ExamPracticeStats, MockAnswerRow, MockResultRow,
@@ -255,8 +256,17 @@ pub struct ExamSummary {
     pub studied: usize,
     pub unstudied: usize,
     pub due: usize,
+    /// Questions with a lapse, difficulty >= 7, or at least one incorrect
+    /// answer. A transparent heuristic shared with Practice.
+    pub weak: usize,
+    /// Calendar days until the target date. Negative values are clamped to 0
+    /// in `plan`; `expired` carries the actual state.
+    pub days_remaining: Option<i64>,
+    pub expired: bool,
     /// `studied / total`, or `None` when the scope is empty.
     pub coverage: Option<f64>,
+    /// Today's deadline-aware selection. Recomputed on every read; never cached.
+    pub plan: ExamPlan,
     pub practice: ExamPracticeStats,
     pub mock_history: Vec<MockHistoryEntry>,
 }
@@ -554,9 +564,10 @@ impl WorkbookService {
         let records = storage.exams(include_archived)?;
         let catalog = exam_catalog(&storage)?;
         let now = self.clock.now();
+        let context = exam_plan_context(&storage, now)?;
         records
             .into_iter()
-            .map(|exam| exam_summary_from(&storage, exam, &catalog, now, 8))
+            .map(|exam| exam_summary_from(&storage, exam, &catalog, &context, now, 8))
             .collect()
     }
 
@@ -568,7 +579,9 @@ impl WorkbookService {
         let storage = self.storage()?;
         let exam = storage.exam(id)?;
         let catalog = exam_catalog(&storage)?;
-        exam_summary_from(&storage, exam, &catalog, self.clock.now(), 50)
+        let now = self.clock.now();
+        let context = exam_plan_context(&storage, now)?;
+        exam_summary_from(&storage, exam, &catalog, &context, now, 50)
     }
 
     pub fn exam_catalog(&self) -> Result<Vec<ExamCatalogQuestion>> {
@@ -643,6 +656,35 @@ impl WorkbookService {
             ));
         }
         self.create_exam_bundle(&mut storage, Mode::Review, exam_id, &candidates, None, now)
+    }
+
+    pub fn start_exam_plan(&self, exam_id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        ensure_no_active_session(&storage)?;
+        let exam = storage.exam(exam_id)?;
+        let catalog = exam_catalog(&storage)?;
+        let now = self.clock.now();
+        let context = exam_plan_context(&storage, now)?;
+        let plan = build_exam_plan(&storage, &exam, &catalog, &context, now)?;
+        if plan.selected.is_empty() {
+            let message = plan
+                .warnings
+                .first()
+                .map(|warning| warning.message())
+                .unwrap_or_else(|| "今日の学習計画が空です".to_string());
+            return Err(ServiceError::Invalid(message));
+        }
+        let candidates: Vec<SessionCandidate> = plan
+            .selected
+            .iter()
+            .map(|item| SessionCandidate {
+                workbook_id: item.workbook_id.clone(),
+                note_id: item.note_id.clone(),
+                question_id: item.question_id.clone(),
+                due_at: None,
+            })
+            .collect();
+        self.create_exam_bundle(&mut storage, Mode::Plan, exam_id, &candidates, None, now)
     }
 
     pub fn start_exam_practice(&self, exam_id: &str, options: &PracticeOptions) -> Result<()> {
@@ -789,9 +831,12 @@ impl WorkbookService {
         bundle.session.current_workbook_id = Some(first_item.workbook_id.clone());
         bundle.session.current_item_id = Some(first_item.id.clone());
         bundle.session.cursor_kind = "initial".to_string();
-        // Exam sessions never show a knowledge-card intro: they are assessment
-        // or review contexts, not first-time note introduction.
-        bundle.session.phase = Phase::Question;
+        // Exam sessions normally skip the knowledge-card intro: they are an
+        // assessment or review context. A Plan session is also allowed to
+        // introduce unstudied notes, so it shows the intro once per note.
+        let intro = mode == Mode::Plan
+            && !storage.note_introduced(&first_item.workbook_id, &first_item.note_id)?;
+        bundle.session.phase = if intro { Phase::Intro } else { Phase::Question };
         bundle.session.question_started_at = Some(now);
         bundle.session.revision = 0;
         storage.create_session(&bundle)?;
@@ -971,6 +1016,11 @@ impl WorkbookService {
                     .ok_or_else(|| ServiceError::Invalid("Workbookを選んでください".to_string()))?;
                 storage.practice_candidates(workbook_id)?
             }
+            Mode::Plan => {
+                return Err(ServiceError::Invalid(
+                    "計画学習は試験画面から開始してください".to_string(),
+                ));
+            }
             Mode::Mock => {
                 return Err(ServiceError::Invalid(
                     "模試は試験画面から開始してください".to_string(),
@@ -993,7 +1043,7 @@ impl WorkbookService {
         session.current_workbook_id = Some(first_item.workbook_id.clone());
         session.current_item_id = Some(first_item.id.clone());
         session.cursor_kind = "initial".to_string();
-        session.phase = if mode == Mode::New
+        session.phase = if matches!(mode, Mode::New | Mode::Plan)
             && !storage.note_introduced(&first_item.workbook_id, &first_note)?
         {
             Phase::Intro
@@ -1380,7 +1430,7 @@ impl WorkbookService {
             assist_json,
             created_at: now,
         };
-        let bury_until = if bundle.session.mode == Mode::Review {
+        let bury_until = if matches!(bundle.session.mode, Mode::Review | Mode::Plan) {
             Some(calendar.next_learning_day_start(pending_at))
         } else {
             None
@@ -1618,7 +1668,7 @@ impl WorkbookService {
                     .find(|item| item.id == choice.item_id)
                     .cloned()
                     .ok_or_else(|| ServiceError::NotFound("セッション項目".to_string()))?;
-                let intro = bundle.session.mode == Mode::New
+                let intro = matches!(bundle.session.mode, Mode::New | Mode::Plan)
                     && choice.kind == QueueKind::Initial
                     && !storage.note_introduced(&item.workbook_id, &item.note_id)?;
                 bundle.session.current_workbook_id = Some(selected_workbook);
@@ -1723,7 +1773,7 @@ impl WorkbookService {
                 .find(|item| item.id == choice.item_id)
                 .cloned()
                 .ok_or_else(|| ServiceError::NotFound("セッション項目".to_string()))?;
-            let intro = bundle.session.mode == Mode::New
+            let intro = matches!(bundle.session.mode, Mode::New | Mode::Plan)
                 && choice.kind == QueueKind::Initial
                 && !storage.note_introduced(&item.workbook_id, &item.note_id)?;
             bundle.session.current_workbook_id = Some(workbook_id);
@@ -2188,6 +2238,7 @@ fn exam_catalog(storage: &Storage) -> Result<Vec<ExamCatalogQuestion>> {
                     note_id: note.id.clone(),
                     question_id: question.id.clone(),
                     question_prompt: question.prompt_text(),
+                    question_kind: question.kind.as_str().to_string(),
                     workbook_tags: workbook.tags.clone(),
                 });
             }
@@ -2202,32 +2253,115 @@ fn exam_catalog(storage: &Storage) -> Result<Vec<ExamCatalogQuestion>> {
     Ok(catalog)
 }
 
-fn exam_summary_from(
-    storage: &Storage,
-    exam: Exam,
-    catalog: &[ExamCatalogQuestion],
-    now: DateTime<Utc>,
-    mock_limit: usize,
-) -> Result<ExamSummary> {
-    let resolved = resolve_scope(&exam.scope, catalog);
-    let total = resolved.len();
-    let states: std::collections::BTreeMap<(String, String), workbook_domain::StoredCard> = storage
+#[derive(Clone, Debug)]
+struct ExamPlanContext {
+    states: BTreeMap<(String, String), workbook_domain::StoredCard>,
+    stats: BTreeMap<(String, String), workbook_storage::QuestionAttemptStat>,
+    calendar: StudyCalendar,
+    scheduler: Scheduler,
+    new_limit_remaining: usize,
+}
+
+fn exam_plan_context(storage: &Storage, now: DateTime<Utc>) -> Result<ExamPlanContext> {
+    let settings = storage.settings()?;
+    let calendar =
+        StudyCalendar::new(&settings.effective_timezone()).map_err(ServiceError::Invalid)?;
+    let scheduler = Scheduler::new(SchedulerSettings {
+        desired_retention: settings.retention,
+        ..SchedulerSettings::default()
+    })?;
+    let introduced = storage.new_questions_introduced_today(&calendar, now)?;
+    let states = storage
         .review_states()?
         .into_iter()
         .map(|(workbook_id, question_id, card)| ((workbook_id, question_id), card))
         .collect();
-    let mut studied = 0;
-    let mut due = 0;
-    for question in &resolved {
-        if let Some(card) =
-            states.get(&(question.workbook_id.clone(), question.question_id.clone()))
-        {
-            studied += 1;
-            if card.due_at <= now {
-                due += 1;
+    let stats = storage
+        .question_attempt_stats()?
+        .into_iter()
+        .map(|(workbook_id, question_id, stat)| ((workbook_id, question_id), stat))
+        .collect();
+    Ok(ExamPlanContext {
+        states,
+        stats,
+        calendar,
+        scheduler,
+        new_limit_remaining: (settings.new_limit as usize).saturating_sub(introduced),
+    })
+}
+
+fn build_exam_plan(
+    storage: &Storage,
+    exam: &Exam,
+    catalog: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    now: DateTime<Utc>,
+) -> Result<ExamPlan> {
+    let deadline = exam
+        .target_date
+        .map(|date| exam_deadline(&context.calendar, date));
+    let today_start = context
+        .calendar
+        .day_start(context.calendar.learning_day(now));
+    let studied_seconds_today =
+        u32::try_from(storage.exam_studied_ms_since(&exam.id, today_start)?.max(0) / 1_000)
+            .unwrap_or(u32::MAX);
+    let questions: Vec<PlanQuestion> = resolve_scope(&exam.scope, catalog)
+        .into_iter()
+        .map(|question| {
+            let key = (question.workbook_id.clone(), question.question_id.clone());
+            let card = context.states.get(&key);
+            let stat = context.stats.get(&key);
+            let attempts = stat.map(|stat| stat.attempts as u32).unwrap_or(0);
+            let incorrect = stat.map(|stat| stat.incorrect as u32).unwrap_or(0);
+            let elapsed_ms = stat.map(|stat| stat.elapsed_ms).unwrap_or(0);
+            let estimated = estimated_seconds(&question.question_kind, attempts, elapsed_ms);
+            let exam_recall = match (card, deadline) {
+                (Some(card), Some(deadline)) => {
+                    Some(context.scheduler.retrievability_at(card, now, deadline))
+                }
+                _ => None,
+            };
+            PlanQuestion {
+                workbook_id: question.workbook_id,
+                note_id: question.note_id,
+                question_id: question.question_id,
+                kind: question.question_kind,
+                card: card.map(|card| PlanCard {
+                    due_at: card.due_at,
+                    last_review_at: card.last_review_at,
+                    lapses: card.lapses,
+                    difficulty: card.difficulty,
+                    reps: card.reps,
+                }),
+                attempts,
+                incorrect,
+                estimated_seconds: estimated,
+                exam_recall,
             }
-        }
-    }
+        })
+        .collect();
+    Ok(plan_exam(PlanInput {
+        now,
+        calendar: &context.calendar,
+        target_date: exam.target_date,
+        daily_minutes: exam.daily_minutes,
+        new_limit_remaining: context.new_limit_remaining,
+        studied_seconds_today,
+        questions: &questions,
+    }))
+}
+
+fn exam_summary_from(
+    storage: &Storage,
+    exam: Exam,
+    catalog: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    now: DateTime<Utc>,
+    mock_limit: usize,
+) -> Result<ExamSummary> {
+    let plan = build_exam_plan(storage, &exam, catalog, context, now)?;
+    let coverage = plan.coverage.clone();
     let practice = storage.exam_practice_stats(&exam.id)?;
     let mock_history = storage
         .mock_results(&exam.id, mock_limit)?
@@ -2245,15 +2379,19 @@ fn exam_summary_from(
         })
         .collect();
     Ok(ExamSummary {
-        total,
-        studied,
-        unstudied: total.saturating_sub(studied),
-        due,
-        coverage: if total == 0 {
+        total: coverage.total,
+        studied: coverage.studied,
+        unstudied: coverage.unstudied,
+        due: coverage.due,
+        weak: coverage.weak,
+        days_remaining: plan.days_remaining.map(|days| days.max(0)),
+        expired: plan.expired,
+        coverage: if coverage.total == 0 {
             None
         } else {
-            Some(studied as f64 / total as f64)
+            Some(coverage.studied as f64 / coverage.total as f64)
         },
+        plan,
         practice,
         mock_history,
         exam,

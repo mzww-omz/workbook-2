@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use rusqlite::OptionalExtension;
 use tempfile::TempDir;
 use workbook_domain::{
@@ -133,6 +133,69 @@ impl Harness {
             }
         }
     }
+
+    fn complete_active(&self) {
+        for _ in 0..300 {
+            let Some(view) = self.service().active_view().unwrap() else {
+                return;
+            };
+            if matches!(view.phase, Phase::OverallResult | Phase::WorkbookResult) {
+                let _ = self.service().finish(&view.session_id, view.revision);
+                return;
+            }
+            let view = if view.phase == Phase::Intro {
+                self.service()
+                    .begin_question(&view.session_id, view.revision)
+                    .unwrap()
+            } else {
+                view
+            };
+            let view = if view.phase == Phase::Feedback {
+                view
+            } else {
+                self.service()
+                    .evaluate_answer(
+                        &view.session_id,
+                        Some(&Answer::Bool(true)),
+                        false,
+                        None,
+                        false,
+                        view.revision,
+                    )
+                    .unwrap()
+            };
+            let view = if view
+                .feedback
+                .as_ref()
+                .is_some_and(|feedback| !feedback.committed)
+            {
+                let rating = view
+                    .feedback
+                    .as_ref()
+                    .and_then(|feedback| feedback.suggested_rating)
+                    .unwrap();
+                self.service()
+                    .commit_rating(
+                        &view.session_id,
+                        &uuid::Uuid::new_v4().to_string(),
+                        rating,
+                        view.revision,
+                    )
+                    .unwrap()
+            } else {
+                view
+            };
+            let view = self
+                .service()
+                .next(&view.session_id, view.revision)
+                .unwrap();
+            if view.phase == Phase::OverallResult {
+                let _ = self.service().finish(&view.session_id, view.revision);
+                return;
+            }
+        }
+        panic!("session did not finish");
+    }
 }
 
 fn workbook(id: &str, tags: &[&str], questions: &[(&str, bool)]) -> String {
@@ -167,6 +230,7 @@ fn exam_draft(title: &str, workbook_ids: &[&str], tags: &[&str]) -> ExamDraft {
         description: None,
         target_date: None,
         target_score: None,
+        daily_minutes: 30,
         scope: ExamScope {
             groups: vec![ExamScopeGroup {
                 workbook_ids: workbook_ids.iter().map(|id| id.to_string()).collect(),
@@ -219,6 +283,7 @@ fn scope_resolution_and_preview_track_imports_and_reclassification() {
                 description: None,
                 target_date: None,
                 target_score: None,
+                daily_minutes: 30,
                 scope: scope.clone(),
             },
         )
@@ -783,4 +848,206 @@ fn exam_data_survives_reopen_and_question_identity_is_stable() {
             .collect::<Vec<_>>(),
         vec![reference]
     );
+}
+
+fn exam_dated(
+    title: &str,
+    workbook_id: &str,
+    target_date: Option<NaiveDate>,
+    daily_minutes: u32,
+) -> ExamDraft {
+    ExamDraft {
+        title: title.to_string(),
+        description: None,
+        target_date,
+        target_score: None,
+        daily_minutes,
+        scope: ExamScope {
+            groups: vec![ExamScopeGroup {
+                workbook_ids: vec![workbook_id.to_string()],
+                tags: vec![],
+            }],
+            ..Default::default()
+        },
+    }
+}
+
+fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).unwrap()
+}
+
+#[test]
+fn exam_plan_introduces_new_questions_and_shares_fsrs_with_normal_study() {
+    let h = Harness::new();
+    let wb = h.import(&workbook("A", &[], &[("q1", true), ("q2", true)]));
+    let exam_id = h
+        .service()
+        .create_exam(exam_dated("Plan", &wb, Some(date(2026, 1, 3)), 10))
+        .unwrap();
+    assert_eq!(
+        h.service()
+            .exam_summary(&exam_id)
+            .unwrap()
+            .plan
+            .coverage
+            .selected,
+        2
+    );
+    h.service().start_exam_plan(&exam_id).unwrap();
+    let view = h.service().active_view().unwrap().unwrap();
+    assert_eq!(view.mode, Mode::Plan);
+    assert_eq!(view.phase, Phase::Intro);
+    h.complete_active();
+    assert_eq!(h.state_count(), 2);
+
+    // The questions are no longer new for ordinary study: the same history is
+    // shared, not copied into an exam-only store.
+    assert!(h.service().start_session(Mode::New, Some(&wb)).is_err());
+    h.clock.advance(Duration::days(7));
+    h.service().start_session(Mode::Review, Some(&wb)).unwrap();
+    assert!(h.service().active_view().unwrap().is_some());
+}
+
+#[test]
+fn exam_plan_respects_zero_minutes_and_recomputes_after_a_settings_change() {
+    let h = Harness::new();
+    let wb = h.import(&workbook(
+        "B",
+        &[],
+        &[("q1", true), ("q2", true), ("q3", true)],
+    ));
+    let exam_id = h
+        .service()
+        .create_exam(exam_dated("Rest", &wb, Some(date(2026, 1, 2)), 0))
+        .unwrap();
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert_eq!(summary.plan.coverage.selected, 0);
+    assert!(
+        summary
+            .plan
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, workbook_scheduler::PlanWarning::NoTime))
+    );
+    assert!(h.service().start_exam_plan(&exam_id).is_err());
+
+    let mut draft = exam_dated("Rest", &wb, Some(date(2026, 1, 2)), 10);
+    draft.daily_minutes = 10;
+    h.service().update_exam(&exam_id, draft).unwrap();
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert!(summary.plan.coverage.selected > 0);
+    h.service().start_exam_plan(&exam_id).unwrap();
+    let view = h.service().active_view().unwrap().unwrap();
+    assert_eq!(view.progress.total, summary.plan.coverage.selected);
+}
+
+#[test]
+fn exam_plan_is_deadline_aware_and_expires_across_the_four_am_boundary() {
+    let h = Harness::new();
+    let mut settings = h.service().settings().unwrap();
+    settings.timezone = "Asia/Tokyo".to_string();
+    h.service().update_settings(settings).unwrap();
+    h.clock
+        .set(Utc.with_ymd_and_hms(2026, 1, 1, 16, 0, 0).unwrap()); // Jan 2 01:00 JST
+    let wb = h.import(&workbook("T", &[], &[("q1", true)]));
+    let exam_id = h
+        .service()
+        .create_exam(exam_dated("Tokyo", &wb, Some(date(2026, 1, 2)), 10))
+        .unwrap();
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert_eq!(summary.days_remaining, Some(1));
+    assert!(!summary.expired);
+
+    h.clock
+        .set(Utc.with_ymd_and_hms(2026, 1, 2, 20, 0, 0).unwrap()); // Jan 3 05:00 JST
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert!(summary.expired);
+    assert_eq!(summary.days_remaining, Some(0));
+
+    // Moving the exam date later recomputes the plan from the same history.
+    let mut draft = exam_dated("Tokyo", &wb, Some(date(2026, 1, 4)), 10);
+    draft.daily_minutes = 10;
+    h.service().update_exam(&exam_id, draft).unwrap();
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert!(!summary.expired);
+    assert_eq!(summary.days_remaining, Some(1));
+    assert!(
+        !summary
+            .plan
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, workbook_scheduler::PlanWarning::Expired))
+    );
+}
+
+#[test]
+fn two_exams_share_one_fsrs_history() {
+    let h = Harness::new();
+    let wb = h.import(&workbook("S", &[], &[("q1", true), ("q2", true)]));
+    let first = h
+        .service()
+        .create_exam(exam_dated("First", &wb, Some(date(2026, 1, 2)), 10))
+        .unwrap();
+    let second = h
+        .service()
+        .create_exam(exam_dated("Second", &wb, Some(date(2026, 1, 3)), 10))
+        .unwrap();
+    h.service().start_exam_plan(&first).unwrap();
+    h.complete_active();
+    let summary = h.service().exam_summary(&second).unwrap();
+    assert_eq!(summary.studied, 2);
+    assert_eq!(summary.plan.coverage.selected_new, 0);
+    assert_eq!(h.state_count(), 2);
+}
+
+#[test]
+fn plan_introductions_count_toward_the_daily_new_limit() {
+    let h = Harness::new();
+    let mut settings = h.service().settings().unwrap();
+    settings.new_limit = 1;
+    h.service().update_settings(settings).unwrap();
+    let wb = h.import(&workbook(
+        "L",
+        &[],
+        &[("q1", true), ("q2", true), ("q3", true)],
+    ));
+    let exam_id = h
+        .service()
+        .create_exam(exam_dated("Limit", &wb, Some(date(2026, 1, 2)), 30))
+        .unwrap();
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert_eq!(summary.plan.coverage.selected_new, 1);
+    h.service().start_exam_plan(&exam_id).unwrap();
+    h.complete_active();
+
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert_eq!(summary.plan.coverage.selected_new, 0);
+    assert_eq!(h.state_count(), 1);
+}
+
+#[test]
+fn infeasible_deadlines_report_the_shortfall_without_promising_coverage() {
+    let h = Harness::new();
+    let questions: Vec<_> = (0..20).map(|index| (format!("q{index}"), true)).collect();
+    let borrowed: Vec<_> = questions
+        .iter()
+        .map(|(id, answer)| (id.as_str(), *answer))
+        .collect();
+    let wb = h.import(&workbook("F", &[], &borrowed));
+    let exam_id = h
+        .service()
+        .create_exam(exam_dated("Short", &wb, Some(date(2026, 1, 1)), 1))
+        .unwrap();
+    let summary = h.service().exam_summary(&exam_id).unwrap();
+    assert_eq!(
+        summary.plan.feasibility,
+        workbook_scheduler::PlanFeasibility::Insufficient
+    );
+    assert!(summary.plan.warnings.iter().any(|warning| matches!(
+        warning,
+        workbook_scheduler::PlanWarning::InsufficientTime { .. }
+    )));
+    assert!(summary.plan.coverage.selected > 0);
+    assert!(summary.plan.planned_seconds <= 60);
+    assert!(summary.plan.coverage.selected < summary.plan.coverage.total);
 }

@@ -125,7 +125,7 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
 
 ## SQLite
 
-`application_id = 1463962418`（`"WBK2"`）、`user_version = 3`。
+`application_id = 1463962418`（`"WBK2"`）、`user_version = 5`。
 
 | Table | 役割 |
 |---|---|
@@ -134,10 +134,13 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
 | `questions` | Question、関連問題の延期 |
 | `assets` | 教材同梱画像（media type、alt、実サイズ、バイト列） |
 | `review_states` | FSRS状態、due、revision |
-| `sessions` | mode/status/cursor/phase/draft/pending/assist/revision |
+| `sessions` | mode/status/cursor/phase/draft/pending/assist/revision、試験ID、模試制限時間 |
 | `session_items` | セッションの初期対象と状態 |
 | `session_workbooks` | 複数WorkbookのResult順序 |
 | `attempts` | 回答ごとの独立UUID、正誤、評価、評価元（automatic/manual）、前後状態、Near Miss履歴、時刻 |
+| `exams` | 試験名、目標日、1日の学習時間、スコープJSON、アーカイブ |
+| `mock_answers` | 模試の回答（FSRSとは分離） |
+| `mock_results` | 模試の提出集計 |
 | `settings` | JSON設定 |
 | `meta` | アプリ識別情報 |
 
@@ -146,9 +149,10 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
 
 スキーマ移行:
 `user_version=1` のDBは起動時に `attempts.rating_source`、`assist_json` 列、`sessions.assist_json`、
-`assets` テーブルを追加し `user_version=3` へ更新する。`user_version=2` のDBも同じ
-v3 移行を行う。変更前に `backups/pre-migration-v{1,2}-*.sqlite` をSQLite backup APIで作成する。
-v1/v2のバックアップも復元時に同じ移行を行う。
+`assets` テーブルを追加する。v4 で `exams`、`mock_answers`、`mock_results` と
+sessions の exam/time-limit 列、v5 で `exams.daily_minutes` を追加する。
+変更前に `backups/pre-migration-v{from}-*.sqlite` をSQLite backup APIで作成する。
+古いバックアップも復元時に同じ前方移行を行う。
 
 ## 再評価タイミング
 
@@ -215,10 +219,15 @@ Exam scope (JSON)
   ▼
 ScopeQuestion [(workbook_id, question_id)]
   │
+  ├─ Plan     → 期限・学習時間・FSRS・苦手から今日の候補を選び、新規は単元単位、既習は混合
   ├─ Review   → 既存 review_candidates を範囲で絞り、既存 Session / Attempt / FSRS を共有
   ├─ Practice → 戦略で絞り、既存 Session / attempts に記録。review_states は書かない
   └─ Mock     → session_items を固定し、mock_answers / mock_results に記録
 ```
+
+`Plan` の選定・時間配分・Interleaving は `workbook-scheduler/src/planner.rs` の純粋関数。
+想起確率は `fsrs-rs` の `current_retrievability` を使い、忘却曲線を再実装しない。
+`Plan` も通常の Attempt とFSRS状態を書き、模試だけが分離される。
 
 スコープ解決は `workbook-domain/src/exam.rs` の純粋関数で、DB にも UI にも依存しない。
 `workbook-service` は教材一覧からカタログを構築して解決し、セッション開始時に

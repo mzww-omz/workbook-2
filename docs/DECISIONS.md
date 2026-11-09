@@ -170,3 +170,20 @@
 - Practice と Mock は `attempts` / `mock_answers` に記録し、`review_states` を変更しない
 - Mock は正解・不正解・未回答・採点なしを分離し、得点の分母は正解 + 不正解とする
 - schema v4 で `exams`、`mock_answers`、`mock_results` と session の exam/time-limit 列を追加する
+
+## 19. Exam Plan は FSRS の上に置く
+
+- 記憶モデルを増やさず、`workbook-scheduler/src/planner.rs` を純粋関数として追加する
+- 入力はスコープ内問題、FSRS要約、Attempt統計、所要時間推定、期限、1日の学習時間、
+  新規上限の残り。出力は今日の候補・理由・Workbook別配分・実現可能性・警告
+- 想起確率は `fsrs-rs` の `current_retrievability` を `Scheduler::retrievability_at` から
+  呼ぶ。忘却曲線を自前実装しない
+- 未学習は単元ブロック、既習は単元/形式が隣接しないよう混合する。単元がなければ
+  優先順にフォールバックする
+- 前倒し復習は `exam_recall` が低い/苦手な既習問題だけを候補にし、通常の
+  `Scheduler::review` で記録する。FSRSの保存状態を直接書き換えない
+- `Mode::Plan` は New/Review と同じFSRS更新経路を使い、`new_limit` の消費も
+  `before_state_json IS NULL` の初回Attemptで数える。Practice/Mock は従来どおり
+  FSRSを更新しない
+- 計画はキャッシュしない。`ExamSummary` とセッション開始のたびに現在のSQLiteから
+  再計算し、日付・範囲・時間・履歴の変更が即座に反映される

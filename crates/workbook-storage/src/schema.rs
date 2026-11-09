@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -47,6 +47,7 @@ CREATE TABLE exams(
   description TEXT,
   target_date TEXT,
   target_score REAL,
+  daily_minutes INTEGER NOT NULL DEFAULT 30,
   scope_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,

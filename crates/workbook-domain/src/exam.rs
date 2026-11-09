@@ -172,6 +172,9 @@ pub struct ExamCatalogQuestion {
     pub note_id: String,
     pub question_id: String,
     pub question_prompt: String,
+    /// Question format used for a first-pass time estimate when no attempt
+    /// history exists.
+    pub question_kind: String,
     pub workbook_tags: Vec<String>,
 }
 
@@ -386,11 +389,18 @@ pub struct Exam {
     pub target_date: Option<NaiveDate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_score: Option<f64>,
+    /// The learner's intended study time per day. `0` is a valid rest day.
+    #[serde(default = "default_daily_minutes")]
+    pub daily_minutes: u32,
     pub scope: ExamScope,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+}
+
+pub fn default_daily_minutes() -> u32 {
+    30
 }
 
 impl Exam {
@@ -425,6 +435,12 @@ impl Exam {
                 "目標スコアは0以上の数値で指定してください",
             ));
         }
+        if self.daily_minutes > 1_440 {
+            return Err(ValidationError::new(
+                "dailyMinutes",
+                "1日の学習時間は0〜1440分で指定してください",
+            ));
+        }
         self.scope.validate_for_save()
     }
 }
@@ -437,6 +453,7 @@ pub struct ExamDraft {
     pub description: Option<String>,
     pub target_date: Option<NaiveDate>,
     pub target_score: Option<f64>,
+    pub daily_minutes: u32,
     pub scope: ExamScope,
 }
 
@@ -449,6 +466,7 @@ impl ExamDraft {
             description: self.description,
             target_date: self.target_date,
             target_score: self.target_score,
+            daily_minutes: self.daily_minutes,
             scope: self.scope,
             created_at: now,
             updated_at: now,
@@ -461,6 +479,7 @@ impl ExamDraft {
         exam.description = self.description;
         exam.target_date = self.target_date;
         exam.target_score = self.target_score;
+        exam.daily_minutes = self.daily_minutes;
         exam.scope = self.scope;
         exam.updated_at = now;
     }
@@ -482,6 +501,7 @@ mod tests {
             note_id: note.to_string(),
             question_id: id.to_string(),
             question_prompt: format!("prompt {id}"),
+            question_kind: "true_false".to_string(),
             workbook_tags: tags.iter().map(|tag| tag.to_string()).collect(),
         }
     }
@@ -680,6 +700,7 @@ mod tests {
             description: None,
             target_date: None,
             target_score: None,
+            daily_minutes: 30,
             scope: ExamScope::default(),
         }
         .into_exam(Utc::now());
@@ -694,12 +715,36 @@ mod tests {
     }
 
     #[test]
+    fn daily_minutes_are_bounded_and_optional_for_old_data() {
+        let mut draft = ExamDraft {
+            title: "Plan".into(),
+            description: None,
+            target_date: None,
+            target_score: None,
+            daily_minutes: 30,
+            scope: ExamScope {
+                include_questions: vec![QuestionRef::new("A", "q1")],
+                ..Default::default()
+            },
+        };
+        assert!(draft.clone().validate().is_ok());
+        draft.daily_minutes = 1_441;
+        assert!(draft.validate().is_err());
+        let exam: Exam = serde_json::from_str(
+            r#"{"id":"e","title":"t","targetDate":null,"targetScore":null,"scope":{"groups":[{"workbookIds":["A"],"tags":[]}],"includeQuestions":[],"excludeQuestions":[],"excludeWorkbooks":[],"excludeTags":[]},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(exam.daily_minutes, default_daily_minutes());
+    }
+
+    #[test]
     fn optional_exam_fields_really_are_optional() {
         let exam = ExamDraft {
             title: "Personal project".into(),
             description: None,
             target_date: None,
             target_score: None,
+            daily_minutes: 30,
             scope: ExamScope {
                 include_questions: vec![QuestionRef::new("A", "q1")],
                 ..Default::default()

@@ -125,6 +125,7 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::New => "新規",
         Mode::Review => "復習",
         Mode::Practice => "練習",
+        Mode::Plan => "計画",
         Mode::Mock => "模試",
     }
 }
@@ -1284,8 +1285,13 @@ impl WorkbookApp {
                                     .text_size(px(12.0))
                                     .text_color(theme.muted_foreground)
                                     .child(format!(
-                                        "範囲 {} · 学習済み {} · 期限 {} · カバレッジ {}",
-                                        summary.total, summary.studied, summary.due, coverage
+                                        "範囲 {} · 学習済み {} · 期限 {} · 苦手 {} · 今日 {}問 · カバレッジ {}",
+                                        summary.total,
+                                        summary.studied,
+                                        summary.due,
+                                        summary.weak,
+                                        summary.plan.coverage.selected,
+                                        coverage
                                     )),
                             )
                             .when_some(target, |column, target| {
@@ -1349,6 +1355,19 @@ impl WorkbookApp {
                 summary.practice.correct as f64 / summary.practice.graded as f64 * 100.0
             )
         };
+        let remaining_label = if summary.expired {
+            "期限切れ".to_string()
+        } else {
+            summary
+                .days_remaining
+                .map(|days| format!("{days}日"))
+                .unwrap_or_else(|| "—".to_string())
+        };
+        let planned_minutes = summary.plan.planned_seconds / 60;
+        let planned_label = format!(
+            "{}問 / 約{}分",
+            summary.plan.coverage.selected, planned_minutes
+        );
         let mut page = div().flex().flex_col().gap_6();
         page = page
             .child(
@@ -1373,9 +1392,18 @@ impl WorkbookApp {
                     .flex_wrap()
                     .gap_2()
                     .child(
+                        Button::new("exam-start-plan")
+                            .label("今日の学習を始める")
+                            .primary()
+                            .disabled(archived)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_exam_plan(window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("exam-start-review")
                             .label("復習を始める")
-                            .primary()
+                            .secondary()
                             .disabled(archived)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.start_exam_review(window, cx);
@@ -1443,7 +1471,10 @@ impl WorkbookApp {
                     .child(self.detail_stat("学習済み", summary.studied.to_string(), cx))
                     .child(self.detail_stat("未学習", summary.unstudied.to_string(), cx))
                     .child(self.detail_stat("期限到来", summary.due.to_string(), cx))
+                    .child(self.detail_stat("苦手", summary.weak.to_string(), cx))
                     .child(self.detail_stat("カバレッジ", coverage, cx))
+                    .child(self.detail_stat("残り", remaining_label, cx))
+                    .child(self.detail_stat("今日の計画", planned_label, cx))
                     .child(self.detail_stat(
                         "練習 正答",
                         format!("{} / {}", summary.practice.correct, summary.practice.graded),
@@ -1476,6 +1507,66 @@ impl WorkbookApp {
                         )),
                 ),
         );
+
+        if !archived {
+            page = page.child(section_heading("今日の計画", cx)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(div().text_size(px(12.0)).child(format!(
+                        "1日{}分のうち、今日は約{}分（{}問）を予定しています。",
+                        summary.plan.daily_minutes,
+                        summary.plan.planned_seconds / 60,
+                        summary.plan.coverage.selected
+                    )))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "未学習 {} / 復習期限 {} / 苦手 {} / 試験前の確認 {}",
+                                summary.plan.coverage.selected_new,
+                                summary.plan.coverage.selected_due,
+                                summary.plan.coverage.selected_weak,
+                                summary.plan.coverage.selected_early
+                            )),
+                    )
+                    .when(!summary.plan.allocation.is_empty(), |section| {
+                        let fields = summary
+                            .plan
+                            .allocation
+                            .iter()
+                            .map(|allocation| {
+                                let title = self
+                                    .snapshot
+                                    .books
+                                    .iter()
+                                    .find(|book| book.local_id == allocation.workbook_id)
+                                    .map(|book| book.title.clone())
+                                    .unwrap_or_else(|| allocation.workbook_id.clone());
+                                format!("{title} {}問", allocation.questions)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                        section.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child(fields),
+                        )
+                    })
+                    .children(summary.plan.warnings.iter().map(|warning| {
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(warning.message())
+                    })),
+            );
+        }
 
         if !archived {
             page = page.child(section_heading("練習", cx)).child(
@@ -1784,6 +1875,19 @@ impl WorkbookApp {
                                     .child(
                                         Input::new(&editor.target_score)
                                             .id("exam-target-score")
+                                            .w_full(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .child(label("1日の学習時間（分）", cx))
+                                    .child(
+                                        Input::new(&editor.daily_minutes)
+                                            .id("exam-daily-minutes")
                                             .w_full(),
                                     ),
                             ),
@@ -4513,11 +4617,20 @@ impl WorkbookApp {
 fn exam_target_line(summary: &workbook_service::ExamSummary) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(date) = summary.exam.target_date {
-        parts.push(format!("目標日 {date}"));
+        let remaining = if summary.expired {
+            "期限切れ".to_string()
+        } else {
+            summary
+                .days_remaining
+                .map(|days| format!("あと{days}日"))
+                .unwrap_or_default()
+        };
+        parts.push(format!("目標日 {date}（{remaining}）"));
     }
     if let Some(score) = summary.exam.target_score {
         parts.push(format!("目標 {score}"));
     }
+    parts.push(format!("1日 {}分", summary.exam.daily_minutes));
     if parts.is_empty() {
         None
     } else {

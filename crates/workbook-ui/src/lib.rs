@@ -122,6 +122,7 @@ pub(crate) struct ExamEditorState {
     pub description: Entity<InputState>,
     pub target_date: Entity<InputState>,
     pub target_score: Entity<InputState>,
+    pub daily_minutes: Entity<InputState>,
     pub groups: Vec<ScopeGroupDraft>,
     pub include: BTreeSet<QuestionKey>,
     pub exclude: BTreeSet<QuestionKey>,
@@ -607,6 +608,11 @@ impl WorkbookApp {
             .and_then(|exam| exam.target_score)
             .map(|score| format!("{score}"))
             .unwrap_or_default();
+        let daily_minutes = existing
+            .as_ref()
+            .map(|exam| exam.daily_minutes)
+            .unwrap_or_else(workbook_domain::exam::default_daily_minutes)
+            .to_string();
         let (groups, include, exclude, exclude_tags, exclude_workbooks) = existing
             .as_ref()
             .map(|exam| {
@@ -664,6 +670,11 @@ impl WorkbookApp {
                 .placeholder("目標スコア（任意）")
                 .default_value(target_score)
         });
+        let daily_minutes_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("1日の学習時間（分）")
+                .default_value(daily_minutes)
+        });
         let question_search = cx.new(|cx| InputState::new(window, cx).placeholder("問題を検索"));
         self.exam_editor = Some(ExamEditorState {
             exam_id,
@@ -671,6 +682,7 @@ impl WorkbookApp {
             description: description_input,
             target_date: target_date_input,
             target_score: target_score_input,
+            daily_minutes: daily_minutes_input,
             groups,
             include,
             exclude,
@@ -742,6 +754,7 @@ impl WorkbookApp {
         let description = editor.description.read(cx).value().to_string();
         let date_text = editor.target_date.read(cx).value().to_string();
         let score_text = editor.target_score.read(cx).value().to_string();
+        let minutes_text = editor.daily_minutes.read(cx).value().to_string();
         let target_date = if date_text.trim().is_empty() {
             None
         } else {
@@ -768,6 +781,19 @@ impl WorkbookApp {
                 }
             }
         };
+        let daily_minutes = if minutes_text.trim().is_empty() {
+            workbook_domain::exam::default_daily_minutes()
+        } else {
+            match minutes_text.trim().parse::<u32>() {
+                Ok(minutes) if minutes <= 1_440 => minutes,
+                _ => {
+                    self.notice_error("1日の学習時間は0〜1440分で入力してください");
+                    window.focus(&self.root_focus, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        };
         let Some(scope) = self.editor_scope() else {
             return;
         };
@@ -777,6 +803,7 @@ impl WorkbookApp {
             description: (!description.is_empty()).then(|| description.to_string()),
             target_date,
             target_score,
+            daily_minutes,
             scope,
         };
         let exam_id = editor.exam_id.clone();
@@ -806,6 +833,19 @@ impl WorkbookApp {
             self.prepare_question(window, cx);
         }
         cx.notify();
+    }
+
+    pub(crate) fn start_exam_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_exam.clone() else {
+            return;
+        };
+        match self.service.start_exam_plan(&id) {
+            Ok(()) => self.enter_started_study(window, cx),
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
     }
 
     pub(crate) fn start_exam_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
