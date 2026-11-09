@@ -55,7 +55,7 @@ pub fn select_next(input: QueueInput<'_>) -> Option<QueueChoice> {
             .then(a.item_id.cmp(&b.item_id))
     });
 
-    if input.mode == Mode::Practice {
+    if matches!(input.mode, Mode::Practice | Mode::Mock) {
         return questions
             .into_iter()
             .filter(|question| question.status == SessionItemStatus::Pending)

@@ -7,6 +7,8 @@ pub enum Mode {
     New,
     Review,
     Practice,
+    /// Fixed-selection exam simulation. Never updates FSRS state.
+    Mock,
 }
 
 impl Mode {
@@ -15,6 +17,7 @@ impl Mode {
             Self::New => "new",
             Self::Review => "review",
             Self::Practice => "practice",
+            Self::Mock => "mock",
         }
     }
 
@@ -23,8 +26,13 @@ impl Mode {
             "new" => Some(Self::New),
             "review" => Some(Self::Review),
             "practice" => Some(Self::Practice),
+            "mock" => Some(Self::Mock),
             _ => None,
         }
+    }
+
+    pub fn is_exam_mode(self) -> bool {
+        matches!(self, Self::Review | Self::Practice | Self::Mock)
     }
 }
 

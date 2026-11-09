@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -41,6 +41,46 @@ CREATE TABLE assets(
   PRIMARY KEY(workbook_id, asset_id)
 );
 
+CREATE TABLE exams(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  target_date TEXT,
+  target_score REAL,
+  scope_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  archived_at TEXT
+);
+CREATE INDEX exams_archive ON exams(archived_at, target_date);
+
+CREATE TABLE mock_answers(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL UNIQUE REFERENCES session_items(id) ON DELETE CASCADE,
+  workbook_id TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  answered_at TEXT NOT NULL,
+  correct INTEGER,
+  answer_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX mock_answers_session ON mock_answers(session_id, answered_at);
+
+CREATE TABLE mock_results(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  exam_id TEXT NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+  submitted_at TEXT NOT NULL,
+  total INTEGER NOT NULL,
+  correct INTEGER NOT NULL,
+  incorrect INTEGER NOT NULL,
+  unanswered INTEGER NOT NULL,
+  ungraded INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL
+);
+CREATE INDEX mock_results_exam ON mock_results(exam_id, submitted_at DESC);
+
 CREATE TABLE review_states(
   workbook_id TEXT NOT NULL,
   question_id TEXT NOT NULL,
@@ -81,7 +121,9 @@ CREATE TABLE sessions(
   question_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   cursor_kind TEXT NOT NULL DEFAULT 'initial',
   assist_json TEXT,
-  revision INTEGER NOT NULL DEFAULT 0
+  revision INTEGER NOT NULL DEFAULT 0,
+  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,
+  time_limit_seconds INTEGER
 );
 CREATE UNIQUE INDEX one_active_session ON sessions(status) WHERE status = 'active';
 
@@ -156,6 +198,23 @@ pub const EXPECTED_TABLES_V1: &[&str] = &[
 pub const EXPECTED_TABLES: &[&str] = &[
     "assets",
     "attempts",
+    "exams",
+    "meta",
+    "mock_answers",
+    "mock_results",
+    "notes",
+    "questions",
+    "review_states",
+    "session_items",
+    "session_workbooks",
+    "sessions",
+    "settings",
+    "workbooks",
+];
+
+pub const EXPECTED_TABLES_V3: &[&str] = &[
+    "assets",
+    "attempts",
     "meta",
     "notes",
     "questions",
@@ -170,6 +229,8 @@ pub const EXPECTED_TABLES: &[&str] = &[
 pub fn expected_tables(version: i64) -> &'static [&'static str] {
     if version < 3 {
         EXPECTED_TABLES_V1
+    } else if version < 4 {
+        EXPECTED_TABLES_V3
     } else {
         EXPECTED_TABLES
     }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -13,9 +13,10 @@ use gpui_kit::{
     Styled, div, px, relative,
 };
 use workbook_domain::{
-    Content, GradeStatus, Mode, Phase, Question, QuestionType, Rating, RatingSource, ThemeSetting,
+    Content, GradeStatus, Mode, Phase, PracticeStrategy, Question, QuestionType, Rating,
+    RatingSource, ThemeSetting,
 };
-use workbook_service::AssetView;
+use workbook_service::{AssetView, MockItemStatus, MockResultView};
 
 use crate::{NoticeKind, Route, WorkbookApp};
 
@@ -124,6 +125,7 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::New => "新規",
         Mode::Review => "復習",
         Mode::Practice => "練習",
+        Mode::Mock => "模試",
     }
 }
 
@@ -175,6 +177,7 @@ impl WorkbookApp {
             .child(self.nav_item("nav-today", "今日", "⌘1", Route::Today, cx))
             .child(self.nav_item("nav-library", "教材", "⌘2", Route::Library, cx))
             .child(self.nav_item("nav-history", "履歴", "⌘3", Route::History, cx))
+            .child(self.nav_item("nav-exams", "試験", "⌘4", Route::Exams, cx))
             .child(self.nav_item("nav-settings", "設定", "⌘,", Route::Settings, cx));
 
         if let Some(active) = self.snapshot.active.as_ref()
@@ -319,6 +322,9 @@ impl WorkbookApp {
             Route::BookDetail => self.render_book_detail(cx),
             Route::History => self.render_history(cx),
             Route::Settings => self.render_settings(cx),
+            Route::Exams => self.render_exams(cx),
+            Route::ExamDetail => self.render_exam_detail(cx),
+            Route::ExamEditor => self.render_exam_editor(cx),
             Route::Study => self.render_study(cx),
         };
         container.child(page).into_any_element()
@@ -1158,6 +1164,1065 @@ impl WorkbookApp {
             .into_any_element()
     }
 
+    fn render_exams(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let active: Vec<_> = self
+            .exams
+            .iter()
+            .filter(|summary| !summary.exam.is_archived())
+            .cloned()
+            .collect();
+        let archived: Vec<_> = self
+            .exams
+            .iter()
+            .filter(|summary| summary.exam.is_archived())
+            .cloned()
+            .collect();
+        let mut page = div().flex().flex_col().gap_6();
+        page = page.child(
+            div()
+                .flex()
+                .items_end()
+                .justify_between()
+                .child(self.page_header(
+                    "試験",
+                    "範囲は保存された条件から毎回解決されます。問題をコピーしません。",
+                    cx,
+                ))
+                .child(
+                    Button::new("exam-new")
+                        .label("新しい試験")
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_exam_editor(None, window, cx);
+                        })),
+                ),
+        );
+        if active.is_empty() && archived.is_empty() {
+            return page
+                .child(self.empty_state(
+                    "試験がありません",
+                    "教材・タグ・個別問題を組み合わせて、学習範囲を作成できます。",
+                    cx,
+                ))
+                .into_any_element();
+        }
+
+        let mut list = div().flex().flex_col();
+        for summary in &active {
+            list = list.child(self.exam_row(summary, cx));
+        }
+        page = page.child(list);
+        if !archived.is_empty() {
+            page = page.child(
+                div()
+                    .mt(px(16.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("アーカイブ"),
+            );
+            let mut archive_list = div().flex().flex_col();
+            for summary in &archived {
+                archive_list = archive_list.child(self.exam_row(summary, cx));
+            }
+            page = page.child(archive_list);
+        }
+        page.into_any_element()
+    }
+
+    fn exam_row(
+        &self,
+        summary: &workbook_service::ExamSummary,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let id_open = summary.exam.id.clone();
+        let id_archive = summary.exam.id.clone();
+        let archived = summary.exam.is_archived();
+        let title = summary.exam.title.clone();
+        let target = exam_target_line(summary);
+        let coverage = summary
+            .coverage
+            .map(|value| format!("{:.0}%", value * 100.0))
+            .unwrap_or_else(|| "—".to_string());
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .py(px(18.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_6()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap_3()
+                                    .child(div().text_size(px(20.0)).child(title))
+                                    .when(archived, |row| {
+                                        row.child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(theme.muted_foreground)
+                                                .child("アーカイブ済み"),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "範囲 {} · 学習済み {} · 期限 {} · カバレッジ {}",
+                                        summary.total, summary.studied, summary.due, coverage
+                                    )),
+                            )
+                            .when_some(target, |column, target| {
+                                column.child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(target),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("exam-open-{}", summary.exam.id))
+                                    .label("開く")
+                                    .secondary()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_exam(id_open.clone(), cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("exam-archive-{}", summary.exam.id))
+                                    .label(if archived {
+                                        "再開"
+                                    } else {
+                                        "アーカイブ"
+                                    })
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_exam_archive(id_archive.clone(), !archived, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_exam_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(summary) = self.selected_exam_summary().cloned() else {
+            return self.empty_state("試験が見つかりません", "一覧へ戻ってください。", cx);
+        };
+        let theme = cx.theme().clone();
+        let exam = &summary.exam;
+        let id_edit = exam.id.clone();
+        let id_archive = exam.id.clone();
+        let id_delete = exam.id.clone();
+        let delete_title = exam.title.clone();
+        let archived = exam.is_archived();
+        let coverage = summary
+            .coverage
+            .map(|value| format!("{:.0}%", value * 100.0))
+            .unwrap_or_else(|| "—".to_string());
+        let practice_rate = if summary.practice.graded == 0 {
+            "—".to_string()
+        } else {
+            format!(
+                "{:.0}%",
+                summary.practice.correct as f64 / summary.practice.graded as f64 * 100.0
+            )
+        };
+        let mut page = div().flex().flex_col().gap_6();
+        page = page
+            .child(
+                Button::new("exam-detail-back")
+                    .label("← 試験一覧")
+                    .text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.go(Route::Exams, window, cx);
+                    })),
+            )
+            .child(self.page_header(
+                exam.title.clone(),
+                exam.description.clone().unwrap_or_else(|| {
+                    exam_target_line(&summary)
+                        .unwrap_or_else(|| "試験の説明はありません".to_string())
+                }),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new("exam-start-review")
+                            .label("復習を始める")
+                            .primary()
+                            .disabled(archived)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_exam_review(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("exam-start-practice")
+                            .label("練習を始める")
+                            .secondary()
+                            .disabled(archived)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_exam_practice(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("exam-start-mock")
+                            .label("模試を始める")
+                            .secondary()
+                            .disabled(archived)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_exam_mock(window, cx);
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("exam-edit")
+                            .label("編集")
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_exam_editor(Some(id_edit.clone()), window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("exam-archive")
+                            .label(if archived {
+                                "再開"
+                            } else {
+                                "アーカイブ"
+                            })
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_exam_archive(id_archive.clone(), !archived, cx);
+                            })),
+                    )
+                    .child(Button::new("exam-delete").label("削除").danger().on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.modal = Some(crate::Modal::DeleteExam {
+                                id: id_delete.clone(),
+                                title: delete_title.clone(),
+                            });
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_6()
+                    .py(px(14.0))
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(self.detail_stat("範囲", summary.total.to_string(), cx))
+                    .child(self.detail_stat("学習済み", summary.studied.to_string(), cx))
+                    .child(self.detail_stat("未学習", summary.unstudied.to_string(), cx))
+                    .child(self.detail_stat("期限到来", summary.due.to_string(), cx))
+                    .child(self.detail_stat("カバレッジ", coverage, cx))
+                    .child(self.detail_stat(
+                        "練習 正答",
+                        format!("{} / {}", summary.practice.correct, summary.practice.graded),
+                        cx,
+                    ))
+                    .child(self.detail_stat("練習 正答率", practice_rate, cx)),
+            );
+
+        page = page.child(section_heading("学習条件", cx)).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_4()
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child(exam_scope_summary(exam, &self.snapshot.books)),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "条件は保存時点の一覧ではなく、開始時に毎回解決されます。現在の範囲は {} 問です。",
+                            summary.total
+                        )),
+                ),
+        );
+
+        if !archived {
+            page = page.child(section_heading("練習", cx)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .children(
+                                [
+                                    PracticeStrategy::All,
+                                    PracticeStrategy::Random,
+                                    PracticeStrategy::Unstudied,
+                                    PracticeStrategy::PreviouslyIncorrect,
+                                    PracticeStrategy::Weak,
+                                ]
+                                .into_iter()
+                                .map(|strategy| {
+                                    let selected = self.practice_strategy == strategy;
+                                    Button::new(format!("practice-strategy-{}", strategy.as_str()))
+                                        .label(strategy.label())
+                                        .when(selected, |button| button.primary())
+                                        .when(!selected, |button| button.secondary())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.practice_strategy = strategy;
+                                            cx.notify();
+                                        }))
+                                        .into_any_element()
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(label("問題数", cx))
+                                    .child(
+                                        Input::new(&self.practice_limit_input)
+                                            .id("practice-limit")
+                                            .w(px(180.0)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("practice-start")
+                                    .label("練習を開始")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start_exam_practice(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child("練習はFSRSの期限・安定度・難易度を変更しません。繰り返し実行できます。"),
+                    ),
+            );
+
+            page = page.child(section_heading("模試", cx)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(label("問題数", cx))
+                                    .child(
+                                        Input::new(&self.mock_limit_input)
+                                            .id("mock-limit")
+                                            .w(px(160.0)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(label("制限時間（分）", cx))
+                                    .child(
+                                        Input::new(&self.mock_minutes_input)
+                                            .id("mock-minutes")
+                                            .w(px(160.0)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("mock-order")
+                                    .label(if self.mock_random {
+                                        "順序: ランダム"
+                                    } else {
+                                        "順序: 固定"
+                                    })
+                                    .secondary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mock_random = !this.mock_random;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("mock-start")
+                                    .label("模試を開始")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start_exam_mock(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child("出題は開始時に固定されます。FSRSは変更しません。未回答と採点不能は正解率の分母から除外します。"),
+                    ),
+            );
+        }
+
+        page = page.child(section_heading("模試履歴", cx));
+        if summary.mock_history.is_empty() {
+            page = page.child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme.muted_foreground)
+                    .child("まだ模試の記録はありません。"),
+            );
+        } else {
+            let mut rows = div().flex().flex_col();
+            for entry in &summary.mock_history {
+                let score = entry
+                    .score_percent
+                    .map(|value| format!("{value:.0}%"))
+                    .unwrap_or_else(|| "採点なし".to_string());
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py(px(12.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_size(px(14.0)).child(format_datetime(
+                                    entry.submitted_at,
+                                    &self.snapshot.timezone,
+                                )))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!(
+                                            "{}問 · 正解 {} · 不正解 {} · 未回答 {} · 採点なし {}",
+                                            entry.total,
+                                            entry.correct,
+                                            entry.incorrect,
+                                            entry.unanswered,
+                                            entry.ungraded
+                                        )),
+                                ),
+                        )
+                        .child(div().text_size(px(18.0)).child(score)),
+                );
+            }
+            page = page.child(rows);
+        }
+
+        page.into_any_element()
+    }
+
+    fn render_exam_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.exam_editor.as_ref() else {
+            return self.empty_state("編集画面がありません", "試験一覧へ戻ってください。", cx);
+        };
+        let theme = cx.theme().clone();
+        let title = if editor.exam_id.is_some() {
+            "試験を編集"
+        } else {
+            "新しい試験"
+        };
+        let is_new = editor.exam_id.is_none();
+        let preview = editor.preview_count;
+        let preview_error = editor.preview_error.clone();
+        let groups = editor.groups.clone();
+        let include = editor.include.clone();
+        let exclude = editor.exclude.clone();
+        let exclude_tags = editor.exclude_tags.clone();
+        let exclude_workbooks = editor.exclude_workbooks.clone();
+        let catalog = editor.catalog.clone();
+        let search = editor
+            .question_search
+            .read(cx)
+            .value()
+            .to_string()
+            .to_lowercase();
+        let workbooks = self.snapshot.books.clone();
+        let mut all_tags: BTreeSet<String> = workbooks
+            .iter()
+            .flat_map(|book| book.tags.iter().cloned())
+            .collect();
+        for group in &groups {
+            all_tags.extend(group.tags.iter().cloned());
+        }
+        all_tags.extend(exclude_tags.iter().cloned());
+
+        let mut page = div().flex().flex_col().gap_6();
+        page = page
+            .child(
+                Button::new("exam-editor-back")
+                    .label("← 戻る")
+                    .text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(id) = this
+                            .exam_editor
+                            .as_ref()
+                            .and_then(|editor| editor.exam_id.clone())
+                        {
+                            this.open_exam(id, cx);
+                        } else {
+                            this.go(Route::Exams, window, cx);
+                        }
+                    })),
+            )
+            .child(self.page_header(
+                title,
+                format!("範囲 {preview} 問 · タイトルと範囲は必須です"),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .p_4()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(label("試験名", cx))
+                            .child(Input::new(&editor.title).id("exam-title").w_full()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(label("説明（任意）", cx))
+                            .child(
+                                Input::new(&editor.description)
+                                    .id("exam-description")
+                                    .w_full(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .child(label("目標日（任意）", cx))
+                                    .child(
+                                        Input::new(&editor.target_date)
+                                            .id("exam-target-date")
+                                            .w_full(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .child(label("目標スコア（任意）", cx))
+                                    .child(
+                                        Input::new(&editor.target_score)
+                                            .id("exam-target-score")
+                                            .w_full(),
+                                    ),
+                            ),
+                    ),
+            );
+
+        page = page.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(section_heading("含める条件（グループはOR）", cx))
+                .child(
+                    Button::new("exam-add-group")
+                        .label("グループを追加")
+                        .secondary()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(editor) = this.exam_editor.as_mut() {
+                                editor.groups.push(Default::default());
+                            }
+                            cx.notify();
+                        })),
+                ),
+        );
+
+        for (index, group) in groups.iter().enumerate() {
+            let mut group_box = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .border_1()
+                .border_color(theme.border);
+            group_box = group_box.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "グループ {} · 条件内はAND / 同じ種類の複数選択はOR",
+                                index + 1
+                            )),
+                    )
+                    .when(groups.len() > 1, |row| {
+                        row.child(
+                            Button::new(format!("exam-group-remove-{index}"))
+                                .label("削除")
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(editor) = this.exam_editor.as_mut()
+                                        && index < editor.groups.len()
+                                    {
+                                        editor.groups.remove(index);
+                                    }
+                                    this.refresh_exam_preview(cx);
+                                })),
+                        )
+                    }),
+            );
+            let mut workbook_row = div().flex().flex_wrap().gap_2();
+            for book in &workbooks {
+                let workbook_id = book.local_id.clone();
+                let selected = group.workbook_ids.contains(&workbook_id);
+                workbook_row = workbook_row.child(
+                    Button::new(format!("exam-group-{index}-wb-{workbook_id}"))
+                        .label(book.title.clone())
+                        .when(selected, |button| button.primary())
+                        .when(!selected, |button| button.secondary())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(editor) = this.exam_editor.as_mut()
+                                && let Some(group) = editor.groups.get_mut(index)
+                            {
+                                if selected {
+                                    group.workbook_ids.remove(&workbook_id);
+                                } else {
+                                    group.workbook_ids.insert(workbook_id.clone());
+                                }
+                            }
+                            this.refresh_exam_preview(cx);
+                        })),
+                );
+            }
+            for workbook_id in group
+                .workbook_ids
+                .iter()
+                .filter(|id| !workbooks.iter().any(|book| &book.local_id == *id))
+            {
+                let workbook_id = workbook_id.clone();
+                workbook_row = workbook_row.child(
+                    Button::new(format!("exam-group-{index}-missing-{workbook_id}"))
+                        .label(format!("参照切れ {}", short_id(&workbook_id)))
+                        .danger()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(editor) = this.exam_editor.as_mut()
+                                && let Some(group) = editor.groups.get_mut(index)
+                            {
+                                group.workbook_ids.remove(&workbook_id);
+                            }
+                            this.refresh_exam_preview(cx);
+                        })),
+                );
+            }
+            group_box = group_box.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child("Workbook（未選択なら全て）"),
+                    )
+                    .child(workbook_row),
+            );
+            let mut tag_row = div().flex().flex_wrap().gap_2();
+            for tag in &all_tags {
+                let tag = tag.clone();
+                let selected = group.tags.contains(&tag);
+                tag_row = tag_row.child(
+                    Button::new(format!("exam-group-{index}-tag-{tag}"))
+                        .label(tag.clone())
+                        .when(selected, |button| button.primary())
+                        .when(!selected, |button| button.secondary())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(editor) = this.exam_editor.as_mut()
+                                && let Some(group) = editor.groups.get_mut(index)
+                            {
+                                if selected {
+                                    group.tags.remove(&tag);
+                                } else {
+                                    group.tags.insert(tag.clone());
+                                }
+                            }
+                            this.refresh_exam_preview(cx);
+                        })),
+                );
+            }
+            group_box = group_box.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child("Workbookタグ（未選択なら全て）"),
+                    )
+                    .child(tag_row),
+            );
+            page = page.child(group_box);
+        }
+
+        page = page.child(section_heading("除外", cx)).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child("除外タグ（含める条件の後に適用）"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .children(all_tags.iter().map(|tag| {
+                            let tag = tag.clone();
+                            let selected = exclude_tags.contains(&tag);
+                            Button::new(format!("exam-exclude-tag-{tag}"))
+                                .label(tag.clone())
+                                .when(selected, |button| button.danger())
+                                .when(!selected, |button| button.ghost())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(editor) = this.exam_editor.as_mut() {
+                                        if selected {
+                                            editor.exclude_tags.remove(&tag);
+                                        } else {
+                                            editor.exclude_tags.insert(tag.clone());
+                                        }
+                                    }
+                                    this.refresh_exam_preview(cx);
+                                }))
+                                .into_any_element()
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child("除外Workbook"),
+                )
+                .child(
+                    div().flex().flex_wrap().gap_2().children(
+                        workbooks
+                            .iter()
+                            .map(|book| {
+                                let workbook_id = book.local_id.clone();
+                                let selected = exclude_workbooks.contains(&workbook_id);
+                                Button::new(format!("exam-exclude-wb-{workbook_id}"))
+                                    .label(book.title.clone())
+                                    .when(selected, |button| button.danger())
+                                    .when(!selected, |button| button.ghost())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(editor) = this.exam_editor.as_mut() {
+                                            if selected {
+                                                editor.exclude_workbooks.remove(&workbook_id);
+                                            } else {
+                                                editor
+                                                    .exclude_workbooks
+                                                    .insert(workbook_id.clone());
+                                            }
+                                        }
+                                        this.refresh_exam_preview(cx);
+                                    }))
+                                    .into_any_element()
+                            })
+                            .chain(
+                                exclude_workbooks
+                                    .iter()
+                                    .filter(|id| {
+                                        !workbooks.iter().any(|book| &book.local_id == *id)
+                                    })
+                                    .map(|workbook_id| {
+                                        let workbook_id = workbook_id.clone();
+                                        let label = format!("参照切れ {}", short_id(&workbook_id));
+                                        Button::new(format!("exam-exclude-missing-{workbook_id}"))
+                                            .label(label)
+                                            .danger()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(editor) = this.exam_editor.as_mut() {
+                                                    editor.exclude_workbooks.remove(&workbook_id);
+                                                }
+                                                this.refresh_exam_preview(cx);
+                                            }))
+                                            .into_any_element()
+                                    }),
+                            ),
+                    ),
+                ),
+        );
+
+        page = page.child(section_heading("個別の問題", cx)).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    Input::new(&editor.question_search)
+                        .id("exam-question-search")
+                        .w_full(),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child("個別に含める / 除外する（グループ条件より後に適用）"),
+                )
+                .child({
+                    let mut rows = div().flex().flex_col();
+                    let mut shown = 0;
+                    for question in &catalog {
+                        if !search.is_empty()
+                            && !question.question_prompt.to_lowercase().contains(&search)
+                            && !question.workbook_title.to_lowercase().contains(&search)
+                        {
+                            continue;
+                        }
+                        let key = crate::QuestionKey::new(
+                            question.workbook_id.clone(),
+                            question.question_id.clone(),
+                        );
+                        let included = include.contains(&key);
+                        let excluded = exclude.contains(&key);
+                        let include_key = key.clone();
+                        let exclude_key = key.clone();
+                        rows = rows.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .py(px(8.0))
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .flex_1()
+                                        .child(
+                                            div().text_size(px(13.0)).child(truncate_text(
+                                                &question.question_prompt,
+                                                90,
+                                            )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!(
+                                                    "{} · {}",
+                                                    question.workbook_title, question.question_id
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new(format!(
+                                                "exam-include-{}-{}",
+                                                question.workbook_id, question.question_id
+                                            ))
+                                            .label("含める")
+                                            .when(included, |button| button.primary())
+                                            .when(!included, |button| button.secondary())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(editor) = this.exam_editor.as_mut() {
+                                                    if included {
+                                                        editor.include.remove(&include_key);
+                                                    } else {
+                                                        editor.include.insert(include_key.clone());
+                                                        editor.exclude.remove(&include_key);
+                                                    }
+                                                }
+                                                this.refresh_exam_preview(cx);
+                                            })),
+                                        )
+                                        .child(
+                                            Button::new(format!(
+                                                "exam-exclude-{}-{}",
+                                                question.workbook_id, question.question_id
+                                            ))
+                                            .label("除外")
+                                            .when(excluded, |button| button.danger())
+                                            .when(!excluded, |button| button.ghost())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(editor) = this.exam_editor.as_mut() {
+                                                    if excluded {
+                                                        editor.exclude.remove(&exclude_key);
+                                                    } else {
+                                                        editor.exclude.insert(exclude_key.clone());
+                                                        editor.include.remove(&exclude_key);
+                                                    }
+                                                }
+                                                this.refresh_exam_preview(cx);
+                                            })),
+                                        ),
+                                ),
+                        );
+                        shown += 1;
+                    }
+                    if shown == 0 {
+                        rows = rows.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.muted_foreground)
+                                .child("該当する問題がありません。"),
+                        );
+                    }
+                    rows
+                }),
+        );
+
+        page = page.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(18.0))
+                                .child(format!("範囲プレビュー: {preview} 問")),
+                        )
+                        .when_some(preview_error, |column, error| {
+                            column.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.danger)
+                                    .child(error),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("exam-editor-cancel")
+                                .label("キャンセル")
+                                .secondary()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if !is_new
+                                        && let Some(id) = this
+                                            .exam_editor
+                                            .as_ref()
+                                            .and_then(|editor| editor.exam_id.clone())
+                                    {
+                                        this.open_exam(id, cx);
+                                        return;
+                                    }
+                                    this.go(Route::Exams, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("exam-editor-save")
+                                .label("保存")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_exam(window, cx);
+                                })),
+                        ),
+                ),
+        );
+        page.into_any_element()
+    }
+
     fn render_history(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let entries = &self.history;
@@ -1602,6 +2667,9 @@ impl WorkbookApp {
                     .flex()
                     .items_center()
                     .gap_4()
+                    .when_some(view.exam_title.clone(), |row, title| {
+                        row.child(div().text_size(px(13.0)).child(title))
+                    })
                     .child(
                         div()
                             .text_size(px(11.0))
@@ -1613,16 +2681,67 @@ impl WorkbookApp {
                             .text_size(px(13.0))
                             .text_color(theme.muted_foreground)
                             .child(progress),
+                    )
+                    .when_some(
+                        view.mock
+                            .as_ref()
+                            .filter(|mock| !mock.submitted)
+                            .and_then(|mock| mock.remaining_ms),
+                        |row, remaining| {
+                            row.child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(if remaining < 60_000 {
+                                        theme.danger
+                                    } else {
+                                        theme.muted_foreground
+                                    })
+                                    .child(format!("残り {}", format_duration(remaining))),
+                            )
+                        },
+                    )
+                    .when_some(
+                        view.mock.as_ref().filter(|mock| !mock.submitted),
+                        |row, mock| {
+                            row.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("{} / {} 回答", mock.answered, mock.total)),
+                            )
+                        },
                     ),
             )
             .child(if active {
-                Button::new("study-finish")
-                    .label("今日はここまで")
-                    .text()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.modal = Some(crate::Modal::Finish);
-                        cx.notify();
-                    }))
+                div()
+                    .flex()
+                    .gap_2()
+                    .when(
+                        view.mode == Mode::Mock && view.phase != Phase::OverallResult,
+                        |row| {
+                            row.child(
+                                Button::new("study-mock-submit")
+                                    .label("提出")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_mock_session(window, cx);
+                                    })),
+                            )
+                        },
+                    )
+                    .child(
+                        Button::new("study-finish")
+                            .label(if view.mode == Mode::Mock {
+                                "模試を終了"
+                            } else {
+                                "今日はここまで"
+                            })
+                            .text()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = Some(crate::Modal::Finish);
+                                cx.notify();
+                            })),
+                    )
                     .into_any_element()
             } else {
                 div().into_any_element()
@@ -1748,29 +2867,40 @@ impl WorkbookApp {
                         &self.content_images(),
                     ));
                 }
-                page = page.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            Button::new("flash-yes")
-                                .label("思い出せた")
-                                .primary()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.self_correct = Some(true);
-                                    this.submit_answer(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("flash-no")
-                                .label("思い出せなかった")
-                                .danger()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.self_correct = Some(false);
-                                    this.submit_answer(window, cx);
-                                })),
-                        ),
-                );
+                if view.mode == Mode::Mock {
+                    page = page.child(
+                        Button::new("mock-flash-next")
+                            .label("次へ（採点なし）")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_mock_question(window, cx);
+                            })),
+                    );
+                } else {
+                    page = page.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("flash-yes")
+                                    .label("思い出せた")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.self_correct = Some(true);
+                                        this.submit_answer(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("flash-no")
+                                    .label("思い出せなかった")
+                                    .danger()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.self_correct = Some(false);
+                                        this.submit_answer(window, cx);
+                                    })),
+                            ),
+                    );
+                }
             } else {
                 page = page.child(
                     Button::new("flash-reveal")
@@ -1785,7 +2915,9 @@ impl WorkbookApp {
             page = page.child(self.render_answer_input(question, cx));
         }
 
-        if let Some(hint) = question.hint.as_ref() {
+        if let Some(hint) = question.hint.as_ref()
+            && view.mode != Mode::Mock
+        {
             if view.hint_visible {
                 page = page.child(
                     div()
@@ -1827,21 +2959,27 @@ impl WorkbookApp {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(
-                        Button::new("question-unknown")
-                            .label("わからない")
-                            .secondary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.mark_unknown(window, cx);
-                            })),
-                    )
+                    .when(view.mode != Mode::Mock, |row| {
+                        row.child(
+                            Button::new("question-unknown")
+                                .label("わからない")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.mark_unknown(window, cx);
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .child(
                                 Button::new("question-skip")
-                                    .label("スキップ")
+                                    .label(if view.mode == Mode::Mock {
+                                        "スキップ（未回答）"
+                                    } else {
+                                        "スキップ"
+                                    })
                                     .ghost()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.skip_question(window, cx);
@@ -1849,7 +2987,11 @@ impl WorkbookApp {
                             )
                             .child(
                                 Button::new("question-submit")
-                                    .label("回答する  ⌘↩")
+                                    .label(if view.mode == Mode::Mock {
+                                        "回答して次へ  ⌘↩"
+                                    } else {
+                                        "回答する  ⌘↩"
+                                    })
                                     .primary()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_answer(window, cx);
@@ -2983,11 +4125,228 @@ impl WorkbookApp {
             .into_any_element()
     }
 
+    fn render_mock_waiting(
+        &self,
+        view: &workbook_service::StudyView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let mock = view.mock.as_ref();
+        let total = mock.map(|mock| mock.total).unwrap_or(0);
+        let answered = mock.map(|mock| mock.answered).unwrap_or(0);
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("模試"),
+            )
+            .child(
+                div()
+                    .text_size(px(32.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .child("提出の準備ができました"),
+            )
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{total}問中 {answered}問に回答しました。未回答は不正解ではなく「未回答」として集計されます。"
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("mock-submit-all")
+                            .label("模試を提出する")
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_mock_session(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("mock-review-today")
+                            .label("今日へ戻る")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.study = None;
+                                this.go(Route::Today, window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_mock_result(&self, result: &MockResultView, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let score = result
+            .score_percent
+            .map(|value| format!("{value:.0}%"))
+            .unwrap_or_else(|| "採点なし".to_string());
+        let exam_id = result.exam_id.clone();
+        let mut page = div().flex().flex_col().gap_5();
+        page = page
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child("模試の結果"),
+            )
+            .child(
+                div()
+                    .text_size(px(32.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .child(result.exam_title.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(format_datetime(
+                        result.submitted_at,
+                        &self.snapshot.timezone,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_6()
+                    .p_5()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(history_stat("得点", score, cx))
+                    .child(history_stat("正解", result.correct.to_string(), cx))
+                    .child(history_stat("不正解", result.incorrect.to_string(), cx))
+                    .child(history_stat("未回答", result.unanswered.to_string(), cx))
+                    .child(history_stat("採点なし", result.ungraded.to_string(), cx))
+                    .child(history_stat("問題", result.total.to_string(), cx))
+                    .child(history_stat(
+                        "所要時間",
+                        format_duration(result.duration_ms),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        "得点は 正解 ÷ (正解 + 不正解) です。未回答と採点不能は分母に含めません。",
+                    ),
+            );
+
+        let mut list = div().flex().flex_col();
+        for item in &result.items {
+            let color = match item.status {
+                MockItemStatus::Correct => theme.success,
+                MockItemStatus::Incorrect => theme.danger,
+                MockItemStatus::Unanswered => theme.muted_foreground,
+                MockItemStatus::Ungraded => theme.accent,
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .py(px(14.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .justify_between()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!(
+                                                "{:02} · {} · {}",
+                                                item.ordinal + 1,
+                                                item.workbook_title,
+                                                item.note_title
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(15.0))
+                                            .child(truncate_text(&item.prompt, 140)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(color)
+                                    .child(item.status.label()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format!("回答: {}", item.given_answer))
+                            .child(format!("正答: {}", item.answer_summary)),
+                    )
+                    .when(!item.explanation.plain_text().is_empty(), |column| {
+                        column.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.muted_foreground)
+                                .child(item.explanation.plain_text()),
+                        )
+                    }),
+            );
+        }
+        page = page.child(list).child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("mock-result-exam")
+                        .label("試験へ戻る")
+                        .primary()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_exam(exam_id.clone(), cx);
+                        })),
+                )
+                .child(
+                    Button::new("mock-result-today")
+                        .label("今日へ")
+                        .secondary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.study = None;
+                            this.go(Route::Today, window, cx);
+                        })),
+                ),
+        );
+        page.into_any_element()
+    }
+
     fn render_workbook_result(
         &self,
         view: &workbook_service::StudyView,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if view.mode == Mode::Mock {
+            return self.render_mock_waiting(view, cx);
+        }
         let theme = cx.theme().clone();
         let Some(result) = view.workbook_result.as_ref() else {
             return div().into_any_element();
@@ -3066,6 +4425,9 @@ impl WorkbookApp {
         view: &workbook_service::StudyView,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(result) = view.mock_result.as_ref() {
+            return self.render_mock_result(result, cx);
+        }
         let theme = cx.theme().clone();
         let Some(result) = view.overall_result.as_ref() else {
             return div().into_any_element();
@@ -3145,6 +4507,100 @@ impl WorkbookApp {
                 cx,
             ))
             .into_any_element()
+    }
+}
+
+fn exam_target_line(summary: &workbook_service::ExamSummary) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(date) = summary.exam.target_date {
+        parts.push(format!("目標日 {date}"));
+    }
+    if let Some(score) = summary.exam.target_score {
+        parts.push(format!("目標 {score}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn exam_scope_summary(
+    exam: &workbook_domain::Exam,
+    books: &[workbook_service::BookSummary],
+) -> String {
+    let workbook_label = |id: &str| {
+        books
+            .iter()
+            .find(|book| book.local_id == id)
+            .map(|book| book.title.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let mut parts = Vec::new();
+    for (index, group) in exam.scope.groups.iter().enumerate() {
+        let workbooks = if group.workbook_ids.is_empty() {
+            "すべての教材".to_string()
+        } else {
+            group
+                .workbook_ids
+                .iter()
+                .map(|id| workbook_label(id))
+                .collect::<Vec<_>>()
+                .join(" または ")
+        };
+        let tags = if group.tags.is_empty() {
+            "すべてのタグ".to_string()
+        } else {
+            group.tags.join(" または ")
+        };
+        parts.push(format!("{}: ({workbooks}) AND ({tags})", index + 1));
+    }
+    if !exam.scope.include_questions.is_empty() {
+        parts.push(format!(
+            "個別指定 {} 問",
+            exam.scope.include_questions.len()
+        ));
+    }
+    let mut text = parts.join(" OR ");
+    if text.is_empty() {
+        text = "条件なし".to_string();
+    }
+    let mut excludes = Vec::new();
+    if !exam.scope.exclude_questions.is_empty() {
+        excludes.push(format!("個別 {} 問", exam.scope.exclude_questions.len()));
+    }
+    if !exam.scope.exclude_workbooks.is_empty() {
+        excludes.push(format!(
+            "Workbook {}",
+            exam.scope
+                .exclude_workbooks
+                .iter()
+                .map(|id| workbook_label(id))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ));
+    }
+    if !exam.scope.exclude_tags.is_empty() {
+        excludes.push(format!("タグ {}", exam.scope.exclude_tags.join(" / ")));
+    }
+    if !excludes.is_empty() {
+        text.push_str(&format!(" · 除外: {}", excludes.join(" / ")));
+    }
+    text
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn truncate_text(text: &str, limit: usize) -> String {
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() <= limit {
+        cleaned
+    } else {
+        let mut truncated: String = cleaned.chars().take(limit).collect();
+        truncated.push('…');
+        truncated
     }
 }
 

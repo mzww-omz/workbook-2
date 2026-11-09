@@ -1,19 +1,24 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use thiserror::Error;
 use workbook_domain::{
-    Answer, AssistState, CardState, Content, GradeResult, GradeStatus, Mode, NearMissReason,
-    NearMissRecord, Phase, Question, QuestionType, Rating, RatingSource, SessionItemStatus,
-    SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook, answer_is_blank,
-    automatic_rating, grade_answer_detailed, parse_workbook,
+    Answer, AssistState, CardState, Content, Exam, ExamCatalogQuestion, ExamDraft, ExamScope,
+    GradeResult, GradeStatus, MockOptions, Mode, NearMissReason, NearMissRecord, Phase,
+    PracticeOptions, PracticeStrategy, Question, QuestionType, Rating, RatingSource,
+    SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
+    answer_is_blank, automatic_rating, grade_answer_detailed, parse_workbook, resolve_scope,
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
-use workbook_scheduler::{Clock, QueueInput, QueueKind, Scheduler, SchedulerSettings, select_next};
+use workbook_scheduler::{
+    Clock, QueueChoice, QueueInput, QueueKind, Scheduler, SchedulerSettings, select_next,
+};
 use workbook_storage::{
-    AttemptRow, CommitWrite, CorrectionWrite, SessionBundle, SessionCandidate, SessionCounts,
-    SessionItemRow, SessionRow, SessionWorkbookRow, Storage, StorageError, counts_for_workbook,
+    AttemptRow, CommitWrite, CorrectionWrite, ExamPracticeStats, MockAnswerRow, MockResultRow,
+    SessionBundle, SessionCandidate, SessionCounts, SessionItemRow, SessionRow, SessionWorkbookRow,
+    Storage, StorageError, counts_for_workbook,
 };
 
 #[derive(Debug, Error)]
@@ -211,6 +216,10 @@ pub struct StudyView {
     pub progress: StudyProgress,
     pub workbook_result: Option<WorkbookResultView>,
     pub overall_result: Option<OverallResultView>,
+    pub exam_id: Option<String>,
+    pub exam_title: Option<String>,
+    pub mock: Option<MockSessionView>,
+    pub mock_result: Option<MockResultView>,
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +230,99 @@ pub struct HistoryEntry {
     pub ended_at: Option<DateTime<Utc>>,
     pub workbook_titles: Vec<String>,
     pub stats: ResultStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct MockHistoryEntry {
+    pub session_id: String,
+    pub submitted_at: DateTime<Utc>,
+    pub total: u32,
+    pub correct: u32,
+    pub incorrect: u32,
+    pub unanswered: u32,
+    pub ungraded: u32,
+    pub duration_ms: i64,
+    /// `correct / (correct + incorrect)`, or `None` when nothing could be
+    /// graded automatically. Unanswered and ungraded items are never treated
+    /// as wrong for this denominator.
+    pub score_percent: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExamSummary {
+    pub exam: Exam,
+    pub total: usize,
+    pub studied: usize,
+    pub unstudied: usize,
+    pub due: usize,
+    /// `studied / total`, or `None` when the scope is empty.
+    pub coverage: Option<f64>,
+    pub practice: ExamPracticeStats,
+    pub mock_history: Vec<MockHistoryEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockItemStatus {
+    Correct,
+    Incorrect,
+    Unanswered,
+    Ungraded,
+}
+
+impl MockItemStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Correct => "正解",
+            Self::Incorrect => "不正解",
+            Self::Unanswered => "未回答",
+            Self::Ungraded => "採点なし",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MockItemResult {
+    pub ordinal: u32,
+    pub workbook_title: String,
+    pub note_title: String,
+    pub prompt: String,
+    pub status: MockItemStatus,
+    pub given_answer: String,
+    pub answer_summary: String,
+    pub explanation: Content,
+}
+
+#[derive(Clone, Debug)]
+pub struct MockResultView {
+    pub session_id: String,
+    pub exam_id: String,
+    pub exam_title: String,
+    pub submitted_at: DateTime<Utc>,
+    pub total: u32,
+    pub correct: u32,
+    pub incorrect: u32,
+    pub unanswered: u32,
+    pub ungraded: u32,
+    pub duration_ms: i64,
+    pub score_percent: Option<f64>,
+    pub items: Vec<MockItemResult>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MockSessionView {
+    pub total: usize,
+    pub answered: usize,
+    pub remaining_ms: Option<i64>,
+    pub submitted: bool,
+}
+
+pub fn mock_score_percent(correct: u32, incorrect: u32) -> Option<f64> {
+    let graded = correct + incorrect;
+    if graded == 0 {
+        None
+    } else {
+        Some(correct as f64 / graded as f64 * 100.0)
+    }
 }
 
 pub struct WorkbookService {
@@ -445,6 +547,391 @@ impl WorkbookService {
         Ok(())
     }
 
+    // ---- exams ----------------------------------------------------------
+
+    pub fn exams(&self, include_archived: bool) -> Result<Vec<ExamSummary>> {
+        let storage = self.storage()?;
+        let records = storage.exams(include_archived)?;
+        let catalog = exam_catalog(&storage)?;
+        let now = self.clock.now();
+        records
+            .into_iter()
+            .map(|exam| exam_summary_from(&storage, exam, &catalog, now, 8))
+            .collect()
+    }
+
+    pub fn exam(&self, id: &str) -> Result<Exam> {
+        Ok(self.storage()?.exam(id)?)
+    }
+
+    pub fn exam_summary(&self, id: &str) -> Result<ExamSummary> {
+        let storage = self.storage()?;
+        let exam = storage.exam(id)?;
+        let catalog = exam_catalog(&storage)?;
+        exam_summary_from(&storage, exam, &catalog, self.clock.now(), 50)
+    }
+
+    pub fn exam_catalog(&self) -> Result<Vec<ExamCatalogQuestion>> {
+        let storage = self.storage()?;
+        exam_catalog(&storage)
+    }
+
+    pub fn preview_exam_scope(&self, scope: &ExamScope) -> Result<Vec<ExamCatalogQuestion>> {
+        let storage = self.storage()?;
+        Ok(resolve_scope(scope, &exam_catalog(&storage)?))
+    }
+
+    pub fn create_exam(&self, draft: ExamDraft) -> Result<String> {
+        draft.validate()?;
+        let exam = draft.into_exam(self.clock.now());
+        let mut storage = self.storage()?;
+        storage.insert_exam(&exam)?;
+        Ok(exam.id)
+    }
+
+    pub fn update_exam(&self, id: &str, draft: ExamDraft) -> Result<()> {
+        draft.validate()?;
+        let mut storage = self.storage()?;
+        let mut exam = storage.exam(id)?;
+        draft.apply_to(&mut exam, self.clock.now());
+        storage.update_exam(&exam)?;
+        Ok(())
+    }
+
+    pub fn archive_exam(&self, id: &str, archived: bool) -> Result<()> {
+        let mut storage = self.storage()?;
+        storage.archive_exam(id, archived, self.clock.now())?;
+        Ok(())
+    }
+
+    pub fn delete_exam(&self, id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        self.write_action_backup(&storage, "pre-delete-exam")?;
+        storage.delete_exam(id)?;
+        Ok(())
+    }
+
+    pub fn start_exam_review(&self, exam_id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        ensure_no_active_session(&storage)?;
+        let exam = storage.exam(exam_id)?;
+        let catalog = exam_catalog(&storage)?;
+        let scope: BTreeSet<(String, String)> = resolve_scope(&exam.scope, &catalog)
+            .into_iter()
+            .map(|question| (question.workbook_id, question.question_id))
+            .collect();
+        let now = self.clock.now();
+        let mut candidates: Vec<SessionCandidate> = storage
+            .review_candidates(None, now)?
+            .into_iter()
+            .filter(|candidate| {
+                scope.contains(&(candidate.workbook_id.clone(), candidate.question_id.clone()))
+            })
+            .collect();
+        if candidates.is_empty() {
+            candidates = storage
+                .upcoming_short_term(None, now, now + Duration::minutes(20))?
+                .into_iter()
+                .filter(|candidate| {
+                    scope.contains(&(candidate.workbook_id.clone(), candidate.question_id.clone()))
+                })
+                .collect();
+        }
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この試験の範囲に期限が来た問題はありません".to_string(),
+            ));
+        }
+        self.create_exam_bundle(&mut storage, Mode::Review, exam_id, &candidates, None, now)
+    }
+
+    pub fn start_exam_practice(&self, exam_id: &str, options: &PracticeOptions) -> Result<()> {
+        let mut storage = self.storage()?;
+        ensure_no_active_session(&storage)?;
+        let exam = storage.exam(exam_id)?;
+        let catalog = exam_catalog(&storage)?;
+        let resolved = resolve_scope(&exam.scope, &catalog);
+        if resolved.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この試験の範囲に問題がありません".to_string(),
+            ));
+        }
+        let now = self.clock.now();
+        let states: BTreeMap<(String, String), CardState> = storage
+            .review_states()?
+            .into_iter()
+            .map(|(workbook_id, question_id, card)| ((workbook_id, question_id), card.state))
+            .collect();
+        let attempt_stats: BTreeMap<(String, String), (usize, usize)> = storage
+            .question_attempt_stats()?
+            .into_iter()
+            .map(|(workbook_id, question_id, stat)| {
+                ((workbook_id, question_id), (stat.attempts, stat.incorrect))
+            })
+            .collect();
+        let mut candidates: Vec<SessionCandidate> = resolved
+            .into_iter()
+            .filter(|question| {
+                let key = (question.workbook_id.clone(), question.question_id.clone());
+                match options.strategy {
+                    PracticeStrategy::All | PracticeStrategy::Random => true,
+                    PracticeStrategy::Unstudied => !states.contains_key(&key),
+                    PracticeStrategy::PreviouslyIncorrect => attempt_stats
+                        .get(&key)
+                        .is_some_and(|(_, incorrect)| *incorrect > 0),
+                    PracticeStrategy::Weak => {
+                        attempt_stats
+                            .get(&key)
+                            .is_some_and(|(_, incorrect)| *incorrect > 0)
+                            || storage
+                                .review_state(&question.workbook_id, &question.question_id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|card| card.lapses > 0 || card.difficulty >= 7.0)
+                    }
+                }
+            })
+            .map(|question| SessionCandidate {
+                workbook_id: question.workbook_id,
+                note_id: question.note_id,
+                question_id: question.question_id,
+                due_at: None,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "条件に合う練習問題がありません".to_string(),
+            ));
+        }
+        if options.strategy == PracticeStrategy::Random {
+            shuffle_candidates(&mut candidates, seed_from(now, exam_id, "practice"));
+        }
+        if let Some(limit) = options.question_limit {
+            candidates.truncate(limit as usize);
+        }
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "条件に合う練習問題がありません".to_string(),
+            ));
+        }
+        self.create_exam_bundle(
+            &mut storage,
+            Mode::Practice,
+            exam_id,
+            &candidates,
+            None,
+            now,
+        )
+    }
+
+    pub fn start_exam_mock(&self, exam_id: &str, options: &MockOptions) -> Result<()> {
+        let mut storage = self.storage()?;
+        ensure_no_active_session(&storage)?;
+        let exam = storage.exam(exam_id)?;
+        let catalog = exam_catalog(&storage)?;
+        let mut candidates: Vec<SessionCandidate> = resolve_scope(&exam.scope, &catalog)
+            .into_iter()
+            .map(|question| SessionCandidate {
+                workbook_id: question.workbook_id,
+                note_id: question.note_id,
+                question_id: question.question_id,
+                due_at: None,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この試験の範囲に問題がありません".to_string(),
+            ));
+        }
+        let now = self.clock.now();
+        if options.order == workbook_domain::MockOrder::Random {
+            shuffle_candidates(&mut candidates, seed_from(now, exam_id, "mock"));
+        }
+        if let Some(limit) = options.question_limit {
+            candidates.truncate(limit as usize);
+        }
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "模試の問題を選択できませんでした".to_string(),
+            ));
+        }
+        self.create_exam_bundle(
+            &mut storage,
+            Mode::Mock,
+            exam_id,
+            &candidates,
+            options.time_limit_seconds,
+            now,
+        )
+    }
+
+    fn create_exam_bundle(
+        &self,
+        storage: &mut Storage,
+        mode: Mode,
+        exam_id: &str,
+        candidates: &[SessionCandidate],
+        time_limit_seconds: Option<u32>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let (mut bundle, _first_note) = build_session_bundle(
+            mode,
+            candidates,
+            now,
+            Some(exam_id.to_string()),
+            time_limit_seconds,
+        )?;
+        let first_item = bundle
+            .items
+            .first()
+            .ok_or_else(|| ServiceError::Invalid("問題を選択できませんでした".to_string()))?
+            .clone();
+        bundle.session.current_workbook_id = Some(first_item.workbook_id.clone());
+        bundle.session.current_item_id = Some(first_item.id.clone());
+        bundle.session.cursor_kind = "initial".to_string();
+        // Exam sessions never show a knowledge-card intro: they are assessment
+        // or review contexts, not first-time note introduction.
+        bundle.session.phase = Phase::Question;
+        bundle.session.question_started_at = Some(now);
+        bundle.session.revision = 0;
+        storage.create_session(&bundle)?;
+        let mut workbooks = BTreeSet::new();
+        for item in &bundle.items {
+            workbooks.insert(item.workbook_id.clone());
+        }
+        for workbook in workbooks {
+            storage.touch_workbook(&workbook, now)?;
+        }
+        Ok(())
+    }
+
+    /// Grades one mock answer, stores it separately from FSRS, then advances.
+    /// Unsupported question types are stored as ungraded (`correct = NULL`).
+    pub fn mock_answer(
+        &self,
+        session_id: &str,
+        answer: Option<&Answer>,
+        expected_revision: u64,
+    ) -> Result<StudyView> {
+        let mut storage = self.storage()?;
+        let settings = storage.settings()?;
+        let calendar =
+            StudyCalendar::new(&settings.effective_timezone()).map_err(ServiceError::Invalid)?;
+        let now = self.clock.now();
+        let mut bundle = storage.session_bundle(session_id)?;
+        ensure_active(&bundle)?;
+        if bundle.session.mode != Mode::Mock {
+            return Err(ServiceError::Invalid("模試ではありません".to_string()));
+        }
+        check_revision(&bundle.session, expected_revision)?;
+        if !matches!(bundle.session.phase, Phase::Question) {
+            return Err(ServiceError::Invalid("いまは回答できません".to_string()));
+        }
+        if mock_deadline(&bundle.session).is_some_and(|deadline| now >= deadline) {
+            return Err(ServiceError::Invalid(
+                "制限時間が終了しました。提出してください".to_string(),
+            ));
+        }
+        let item = current_item(&bundle)?.clone();
+        let workbook = storage.workbook(&item.workbook_id)?;
+        let question = workbook
+            .find_question(&item.note_id, &item.question_id)
+            .map(|(_, question)| question.clone())
+            .ok_or_else(|| ServiceError::NotFound("問題".to_string()))?;
+        if answer_is_blank(answer) {
+            return Err(ServiceError::Invalid("回答を入力してください".to_string()));
+        }
+        let correct = match grade_answer_detailed(&question, answer).map(|result| result.status) {
+            Some(GradeStatus::Correct) => Some(true),
+            Some(GradeStatus::Incorrect | GradeStatus::NearMiss) => Some(false),
+            Some(GradeStatus::Manual) | None => None,
+        };
+        record_time(&mut bundle.session, now);
+        let answer_json = answer
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_else(|| "null".to_string());
+        bundle.session.draft_json = Some(answer_json.clone());
+        bundle.session.revision += 1;
+        let mock_answer = MockAnswerRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            item_id: item.id.clone(),
+            workbook_id: item.workbook_id.clone(),
+            note_id: item.note_id.clone(),
+            question_id: item.question_id.clone(),
+            answered_at: now,
+            correct,
+            answer_json,
+            created_at: now,
+        };
+        storage.record_mock_answer(&mock_answer, &bundle.session)?;
+        if let Some(row) = bundle.items.iter_mut().find(|row| row.id == item.id) {
+            row.status = SessionItemStatus::Answered;
+        }
+        self.advance(&mut storage, &mut bundle, now, &settings, &calendar)?;
+        self.view_for(&storage, &bundle, &settings, &calendar, now)
+    }
+
+    pub fn submit_mock(&self, session_id: &str, expected_revision: u64) -> Result<StudyView> {
+        let mut storage = self.storage()?;
+        let settings = storage.settings()?;
+        let calendar =
+            StudyCalendar::new(&settings.effective_timezone()).map_err(ServiceError::Invalid)?;
+        let mut bundle = storage.session_bundle(session_id)?;
+        if bundle.session.mode != Mode::Mock {
+            return Err(ServiceError::Invalid("模試ではありません".to_string()));
+        }
+        let now = self.clock.now();
+        if bundle.session.status == SessionStatus::Ended {
+            return self.view_for(&storage, &bundle, &settings, &calendar, now);
+        }
+        check_revision(&bundle.session, expected_revision)?;
+        ensure_active(&bundle)?;
+        let exam_id = bundle
+            .session
+            .exam_id
+            .clone()
+            .ok_or_else(|| ServiceError::Invalid("試験が指定されていません".to_string()))?;
+        let answers = storage.mock_answers_for_session(session_id)?;
+        let total = bundle.items.len() as u32;
+        let correct = answers
+            .iter()
+            .filter(|answer| answer.correct == Some(true))
+            .count() as u32;
+        let incorrect = answers
+            .iter()
+            .filter(|answer| answer.correct == Some(false))
+            .count() as u32;
+        let ungraded = answers
+            .iter()
+            .filter(|answer| answer.correct.is_none())
+            .count() as u32;
+        let unanswered = total.saturating_sub(answers.len() as u32);
+        let submitted_at = now;
+        let duration_ms = (submitted_at - bundle.session.started_at)
+            .num_milliseconds()
+            .max(0);
+        let result = MockResultRow {
+            session_id: session_id.to_string(),
+            exam_id,
+            submitted_at,
+            total,
+            correct,
+            incorrect,
+            unanswered,
+            ungraded,
+            duration_ms,
+        };
+        bundle.session.status = SessionStatus::Ended;
+        bundle.session.ended_at = Some(submitted_at);
+        bundle.session.phase = Phase::OverallResult;
+        bundle.session.current_item_id = None;
+        bundle.session.revision += 1;
+        storage.finish_mock(&result, &bundle.session)?;
+        self.view_for(&storage, &bundle, &settings, &calendar, now)
+    }
+
     // ---- study session --------------------------------------------------
 
     pub fn start_session(&self, mode: Mode, workbook_id: Option<&str>) -> Result<()> {
@@ -484,6 +971,11 @@ impl WorkbookService {
                     .ok_or_else(|| ServiceError::Invalid("Workbookを選んでください".to_string()))?;
                 storage.practice_candidates(workbook_id)?
             }
+            Mode::Mock => {
+                return Err(ServiceError::Invalid(
+                    "模試は試験画面から開始してください".to_string(),
+                ));
+            }
         };
         if candidates.is_empty() {
             return Err(ServiceError::Invalid(
@@ -491,7 +983,7 @@ impl WorkbookService {
                     .to_string(),
             ));
         }
-        let (bundle, first_note) = build_session_bundle(mode, &candidates, now)?;
+        let (bundle, first_note) = build_session_bundle(mode, &candidates, now, None, None)?;
         let first_item = bundle
             .items
             .first()
@@ -530,13 +1022,16 @@ impl WorkbookService {
             StudyCalendar::new(&settings.effective_timezone()).map_err(ServiceError::Invalid)?;
         let now = self.clock.now();
         let next_due = storage.next_due_at(now)?;
+        let mock_deadline = storage
+            .active_session()?
+            .and_then(|bundle| mock_deadline(&bundle.session));
         // Refresh at the next 4 a.m. boundary even when no card is due, so
         // Today's learning-day counts and date caption switch over.
         let day_start = Some(calendar.next_learning_day_start(now));
-        Ok(match (next_due, day_start) {
-            (Some(due), Some(start)) => Some(due.min(start)),
-            (due, start) => due.or(start),
-        })
+        Ok([next_due, day_start, mock_deadline]
+            .into_iter()
+            .flatten()
+            .min())
     }
 
     pub fn active_view(&self) -> Result<Option<StudyView>> {
@@ -837,7 +1332,7 @@ impl WorkbookService {
             .ok_or_else(|| ServiceError::Invalid("回答時刻が記録されていません".to_string()))?;
         let item = current_item(bundle)?.clone();
         let before = storage.review_state(&item.workbook_id, &item.question_id)?;
-        let card = if bundle.session.mode == Mode::Practice {
+        let card = if matches!(bundle.session.mode, Mode::Practice | Mode::Mock) {
             None
         } else {
             Some(
@@ -902,7 +1397,7 @@ impl WorkbookService {
             card,
             item_id: Some(item.id.clone()),
             mark_answered: !cursor_short_term,
-            introduce_note: bundle.session.mode != Mode::Practice,
+            introduce_note: !matches!(bundle.session.mode, Mode::Practice | Mode::Mock),
             bury_until,
         })?;
         bundle.attempts.push(committed_attempt);
@@ -962,7 +1457,7 @@ impl WorkbookService {
         if correct.is_none() && rating.is_none() {
             return Err(ServiceError::Invalid("訂正内容がありません".to_string()));
         }
-        let card = if bundle.session.mode == Mode::Practice {
+        let card = if matches!(bundle.session.mode, Mode::Practice | Mode::Mock) {
             None
         } else {
             let expected_revision = current.state_revision;
@@ -1091,16 +1586,32 @@ impl WorkbookService {
             .current_workbook_id
             .clone()
             .ok_or_else(|| ServiceError::Invalid("Workbookが選択されていません".to_string()))?;
-        let queue = storage.session_queue(&bundle.session.id, &workbook_id)?;
-        let choice = select_next(QueueInput {
-            mode: bundle.session.mode,
-            workbook_id: &workbook_id,
-            questions: &queue,
-            now,
-            calendar,
-        });
+        let is_exam = bundle.session.exam_id.is_some();
+        let mut choice: Option<(String, QueueChoice)> = None;
+        let workbook_ids: Vec<String> = if is_exam {
+            bundle
+                .workbooks
+                .iter()
+                .map(|workbook| workbook.workbook_id.clone())
+                .collect()
+        } else {
+            vec![workbook_id.clone()]
+        };
+        for candidate_workbook in workbook_ids {
+            let queue = storage.session_queue(&bundle.session.id, &candidate_workbook)?;
+            if let Some(selected) = select_next(QueueInput {
+                mode: bundle.session.mode,
+                workbook_id: &candidate_workbook,
+                questions: &queue,
+                now,
+                calendar,
+            }) {
+                choice = Some((candidate_workbook, selected));
+                break;
+            }
+        }
         match choice {
-            Some(choice) => {
+            Some((selected_workbook, choice)) => {
                 let item = bundle
                     .items
                     .iter()
@@ -1110,7 +1621,7 @@ impl WorkbookService {
                 let intro = bundle.session.mode == Mode::New
                     && choice.kind == QueueKind::Initial
                     && !storage.note_introduced(&item.workbook_id, &item.note_id)?;
-                bundle.session.current_workbook_id = Some(workbook_id);
+                bundle.session.current_workbook_id = Some(selected_workbook);
                 bundle.session.current_item_id = Some(item.id);
                 bundle.session.cursor_kind = match choice.kind {
                     QueueKind::Initial => "initial",
@@ -1127,6 +1638,17 @@ impl WorkbookService {
                 bundle.session.assist_json = None;
                 bundle.session.question_started_at = Some(now);
                 bundle.session.question_elapsed_ms = 0;
+            }
+            None if is_exam && bundle.session.mode == Mode::Mock => {
+                bundle.session.phase = Phase::WorkbookResult;
+                bundle.session.current_item_id = None;
+                bundle.session.current_workbook_id = Some(workbook_id);
+            }
+            None if is_exam => {
+                bundle.session.phase = Phase::OverallResult;
+                bundle.session.current_item_id = None;
+                bundle.session.status = SessionStatus::Ended;
+                bundle.session.ended_at = Some(now);
             }
             None => {
                 bundle.session.phase = Phase::WorkbookResult;
@@ -1242,6 +1764,10 @@ impl WorkbookService {
             StudyCalendar::new(&settings.effective_timezone()).map_err(ServiceError::Invalid)?;
         let now = self.clock.now();
         let mut bundle = storage.session_bundle(session_id)?;
+        if bundle.session.mode == Mode::Mock {
+            drop(storage);
+            return self.submit_mock(session_id, expected_revision);
+        }
         ensure_active(&bundle)?;
         check_revision(&bundle.session, expected_revision)?;
         bundle.session.status = SessionStatus::Ended;
@@ -1265,7 +1791,7 @@ impl WorkbookService {
         bundle: &SessionBundle,
         settings: &Settings,
         calendar: &StudyCalendar,
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<StudyView> {
         let _ = calendar;
         let _ = settings;
@@ -1337,7 +1863,9 @@ impl WorkbookService {
             None
         };
         let mut progress = StudyProgress::default();
-        if let Some(workbook_id) = workbook_id.as_deref() {
+        if session.exam_id.is_some() {
+            progress = progress_for_exam(bundle, item);
+        } else if let Some(workbook_id) = workbook_id.as_deref() {
             progress = progress_for(bundle, workbook_id, item);
         }
         let workbook_result = if session.phase == Phase::WorkbookResult {
@@ -1378,6 +1906,36 @@ impl WorkbookService {
         } else {
             None
         };
+        let exam = session
+            .exam_id
+            .as_deref()
+            .map(|id| storage.exam(id))
+            .transpose()?;
+        let mock = if session.mode == Mode::Mock {
+            let answered = bundle
+                .items
+                .iter()
+                .filter(|item| item.status == SessionItemStatus::Answered)
+                .count();
+            let remaining_ms =
+                mock_deadline(session).map(|deadline| (deadline - now).num_milliseconds().max(0));
+            Some(MockSessionView {
+                total: bundle.items.len(),
+                answered,
+                remaining_ms,
+                submitted: session.status == SessionStatus::Ended,
+            })
+        } else {
+            None
+        };
+        let mock_result = if session.mode == Mode::Mock && session.phase == Phase::OverallResult {
+            storage
+                .mock_result(&session.id)?
+                .map(|result| build_mock_result_view(storage, bundle, &result))
+                .transpose()?
+        } else {
+            None
+        };
         Ok(StudyView {
             session_id: session.id.clone(),
             mode: session.mode,
@@ -1399,6 +1957,10 @@ impl WorkbookService {
             progress,
             workbook_result,
             overall_result,
+            exam_id: session.exam_id.clone(),
+            exam_title: exam.map(|exam| exam.title),
+            mock,
+            mock_result,
         })
     }
 
@@ -1614,10 +2176,227 @@ impl WorkbookService {
     }
 }
 
+fn exam_catalog(storage: &Storage) -> Result<Vec<ExamCatalogQuestion>> {
+    let mut catalog = Vec::new();
+    for record in storage.workbooks()? {
+        let workbook = parse_workbook(&record.content_json)?;
+        for note in &workbook.notes {
+            for question in &note.questions {
+                catalog.push(ExamCatalogQuestion {
+                    workbook_id: record.local_id.clone(),
+                    workbook_title: workbook.title.clone(),
+                    note_id: note.id.clone(),
+                    question_id: question.id.clone(),
+                    question_prompt: question.prompt_text(),
+                    workbook_tags: workbook.tags.clone(),
+                });
+            }
+        }
+    }
+    catalog.sort_by(|a, b| {
+        a.workbook_title
+            .cmp(&b.workbook_title)
+            .then(a.note_id.cmp(&b.note_id))
+            .then(a.question_id.cmp(&b.question_id))
+    });
+    Ok(catalog)
+}
+
+fn exam_summary_from(
+    storage: &Storage,
+    exam: Exam,
+    catalog: &[ExamCatalogQuestion],
+    now: DateTime<Utc>,
+    mock_limit: usize,
+) -> Result<ExamSummary> {
+    let resolved = resolve_scope(&exam.scope, catalog);
+    let total = resolved.len();
+    let states: std::collections::BTreeMap<(String, String), workbook_domain::StoredCard> = storage
+        .review_states()?
+        .into_iter()
+        .map(|(workbook_id, question_id, card)| ((workbook_id, question_id), card))
+        .collect();
+    let mut studied = 0;
+    let mut due = 0;
+    for question in &resolved {
+        if let Some(card) =
+            states.get(&(question.workbook_id.clone(), question.question_id.clone()))
+        {
+            studied += 1;
+            if card.due_at <= now {
+                due += 1;
+            }
+        }
+    }
+    let practice = storage.exam_practice_stats(&exam.id)?;
+    let mock_history = storage
+        .mock_results(&exam.id, mock_limit)?
+        .into_iter()
+        .map(|result| MockHistoryEntry {
+            session_id: result.session_id,
+            submitted_at: result.submitted_at,
+            total: result.total,
+            correct: result.correct,
+            incorrect: result.incorrect,
+            unanswered: result.unanswered,
+            ungraded: result.ungraded,
+            duration_ms: result.duration_ms,
+            score_percent: mock_score_percent(result.correct, result.incorrect),
+        })
+        .collect();
+    Ok(ExamSummary {
+        total,
+        studied,
+        unstudied: total.saturating_sub(studied),
+        due,
+        coverage: if total == 0 {
+            None
+        } else {
+            Some(studied as f64 / total as f64)
+        },
+        practice,
+        mock_history,
+        exam,
+    })
+}
+
+fn build_mock_result_view(
+    storage: &Storage,
+    bundle: &SessionBundle,
+    result: &MockResultRow,
+) -> Result<MockResultView> {
+    let exam_title = storage
+        .exam(&result.exam_id)
+        .map(|exam| exam.title)
+        .unwrap_or_else(|_| "試験".to_string());
+    let answers: BTreeMap<String, MockAnswerRow> = storage
+        .mock_answers_for_session(&result.session_id)?
+        .into_iter()
+        .map(|answer| (answer.item_id.clone(), answer))
+        .collect();
+    let mut workbook_cache: BTreeMap<String, Workbook> = BTreeMap::new();
+    let mut items = Vec::new();
+    for item in &bundle.items {
+        let workbook = match workbook_cache.get(&item.workbook_id) {
+            Some(workbook) => workbook.clone(),
+            None => {
+                let workbook = storage.workbook(&item.workbook_id)?;
+                workbook_cache.insert(item.workbook_id.clone(), workbook.clone());
+                workbook
+            }
+        };
+        let note_title = workbook
+            .notes
+            .iter()
+            .find(|note| note.id == item.note_id)
+            .map(|note| note.title.clone())
+            .unwrap_or_default();
+        let question = workbook
+            .find_question(&item.note_id, &item.question_id)
+            .map(|(_, question)| question.clone());
+        let answer = answers.get(&item.id);
+        let status = match answer.and_then(|answer| answer.correct) {
+            Some(true) => MockItemStatus::Correct,
+            Some(false) => MockItemStatus::Incorrect,
+            None if answer.is_some() => MockItemStatus::Ungraded,
+            None => MockItemStatus::Unanswered,
+        };
+        let given = answer
+            .and_then(|answer| serde_json::from_str::<Value>(&answer.answer_json).ok())
+            .filter(|value| !value.is_null());
+        items.push(MockItemResult {
+            ordinal: item.ordinal,
+            workbook_title: workbook.title.clone(),
+            note_title,
+            prompt: question
+                .as_ref()
+                .map(Question::prompt_text)
+                .unwrap_or_default(),
+            status,
+            given_answer: question
+                .as_ref()
+                .map(|question| format_given_answer(question, given.as_ref()))
+                .unwrap_or_else(|| "（未回答）".to_string()),
+            answer_summary: question
+                .as_ref()
+                .map(Question::answer_summary)
+                .unwrap_or_default(),
+            explanation: question
+                .as_ref()
+                .map(|question| question.explanation.clone())
+                .unwrap_or_else(|| Content::Text(String::new())),
+        });
+    }
+    Ok(MockResultView {
+        session_id: result.session_id.clone(),
+        exam_id: result.exam_id.clone(),
+        exam_title,
+        submitted_at: result.submitted_at,
+        total: result.total,
+        correct: result.correct,
+        incorrect: result.incorrect,
+        unanswered: result.unanswered,
+        ungraded: result.ungraded,
+        duration_ms: result.duration_ms,
+        score_percent: mock_score_percent(result.correct, result.incorrect),
+        items,
+    })
+}
+
+fn mock_deadline(session: &SessionRow) -> Option<DateTime<Utc>> {
+    if session.mode != Mode::Mock {
+        return None;
+    }
+    session
+        .time_limit_seconds
+        .map(|seconds| session.started_at + Duration::seconds(i64::from(seconds)))
+}
+
+fn ensure_no_active_session(storage: &Storage) -> Result<()> {
+    if storage.active_session()?.is_some() {
+        return Err(ServiceError::Conflict(
+            "中断中のセッションを再開するか、終了してください".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn seed_from(now: DateTime<Utc>, exam_id: &str, mode: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in now
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .to_le_bytes()
+        .into_iter()
+        .chain(exam_id.bytes())
+        .chain(mode.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn shuffle_candidates(candidates: &mut [SessionCandidate], seed: u64) {
+    if candidates.len() < 2 {
+        return;
+    }
+    let mut state = seed | 1;
+    for index in (1..candidates.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let swap = (state % (index as u64 + 1)) as usize;
+        candidates.swap(index, swap);
+    }
+}
+
 fn build_session_bundle(
     mode: Mode,
     candidates: &[SessionCandidate],
     now: DateTime<Utc>,
+    exam_id: Option<String>,
+    time_limit_seconds: Option<u32>,
 ) -> Result<(SessionBundle, String)> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let started_at = now;
@@ -1668,6 +2447,8 @@ fn build_session_bundle(
         cursor_kind: "initial".to_string(),
         assist_json: None,
         revision: 0,
+        exam_id,
+        time_limit_seconds,
     };
     Ok((
         SessionBundle {
@@ -1732,6 +2513,26 @@ fn record_time(session: &mut SessionRow, now: DateTime<Utc>) {
             session.question_elapsed_ms += elapsed;
         }
         session.question_started_at = Some(now);
+    }
+}
+
+fn progress_for_exam(bundle: &SessionBundle, item: Option<&SessionItemRow>) -> StudyProgress {
+    let answered = bundle
+        .items
+        .iter()
+        .filter(|item| item.status == SessionItemStatus::Answered)
+        .count();
+    StudyProgress {
+        position: item
+            .map(|item| item.ordinal as usize + 1)
+            .unwrap_or(answered),
+        total: bundle.items.len(),
+        answered,
+        skipped: bundle
+            .items
+            .iter()
+            .filter(|item| item.status == SessionItemStatus::Skipped)
+            .count(),
     }
 }
 

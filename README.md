@@ -37,6 +37,8 @@
 - GUI不要の `workbook-lint` CLI。Domain検証を再利用し、Numeric/Hotspot/Content/教材品質の診断、JSON出力、`--strict`、CI向け終了コードを提供
 - AI向け `workbook-authoring` Skill と、5教科＋基本のインポート可能なサンプル
 - 拡張サンプル教材（数学・英語・社会・理科の5形式、画像2枚）をアプリから追加可能
+- 試験（Exam）: Workbook・Workbookタグ・個別問題の動的スコープ、復習 / 練習 / 模試、範囲プレビュー、カバレッジ・練習成績・模試履歴
+- 復習は既存FSRS状態を共有し、練習と模試は FSRS を変更しない。模試は正解・不正解・未回答・採点なしを分離
 - 旧 Electron v1 DB の読み取り専用ステージング検査と移行
 - 完全バックアップ、7世代の日次バックアップ、復元前/削除前/移行前/リセット前の安全バックアップ
 - Light / Dark / System、Cyanアクセント、キーボード操作、GPUI Kit の IME対応 Input
@@ -79,7 +81,7 @@ open "dist/Workbook 2.app"
 
 | キー | 動作 |
 |---|---|
-| `⌘1` / `⌘2` / `⌘3` | Today / Library / History |
+| `⌘1` / `⌘2` / `⌘3` / `⌘4` | Today / Library / History / Exams |
 | `⌘,` | Settings |
 | `⌘O` | JSON教材を読み込む |
 | `⌘F` | Library の検索へ |

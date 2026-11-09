@@ -8,6 +8,181 @@ use workbook_service::{SAMPLE_WORKBOOK_JSON, WorkbookService};
 use workbook_storage::Storage;
 
 #[test]
+fn version_one_data_survives_the_v4_migration() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    create_v1_database(&path);
+    let content = r#"{
+      "format":"workbook","schemaVersion":1,"id":"legacy","revision":1,
+      "title":"Legacy","description":"","language":"ja","tags":["old"],
+      "notes":[{"id":"n","title":"Note","knowledgeCard":"card","questions":[
+        {"id":"q","revision":1,"type":"true_false","prompt":"p","answer":true,"explanation":"e"}
+      ]}]
+    }"#;
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"
+                INSERT INTO workbooks(local_id,source_id,source_revision,title,content_json,imported_at,last_used_at)
+                VALUES('w1','legacy',1,'Legacy','{content}','2026-01-01T00:00:00.000Z',NULL);
+                INSERT INTO notes(workbook_id,note_id,introduced,introduced_at)
+                VALUES('w1','n',1,'2026-01-01T00:00:00.000Z');
+                INSERT INTO questions(workbook_id,question_id,note_id,buried_until)
+                VALUES('w1','q','n',NULL);
+                INSERT INTO review_states(workbook_id,question_id,state,stability,stability_fast,
+                  difficulty,due_at,last_review_at,reps,lapses,scheduled_days,learning_step,
+                  algorithm,policy_version,revision)
+                VALUES('w1','q',2,5.0,5.0,5.0,'2026-02-01T00:00:00.000Z',
+                  '2026-01-01T00:00:00.000Z',2,0,30.0,0,'FSRS-7','workbook2-step-v1',1);
+                "#
+            ))
+            .unwrap();
+    }
+    let storage = Storage::open(dir.path()).unwrap();
+    assert_eq!(storage.workbooks().unwrap().len(), 1);
+    assert_eq!(storage.learned_count("w1").unwrap(), 1);
+    assert!(storage.review_state("w1", "q").unwrap().is_some());
+    assert!(storage.exams(true).unwrap().is_empty());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    let columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name IN ('exam_id','time_limit_seconds')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 2);
+}
+
+fn v3_schema_sql() -> String {
+    workbook_storage::schema::SCHEMA_SQL
+        .replace(
+            "  revision INTEGER NOT NULL DEFAULT 0,\n  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,\n  time_limit_seconds INTEGER\n",
+            "  revision INTEGER NOT NULL DEFAULT 0\n",
+        )
+        .replace(
+            r#"CREATE TABLE exams(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  target_date TEXT,
+  target_score REAL,
+  scope_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  archived_at TEXT
+);
+CREATE INDEX exams_archive ON exams(archived_at, target_date);
+
+"#,
+            "",
+        )
+        .replace(
+            r#"CREATE TABLE mock_answers(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL UNIQUE REFERENCES session_items(id) ON DELETE CASCADE,
+  workbook_id TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  answered_at TEXT NOT NULL,
+  correct INTEGER,
+  answer_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX mock_answers_session ON mock_answers(session_id, answered_at);
+
+"#,
+            "",
+        )
+        .replace(
+            r#"CREATE TABLE mock_results(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  exam_id TEXT NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+  submitted_at TEXT NOT NULL,
+  total INTEGER NOT NULL,
+  correct INTEGER NOT NULL,
+  incorrect INTEGER NOT NULL,
+  unanswered INTEGER NOT NULL,
+  ungraded INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL
+);
+CREATE INDEX mock_results_exam ON mock_results(exam_id, submitted_at DESC);
+
+"#,
+            "",
+        )
+}
+
+fn create_v3_database(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection.execute_batch(&v3_schema_sql()).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA application_id=1463962418; PRAGMA user_version=3;
+             INSERT INTO meta(key,value) VALUES('app','workbook-2');",
+        )
+        .unwrap();
+}
+
+#[test]
+fn version_three_data_survives_the_v4_migration() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    create_v3_database(&path);
+    let content = r#"{
+      "format":"workbook","schemaVersion":1,"id":"v3","revision":1,
+      "title":"V3","description":"","language":"ja","tags":["v3"],
+      "notes":[{"id":"n","title":"Note","knowledgeCard":"card","questions":[
+        {"id":"q","revision":1,"type":"true_false","prompt":"p","answer":true,"explanation":"e"}
+      ]}]
+    }"#;
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"
+                INSERT INTO workbooks(local_id,source_id,source_revision,title,content_json,imported_at,last_used_at)
+                VALUES('w3','v3',1,'V3','{content}','2026-01-01T00:00:00.000Z',NULL);
+                INSERT INTO notes(workbook_id,note_id,introduced,introduced_at)
+                VALUES('w3','n',1,'2026-01-01T00:00:00.000Z');
+                INSERT INTO questions(workbook_id,question_id,note_id,buried_until)
+                VALUES('w3','q','n',NULL);
+                INSERT INTO review_states(workbook_id,question_id,state,stability,stability_fast,
+                  difficulty,due_at,last_review_at,reps,lapses,scheduled_days,learning_step,
+                  algorithm,policy_version,revision)
+                VALUES('w3','q',2,5.0,5.0,5.0,'2026-02-01T00:00:00.000Z',
+                  '2026-01-01T00:00:00.000Z',2,0,30.0,0,'FSRS-7','workbook2-step-v1',1);
+                "#
+            ))
+            .unwrap();
+    }
+    let storage = Storage::open(dir.path()).unwrap();
+    assert_eq!(storage.workbooks().unwrap().len(), 1);
+    assert_eq!(storage.learned_count("w3").unwrap(), 1);
+    assert!(storage.exams(true).unwrap().is_empty());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+               AND name IN ('exams','mock_answers','mock_results')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 3);
+}
+
+#[test]
 fn daily_backups_keep_seven_generations_and_private_permissions() {
     let dir = tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
@@ -33,6 +208,62 @@ fn v1_schema_sql() -> String {
     workbook_storage::schema::SCHEMA_SQL
         .replace("  rating_source TEXT NOT NULL DEFAULT 'manual',\n", "")
         .replace("  assist_json TEXT,\n", "")
+        .replace(
+            "  revision INTEGER NOT NULL DEFAULT 0,\n  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,\n  time_limit_seconds INTEGER\n",
+            "  revision INTEGER NOT NULL DEFAULT 0\n",
+        )
+        .replace(
+            r#"CREATE TABLE exams(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  target_date TEXT,
+  target_score REAL,
+  scope_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  archived_at TEXT
+);
+CREATE INDEX exams_archive ON exams(archived_at, target_date);
+
+"#,
+            "",
+        )
+        .replace(
+            r#"CREATE TABLE mock_answers(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL UNIQUE REFERENCES session_items(id) ON DELETE CASCADE,
+  workbook_id TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  answered_at TEXT NOT NULL,
+  correct INTEGER,
+  answer_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX mock_answers_session ON mock_answers(session_id, answered_at);
+
+"#,
+            "",
+        )
+        .replace(
+            r#"CREATE TABLE mock_results(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  exam_id TEXT NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+  submitted_at TEXT NOT NULL,
+  total INTEGER NOT NULL,
+  correct INTEGER NOT NULL,
+  incorrect INTEGER NOT NULL,
+  unanswered INTEGER NOT NULL,
+  ungraded INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL
+);
+CREATE INDEX mock_results_exam ON mock_results(exam_id, submitted_at DESC);
+
+"#,
+            "",
+        )
         .replace(
             "CREATE TABLE assets(\n  workbook_id TEXT NOT NULL REFERENCES workbooks(local_id) ON DELETE CASCADE,\n  asset_id TEXT NOT NULL,\n  media_type TEXT NOT NULL,\n  alt TEXT NOT NULL,\n  width INTEGER NOT NULL,\n  height INTEGER NOT NULL,\n  bytes BLOB NOT NULL,\n  PRIMARY KEY(workbook_id, asset_id)\n);\n\n",
             "",

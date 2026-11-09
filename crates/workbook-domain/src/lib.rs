@@ -7,6 +7,7 @@
 pub mod answer;
 pub mod calendar;
 pub mod content;
+pub mod exam;
 pub mod grading;
 pub mod question_format;
 pub mod session;
@@ -16,6 +17,10 @@ pub mod workbook;
 pub use answer::{Answer, answer_is_blank, automatic_rating, grade_answer, normalize_answer};
 pub use calendar::{StudyCalendar, learning_day, next_learning_day_start};
 pub use content::{Content, ContentBlock, ImageBlock, ImageFit, ImageSource};
+pub use exam::{
+    Exam, ExamCatalogQuestion, ExamDraft, ExamScope, ExamScopeGroup, ExamStudyMode, MockOptions,
+    MockOrder, PracticeOptions, PracticeStrategy, QuestionRef, resolve_scope,
+};
 pub use grading::{
     AssistState, GradeDiagnostic, GradeResult, GradeStatus, NearMissReason, NearMissRecord,
     grade_answer_detailed,

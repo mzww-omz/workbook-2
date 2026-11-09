@@ -28,11 +28,14 @@ use gpui_kit::{
     WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use workbook_domain::{
-    Answer, Mode, Phase, Question, QuestionType, Rating, Settings, ThemeSetting, Workbook,
-    answer_is_blank,
+    Answer, ExamDraft, ExamScope, ExamScopeGroup, MockOptions, MockOrder, Mode, Phase,
+    PracticeOptions, PracticeStrategy, Question, QuestionRef, QuestionType, Rating, Settings,
+    ThemeSetting, Workbook, answer_is_blank,
 };
 use workbook_import::LegacyPreview;
-use workbook_service::{BookSummary, Snapshot, StudyView, TodaySummary, WorkbookService};
+use workbook_service::{
+    BookSummary, ExamSummary, Snapshot, StudyView, TodaySummary, WorkbookService,
+};
 
 use crate::image_cache::ImageCache;
 
@@ -46,6 +49,9 @@ pub(crate) enum Route {
     BookDetail,
     History,
     Settings,
+    Exams,
+    ExamDetail,
+    ExamEditor,
     Study,
 }
 
@@ -83,6 +89,48 @@ pub(crate) enum Modal {
         preview: LegacyPreview,
     },
     ResetHistory,
+    DeleteExam {
+        id: String,
+        title: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScopeGroupDraft {
+    pub workbook_ids: BTreeSet<String>,
+    pub tags: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct QuestionKey {
+    pub workbook_id: String,
+    pub question_id: String,
+}
+
+impl QuestionKey {
+    pub(crate) fn new(workbook_id: impl Into<String>, question_id: impl Into<String>) -> Self {
+        Self {
+            workbook_id: workbook_id.into(),
+            question_id: question_id.into(),
+        }
+    }
+}
+
+pub(crate) struct ExamEditorState {
+    pub exam_id: Option<String>,
+    pub title: Entity<InputState>,
+    pub description: Entity<InputState>,
+    pub target_date: Entity<InputState>,
+    pub target_score: Entity<InputState>,
+    pub groups: Vec<ScopeGroupDraft>,
+    pub include: BTreeSet<QuestionKey>,
+    pub exclude: BTreeSet<QuestionKey>,
+    pub exclude_tags: BTreeSet<String>,
+    pub exclude_workbooks: BTreeSet<String>,
+    pub catalog: Vec<workbook_domain::ExamCatalogQuestion>,
+    pub preview_count: usize,
+    pub preview_error: Option<String>,
+    pub question_search: Entity<InputState>,
 }
 
 pub struct WorkbookApp {
@@ -93,6 +141,14 @@ pub struct WorkbookApp {
     pub(crate) study: Option<StudyView>,
     pub(crate) selected_book: Option<String>,
     pub(crate) selected_workbook: Option<Workbook>,
+    pub(crate) exams: Vec<ExamSummary>,
+    pub(crate) selected_exam: Option<String>,
+    pub(crate) exam_editor: Option<ExamEditorState>,
+    pub(crate) practice_strategy: PracticeStrategy,
+    pub(crate) practice_limit_input: Entity<InputState>,
+    pub(crate) mock_limit_input: Entity<InputState>,
+    pub(crate) mock_minutes_input: Entity<InputState>,
+    pub(crate) mock_random: bool,
     pub(crate) search: String,
     pub(crate) search_input: Entity<InputState>,
     pub(crate) short_input: Entity<InputState>,
@@ -176,6 +232,12 @@ impl WorkbookApp {
             cx.new(|cx| InputState::new(window, cx).default_value(retention.clone()));
         let settings_new_limit =
             cx.new(|cx| InputState::new(window, cx).default_value(new_limit.clone()));
+        let practice_limit_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("問題数（空=すべて）"));
+        let mock_limit_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("問題数（空=すべて）"));
+        let mock_minutes_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("制限時間（分・空=なし）"));
 
         let mut app = Self {
             service,
@@ -185,6 +247,14 @@ impl WorkbookApp {
             study,
             selected_book: None,
             selected_workbook: None,
+            exams: Vec::new(),
+            selected_exam: None,
+            exam_editor: None,
+            practice_strategy: PracticeStrategy::All,
+            practice_limit_input,
+            mock_limit_input,
+            mock_minutes_input,
+            mock_random: false,
             search: String::new(),
             search_input,
             short_input,
@@ -261,7 +331,8 @@ impl WorkbookApp {
                 cx.background_executor().timer(wait).await;
                 let result = this.update_in(cx, |this, window, cx| {
                     if window.is_window_active()
-                        && !(this.route == Route::Study && this.input_focused(window, cx))
+                        && (!(this.route == Route::Study && this.input_focused(window, cx))
+                            || this.mock_expired())
                     {
                         this.refresh(cx);
                     }
@@ -340,6 +411,24 @@ impl WorkbookApp {
                 if self.route == Route::History {
                     self.history = self.service.history(200).unwrap_or_default();
                 }
+                if matches!(self.route, Route::Exams | Route::ExamDetail) {
+                    self.exams = self.service.exams(true).unwrap_or_default();
+                }
+                if let Some(active) = self.snapshot.active.clone()
+                    && active.mode == Mode::Mock
+                    && active.phase != Phase::OverallResult
+                    && active
+                        .mock
+                        .as_ref()
+                        .and_then(|mock| mock.remaining_ms)
+                        .is_some_and(|remaining| remaining <= 0)
+                    && let Ok(updated) = self
+                        .service
+                        .submit_mock(&active.session_id, active.revision)
+                {
+                    self.study = Some(updated);
+                    self.route = Route::Study;
+                }
                 cx.notify();
             }
             Err(error) => {
@@ -363,6 +452,9 @@ impl WorkbookApp {
         if route == Route::History {
             self.history = self.service.history(200).unwrap_or_default();
         }
+        if matches!(route, Route::Exams | Route::ExamDetail) {
+            self.exams = self.service.exams(true).unwrap_or_default();
+        }
         if route == Route::Settings {
             self.sync_settings_inputs(window, cx);
         }
@@ -377,6 +469,18 @@ impl WorkbookApp {
                 .active
                 .as_ref()
                 .is_some_and(|active| active.session_id == view.session_id)
+        })
+    }
+
+    pub(crate) fn mock_expired(&self) -> bool {
+        self.study.as_ref().is_some_and(|view| {
+            view.mode == Mode::Mock
+                && view.phase != Phase::OverallResult
+                && view
+                    .mock
+                    .as_ref()
+                    .and_then(|mock| mock.remaining_ms)
+                    .is_some_and(|remaining| remaining <= 0)
         })
     }
 
@@ -430,6 +534,454 @@ impl WorkbookApp {
                 self.route = Route::BookDetail;
                 self.notice = None;
                 cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn open_exam(&mut self, id: String, cx: &mut Context<Self>) {
+        match self.service.exams(true) {
+            Ok(exams) => {
+                self.exams = exams;
+                self.selected_exam = Some(id);
+                self.route = Route::ExamDetail;
+                self.notice = None;
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn selected_exam_summary(&self) -> Option<&ExamSummary> {
+        self.selected_exam
+            .as_ref()
+            .and_then(|id| self.exams.iter().find(|summary| &summary.exam.id == id))
+    }
+
+    pub(crate) fn open_exam_editor(
+        &mut self,
+        exam_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let catalog = match self.service.exam_catalog() {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let existing = match exam_id.as_deref() {
+            Some(id) => match self.service.exam(id) {
+                Ok(exam) => Some(exam),
+                Err(error) => {
+                    self.notice_error(error.to_string());
+                    cx.notify();
+                    return;
+                }
+            },
+            None => None,
+        };
+        let title = existing
+            .as_ref()
+            .map(|exam| exam.title.clone())
+            .unwrap_or_default();
+        let description = existing
+            .as_ref()
+            .and_then(|exam| exam.description.clone())
+            .unwrap_or_default();
+        let target_date = existing
+            .as_ref()
+            .and_then(|exam| exam.target_date)
+            .map(|date| date.to_string())
+            .unwrap_or_default();
+        let target_score = existing
+            .as_ref()
+            .and_then(|exam| exam.target_score)
+            .map(|score| format!("{score}"))
+            .unwrap_or_default();
+        let (groups, include, exclude, exclude_tags, exclude_workbooks) = existing
+            .as_ref()
+            .map(|exam| {
+                (
+                    exam.scope
+                        .groups
+                        .iter()
+                        .map(|group| ScopeGroupDraft {
+                            workbook_ids: group.workbook_ids.iter().cloned().collect(),
+                            tags: group.tags.iter().cloned().collect(),
+                        })
+                        .collect::<Vec<_>>(),
+                    exam.scope
+                        .include_questions
+                        .iter()
+                        .map(|reference| {
+                            QuestionKey::new(
+                                reference.workbook_id.clone(),
+                                reference.question_id.clone(),
+                            )
+                        })
+                        .collect::<BTreeSet<_>>(),
+                    exam.scope
+                        .exclude_questions
+                        .iter()
+                        .map(|reference| {
+                            QuestionKey::new(
+                                reference.workbook_id.clone(),
+                                reference.question_id.clone(),
+                            )
+                        })
+                        .collect::<BTreeSet<_>>(),
+                    exam.scope.exclude_tags.iter().cloned().collect(),
+                    exam.scope.exclude_workbooks.iter().cloned().collect(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    vec![ScopeGroupDraft::default()],
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                )
+            });
+        let title_input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let description_input = cx.new(|cx| InputState::new(window, cx).default_value(description));
+        let target_date_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("YYYY-MM-DD（任意）")
+                .default_value(target_date)
+        });
+        let target_score_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("目標スコア（任意）")
+                .default_value(target_score)
+        });
+        let question_search = cx.new(|cx| InputState::new(window, cx).placeholder("問題を検索"));
+        self.exam_editor = Some(ExamEditorState {
+            exam_id,
+            title: title_input,
+            description: description_input,
+            target_date: target_date_input,
+            target_score: target_score_input,
+            groups,
+            include,
+            exclude,
+            exclude_tags,
+            exclude_workbooks,
+            catalog,
+            preview_count: 0,
+            preview_error: None,
+            question_search,
+        });
+        self.refresh_exam_preview(cx);
+        self.route = Route::ExamEditor;
+        self.notice = None;
+        cx.notify();
+    }
+
+    fn editor_scope(&self) -> Option<ExamScope> {
+        let editor = self.exam_editor.as_ref()?;
+        Some(ExamScope {
+            groups: editor
+                .groups
+                .iter()
+                .filter(|group| !group.workbook_ids.is_empty() || !group.tags.is_empty())
+                .map(|group| ExamScopeGroup {
+                    workbook_ids: group.workbook_ids.iter().cloned().collect(),
+                    tags: group.tags.iter().cloned().collect(),
+                })
+                .collect(),
+            include_questions: editor
+                .include
+                .iter()
+                .map(|key| QuestionRef::new(key.workbook_id.clone(), key.question_id.clone()))
+                .collect(),
+            exclude_questions: editor
+                .exclude
+                .iter()
+                .map(|key| QuestionRef::new(key.workbook_id.clone(), key.question_id.clone()))
+                .collect(),
+            exclude_workbooks: editor.exclude_workbooks.iter().cloned().collect(),
+            exclude_tags: editor.exclude_tags.iter().cloned().collect(),
+        })
+    }
+
+    pub(crate) fn refresh_exam_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(scope) = self.editor_scope() else {
+            return;
+        };
+        match self.service.preview_exam_scope(&scope) {
+            Ok(questions) => {
+                if let Some(editor) = self.exam_editor.as_mut() {
+                    editor.preview_count = questions.len();
+                    editor.preview_error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(editor) = self.exam_editor.as_mut() {
+                    editor.preview_error = Some(error.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn save_exam(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.exam_editor.as_ref() else {
+            return;
+        };
+        let title = editor.title.read(cx).value().to_string();
+        let description = editor.description.read(cx).value().to_string();
+        let date_text = editor.target_date.read(cx).value().to_string();
+        let score_text = editor.target_score.read(cx).value().to_string();
+        let target_date = if date_text.trim().is_empty() {
+            None
+        } else {
+            match chrono::NaiveDate::parse_from_str(date_text.trim(), "%Y-%m-%d") {
+                Ok(date) => Some(date),
+                Err(_) => {
+                    self.notice_error("目標日は YYYY-MM-DD 形式で入力してください");
+                    window.focus(&self.root_focus, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let target_score = if score_text.trim().is_empty() {
+            None
+        } else {
+            match score_text.trim().parse::<f64>() {
+                Ok(score) if score.is_finite() && score >= 0.0 => Some(score),
+                _ => {
+                    self.notice_error("目標スコアは0以上の数値で入力してください");
+                    window.focus(&self.root_focus, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let Some(scope) = self.editor_scope() else {
+            return;
+        };
+        let description = description.trim();
+        let draft = ExamDraft {
+            title,
+            description: (!description.is_empty()).then(|| description.to_string()),
+            target_date,
+            target_score,
+            scope,
+        };
+        let exam_id = editor.exam_id.clone();
+        let result = match exam_id.as_deref() {
+            Some(id) => self.service.update_exam(id, draft).map(|_| id.to_string()),
+            None => self.service.create_exam(draft),
+        };
+        match result {
+            Ok(id) => {
+                self.open_exam(id, cx);
+                self.notice_success("試験を保存しました");
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                window.focus(&self.root_focus, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn enter_started_study(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh(cx);
+        if let Some(active) = self.snapshot.active.clone() {
+            self.study = Some(active);
+            self.route = Route::Study;
+            self.notice = None;
+            self.prepare_question(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn start_exam_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_exam.clone() else {
+            return;
+        };
+        match self.service.start_exam_review(&id) {
+            Ok(()) => self.enter_started_study(window, cx),
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn start_exam_practice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_exam.clone() else {
+            return;
+        };
+        let limit_text = self.practice_limit_input.read(cx).value().to_string();
+        let question_limit = match parse_optional_u32(&limit_text) {
+            Ok(value) => value,
+            Err(()) => {
+                self.notice_error("問題数は0以上の整数で入力してください");
+                cx.notify();
+                return;
+            }
+        };
+        let options = PracticeOptions {
+            strategy: self.practice_strategy,
+            question_limit,
+        };
+        match self.service.start_exam_practice(&id, &options) {
+            Ok(()) => self.enter_started_study(window, cx),
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn start_exam_mock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_exam.clone() else {
+            return;
+        };
+        let limit_text = self.mock_limit_input.read(cx).value().to_string();
+        let minutes_text = self.mock_minutes_input.read(cx).value().to_string();
+        let question_limit = match parse_optional_u32(&limit_text) {
+            Ok(value) => value,
+            Err(()) => {
+                self.notice_error("問題数は0以上の整数で入力してください");
+                cx.notify();
+                return;
+            }
+        };
+        let minutes = match parse_optional_u32(&minutes_text) {
+            Ok(value) => value,
+            Err(()) => {
+                self.notice_error("制限時間は0以上の整数で入力してください");
+                cx.notify();
+                return;
+            }
+        };
+        let options = MockOptions {
+            question_limit,
+            time_limit_seconds: minutes.map(|minutes| minutes.saturating_mul(60)),
+            order: if self.mock_random {
+                MockOrder::Random
+            } else {
+                MockOrder::Fixed
+            },
+        };
+        match self.service.start_exam_mock(&id, &options) {
+            Ok(()) => self.enter_started_study(window, cx),
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn submit_mock_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.study.clone() else {
+            return;
+        };
+        if view.phase == Phase::WorkbookResult {
+            return self.submit_mock_session(window, cx);
+        }
+        let Some(question) = view.question.as_ref() else {
+            return;
+        };
+        if question.kind == QuestionType::Flashcard && !view.revealed {
+            self.reveal_flashcard(window, cx);
+            return;
+        }
+        let answer = if question.kind == QuestionType::Flashcard {
+            Some(Answer::Bool(true))
+        } else {
+            self.current_answer(question, cx)
+        };
+        if answer_is_blank(answer.as_ref()) {
+            self.notice_info("回答を入力してください");
+            cx.notify();
+            return;
+        }
+        match self
+            .service
+            .mock_answer(&view.session_id, answer.as_ref(), view.revision)
+        {
+            Ok(updated) => {
+                self.study = Some(updated);
+                self.prepare_question(window, cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn submit_mock_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.study.clone() else {
+            return;
+        };
+        match self.service.submit_mock(&view.session_id, view.revision) {
+            Ok(updated) => {
+                self.study = Some(updated);
+                self.modal = None;
+                self.refresh(cx);
+                window.focus(&self.root_focus, cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn toggle_exam_archive(
+        &mut self,
+        id: String,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match self.service.archive_exam(&id, archived) {
+            Ok(()) => {
+                self.notice_success(if archived {
+                    "試験をアーカイブしました"
+                } else {
+                    "試験を再開しました"
+                });
+                self.exams = self.service.exams(true).unwrap_or_default();
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn confirm_delete_exam(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.service.delete_exam(&id) {
+            Ok(()) => {
+                self.modal = None;
+                self.exams = self.service.exams(true).unwrap_or_default();
+                self.selected_exam = None;
+                self.notice_success("試験を削除しました");
+                self.go(Route::Exams, window, cx);
             }
             Err(error) => {
                 self.notice_error(error.to_string());
@@ -578,6 +1130,9 @@ impl WorkbookApp {
         let Some(view) = self.study.clone() else {
             return;
         };
+        if view.mode == Mode::Mock {
+            return self.submit_mock_question(window, cx);
+        }
         match view.phase {
             Phase::Intro => self.begin_question(window, cx),
             Phase::Feedback => {
@@ -1071,6 +1626,44 @@ impl WorkbookApp {
                 .focus_handle(cx)
                 .is_focused(window);
         focused |= self
+            .practice_limit_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+            || self
+                .mock_limit_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .mock_minutes_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window);
+        if let Some(editor) = self.exam_editor.as_ref() {
+            focused |= editor.title.read(cx).focus_handle(cx).is_focused(window)
+                || editor
+                    .description
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+                || editor
+                    .target_date
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+                || editor
+                    .target_score
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+                || editor
+                    .question_search
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+        }
+        focused |= self
             .cloze_inputs
             .iter()
             .any(|(_, input)| input.read(cx).focus_handle(cx).is_focused(window));
@@ -1103,6 +1696,10 @@ impl WorkbookApp {
                 }
                 "3" => {
                     self.go(Route::History, window, cx);
+                    return;
+                }
+                "4" => {
+                    self.go(Route::Exams, window, cx);
                     return;
                 }
                 "," => {
@@ -1603,6 +2200,15 @@ impl Render for WorkbookApp {
             root = root.child(self.render_modal(modal, cx));
         }
         root
+    }
+}
+
+fn parse_optional_u32(value: &str) -> std::result::Result<Option<u32>, ()> {
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        value.parse::<u32>().map(Some).map_err(|_| ())
     }
 }
 

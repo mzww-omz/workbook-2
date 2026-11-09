@@ -8,8 +8,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 use workbook_domain::{
-    AssetContent, AssistState, CardState, Mode, Phase, RatingSource, SessionItemStatus,
-    SessionStatus, Settings, StoredCard, StudyCalendar, ThemeSetting, Workbook, parse_workbook,
+    AssetContent, AssistState, CardState, Exam, ExamScope, Mode, Phase, RatingSource,
+    SessionItemStatus, SessionStatus, Settings, StoredCard, StudyCalendar, ThemeSetting, Workbook,
+    parse_workbook,
 };
 use workbook_import::{
     LegacyAttempt, LegacyPlan, LegacySession, LegacySessionItem, LegacySessionWorkbook,
@@ -96,6 +97,48 @@ pub struct SessionRow {
     pub cursor_kind: String,
     pub assist_json: Option<String>,
     pub revision: u64,
+    pub exam_id: Option<String>,
+    pub time_limit_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MockAnswerRow {
+    pub id: String,
+    pub session_id: String,
+    pub item_id: String,
+    pub workbook_id: String,
+    pub note_id: String,
+    pub question_id: String,
+    pub answered_at: DateTime<Utc>,
+    pub correct: Option<bool>,
+    pub answer_json: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MockResultRow {
+    pub session_id: String,
+    pub exam_id: String,
+    pub submitted_at: DateTime<Utc>,
+    pub total: u32,
+    pub correct: u32,
+    pub incorrect: u32,
+    pub unanswered: u32,
+    pub ungraded: u32,
+    pub duration_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExamPracticeStats {
+    pub attempts: usize,
+    pub graded: usize,
+    pub correct: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuestionAttemptStat {
+    pub attempts: usize,
+    pub incorrect: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -499,6 +542,286 @@ impl Storage {
         Ok(())
     }
 
+    // ---- exams ----------------------------------------------------------
+
+    pub fn exams(&self, include_archived: bool) -> Result<Vec<Exam>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,title,description,target_date,target_score,scope_json,
+                    created_at,updated_at,archived_at
+             FROM exams
+             WHERE ?1=1 OR archived_at IS NULL
+             ORDER BY archived_at IS NOT NULL,
+                      COALESCE(target_date,'9999-12-31'),
+                      updated_at DESC, title, id",
+        )?;
+        let rows = statement.query_map([i64::from(include_archived)], map_exam)?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
+    pub fn exam(&self, id: &str) -> Result<Exam> {
+        self.connection()?
+            .query_row(
+                "SELECT id,title,description,target_date,target_score,scope_json,
+                        created_at,updated_at,archived_at
+                 FROM exams WHERE id=?1",
+                [id],
+                map_exam,
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("Exam {id}")))
+    }
+
+    pub fn insert_exam(&mut self, exam: &Exam) -> Result<()> {
+        let scope_json = serde_json::to_string(&exam.scope)?;
+        self.connection()?.execute(
+            "INSERT INTO exams(id,title,description,target_date,target_score,scope_json,
+                    created_at,updated_at,archived_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                exam.id,
+                exam.title,
+                exam.description,
+                exam.target_date.map(|date| date.to_string()),
+                exam.target_score,
+                scope_json,
+                format_ts(exam.created_at),
+                format_ts(exam.updated_at),
+                exam.archived_at.map(format_ts),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_exam(&mut self, exam: &Exam) -> Result<()> {
+        let scope_json = serde_json::to_string(&exam.scope)?;
+        let changed = self.connection()?.execute(
+            "UPDATE exams SET title=?1,description=?2,target_date=?3,target_score=?4,
+                    scope_json=?5,updated_at=?6,archived_at=?7 WHERE id=?8",
+            params![
+                exam.title,
+                exam.description,
+                exam.target_date.map(|date| date.to_string()),
+                exam.target_score,
+                scope_json,
+                format_ts(exam.updated_at),
+                exam.archived_at.map(format_ts),
+                exam.id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("Exam {}", exam.id)));
+        }
+        Ok(())
+    }
+
+    pub fn archive_exam(&mut self, id: &str, archived: bool, now: DateTime<Utc>) -> Result<()> {
+        let changed = self.connection()?.execute(
+            "UPDATE exams SET archived_at=?1,updated_at=?2 WHERE id=?3",
+            params![
+                if archived { Some(format_ts(now)) } else { None },
+                format_ts(now),
+                id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("Exam {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn delete_exam(&mut self, id: &str) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let active: Option<String> = connection
+            .query_row(
+                "SELECT id FROM sessions WHERE status='active' AND exam_id=?1 LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if active.is_some() {
+            return Err(StorageError::Conflict(
+                "この試験の学習中は削除できません".to_string(),
+            ));
+        }
+        let transaction = connection.transaction()?;
+        // Mock answers/results are assessment-local. Deleting the exam removes
+        // those sessions; ordinary Review/Practice sessions keep their attempts
+        // and become unlinked through ON DELETE SET NULL.
+        transaction.execute(
+            "DELETE FROM sessions WHERE exam_id=?1 AND mode='mock'",
+            [id],
+        )?;
+        let changed = transaction.execute("DELETE FROM exams WHERE id=?1", [id])?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("Exam {id}")));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Attempt counts by question, used by Practice selection strategies.
+    /// Only deterministic attempt history is counted; practice answers are
+    /// already stored in `attempts` without touching FSRS.
+    pub fn question_attempt_stats(&self) -> Result<Vec<(String, String, QuestionAttemptStat)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT workbook_id,question_id,COUNT(*),
+                    COALESCE(SUM(CASE WHEN correct=0 THEN 1 ELSE 0 END),0)
+             FROM attempts GROUP BY workbook_id,question_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                QuestionAttemptStat {
+                    attempts: row.get::<_, i64>(2)? as usize,
+                    incorrect: row.get::<_, i64>(3)? as usize,
+                },
+            ))
+        })?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
+    pub fn exam_practice_stats(&self, exam_id: &str) -> Result<ExamPracticeStats> {
+        let connection = self.connection()?;
+        let (attempts, graded, correct): (i64, i64, i64) = connection.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN a.correct IS NOT NULL THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN a.correct=1 THEN 1 ELSE 0 END),0)
+             FROM attempts a JOIN sessions s ON s.id=a.session_id
+             WHERE s.exam_id=?1 AND s.mode='practice'",
+            [exam_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(ExamPracticeStats {
+            attempts: attempts as usize,
+            graded: graded as usize,
+            correct: correct as usize,
+        })
+    }
+
+    pub fn mock_answers_for_session(&self, session_id: &str) -> Result<Vec<MockAnswerRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,session_id,item_id,workbook_id,note_id,question_id,answered_at,
+                    correct,answer_json,created_at
+             FROM mock_answers WHERE session_id=?1 ORDER BY answered_at, rowid",
+        )?;
+        let rows = statement.query_map([session_id], map_mock_answer)?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
+    pub fn record_mock_answer(
+        &mut self,
+        answer: &MockAnswerRow,
+        session: &SessionRow,
+    ) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO mock_answers(id,session_id,item_id,workbook_id,note_id,question_id,
+                    answered_at,correct,answer_json,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                answer.id,
+                answer.session_id,
+                answer.item_id,
+                answer.workbook_id,
+                answer.note_id,
+                answer.question_id,
+                format_ts(answer.answered_at),
+                answer.correct.map(i64::from),
+                answer.answer_json,
+                format_ts(answer.created_at),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE session_items SET status='answered' WHERE id=?1",
+            [&answer.item_id],
+        )?;
+        update_session_row(&transaction, session)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_mock(&mut self, result: &MockResultRow, session: &SessionRow) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO mock_results(session_id,exam_id,submitted_at,total,correct,incorrect,
+                    unanswered,ungraded,duration_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(session_id) DO UPDATE SET
+               submitted_at=excluded.submitted_at,total=excluded.total,correct=excluded.correct,
+               incorrect=excluded.incorrect,unanswered=excluded.unanswered,
+               ungraded=excluded.ungraded,duration_ms=excluded.duration_ms",
+            params![
+                result.session_id,
+                result.exam_id,
+                format_ts(result.submitted_at),
+                result.total as i64,
+                result.correct as i64,
+                result.incorrect as i64,
+                result.unanswered as i64,
+                result.ungraded as i64,
+                result.duration_ms,
+            ],
+        )?;
+        update_session_row(&transaction, session)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mock_result(&self, session_id: &str) -> Result<Option<MockResultRow>> {
+        self.connection()?
+            .query_row(
+                "SELECT session_id,exam_id,submitted_at,total,correct,incorrect,unanswered,
+                        ungraded,duration_ms
+                 FROM mock_results WHERE session_id=?1",
+                [session_id],
+                map_mock_result,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn mock_results(&self, exam_id: &str, limit: usize) -> Result<Vec<MockResultRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT session_id,exam_id,submitted_at,total,correct,incorrect,unanswered,
+                    ungraded,duration_ms
+             FROM mock_results WHERE exam_id=?1 ORDER BY submitted_at DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![exam_id, limit as i64], map_mock_result)?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
     // ---- notes / review states -----------------------------------------
 
     pub fn note_introduced(&self, workbook_id: &str, note_id: &str) -> Result<bool> {
@@ -835,7 +1158,8 @@ impl Storage {
             .query_row(
                 "SELECT id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,phase,
                         draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
-                        question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision
+                        question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision,
+                        exam_id,time_limit_seconds
                  FROM sessions WHERE id=?1",
                 [session_id],
                 map_session,
@@ -1035,7 +1359,8 @@ impl Storage {
     pub fn history(&self, limit: usize) -> Result<Vec<SessionBundle>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id FROM sessions WHERE status='ended' ORDER BY started_at DESC LIMIT ?1",
+            "SELECT id FROM sessions WHERE status='ended' AND mode<>'mock'
+             ORDER BY started_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit as i64], |row| row.get::<_, String>(0))?;
         let mut ids = Vec::new();
@@ -1381,6 +1706,31 @@ impl Storage {
                     .map_err(|error| StorageError::Validation(format!("assist_json: {error}")))?;
             }
         }
+        if version >= 4 {
+            let mut statement = connection.prepare(
+                "SELECT id,title,description,target_date,target_score,scope_json,
+                        created_at,updated_at,archived_at FROM exams",
+            )?;
+            let rows = statement.query_map([], map_exam)?;
+            for row in rows {
+                let exam = row.map_err(|error| StorageError::Validation(error.to_string()))?;
+                exam.validate()
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
+            }
+            let mut statement = connection.prepare(
+                "SELECT session_id,exam_id,submitted_at,total,correct,incorrect,unanswered,
+                        ungraded,duration_ms FROM mock_results",
+            )?;
+            let rows = statement.query_map([], map_mock_result)?;
+            for row in rows {
+                let result = row.map_err(|error| StorageError::Validation(error.to_string()))?;
+                if result.correct + result.incorrect + result.ungraded > result.total {
+                    return Err(StorageError::Validation(
+                        "模試結果の件数が不正です".to_string(),
+                    ));
+                }
+            }
+        }
         let mut statement = connection.prepare(
             "SELECT state,stability,stability_fast,difficulty,due_at,last_review_at,reps,lapses,
                     scheduled_days,learning_step,algorithm,policy_version,revision FROM review_states",
@@ -1560,6 +1910,8 @@ impl Storage {
             .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM attempts", [])?;
+        transaction.execute("DELETE FROM mock_answers", [])?;
+        transaction.execute("DELETE FROM mock_results", [])?;
         transaction.execute("DELETE FROM session_items", [])?;
         transaction.execute("DELETE FROM session_workbooks", [])?;
         transaction.execute("DELETE FROM sessions", [])?;
@@ -1604,6 +1956,8 @@ fn insert_legacy_session(
         cursor_kind: session.cursor_kind.clone(),
         assist_json: None,
         revision: session.revision,
+        exam_id: None,
+        time_limit_seconds: None,
     };
     insert_session(transaction, &row)?;
     for item in &session.items {
@@ -1667,8 +2021,9 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
     transaction.execute(
         "INSERT INTO sessions(id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,
                 phase,draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
-                question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision,
+                exam_id,time_limit_seconds)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             session.id,
             session.mode.as_str(),
@@ -1691,7 +2046,9 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
             session.question_elapsed_ms,
             session.cursor_kind,
             session.assist_json,
-            session.revision as i64
+            session.revision as i64,
+            session.exam_id,
+            session.time_limit_seconds.map(i64::from)
         ],
     )?;
     Ok(())
@@ -1702,7 +2059,8 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
         "UPDATE sessions SET mode=?1,status=?2,started_at=?3,ended_at=?4,current_workbook_id=?5,
                 current_item_id=?6,phase=?7,draft_json=?8,hint=?9,revealed=?10,pending_correct=?11,
                 pending_unknown=?12,pending_at=?13,question_started_at=?14,question_elapsed_ms=?15,
-                cursor_kind=?16,assist_json=?17,revision=?18 WHERE id=?19",
+                cursor_kind=?16,assist_json=?17,revision=?18,exam_id=?19,time_limit_seconds=?20
+                WHERE id=?21",
         params![
             session.mode.as_str(),
             match session.status {
@@ -1725,6 +2083,8 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
             session.cursor_kind,
             session.assist_json,
             session.revision as i64,
+            session.exam_id,
+            session.time_limit_seconds.map(i64::from),
             session.id
         ],
     )?;
@@ -2015,6 +2375,70 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         cursor_kind: row.get(16)?,
         assist_json: row.get(17)?,
         revision: row.get::<_, i64>(18)? as u64,
+        exam_id: row.get(19)?,
+        time_limit_seconds: row
+            .get::<_, Option<i64>>(20)?
+            .and_then(|value| u32::try_from(value).ok()),
+    })
+}
+
+fn map_exam(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exam> {
+    let target_date: Option<String> = row.get(3)?;
+    let scope_json: String = row.get(5)?;
+    Ok(Exam {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        target_date: target_date
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|_| {
+                to_sql_error(StorageError::Validation(
+                    "target_dateが不正です".to_string(),
+                ))
+            })?,
+        target_score: row.get(4)?,
+        scope: serde_json::from_str::<ExamScope>(&scope_json)
+            .map_err(StorageError::from)
+            .map_err(to_sql_error)?,
+        created_at: parse_ts(&row.get::<_, String>(6)?).map_err(to_sql_error)?,
+        updated_at: parse_ts(&row.get::<_, String>(7)?).map_err(to_sql_error)?,
+        archived_at: row
+            .get::<_, Option<String>>(8)?
+            .as_deref()
+            .map(parse_ts)
+            .transpose()
+            .map_err(to_sql_error)?,
+    })
+}
+
+fn map_mock_answer(row: &rusqlite::Row<'_>) -> rusqlite::Result<MockAnswerRow> {
+    Ok(MockAnswerRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        item_id: row.get(2)?,
+        workbook_id: row.get(3)?,
+        note_id: row.get(4)?,
+        question_id: row.get(5)?,
+        answered_at: parse_ts(&row.get::<_, String>(6)?).map_err(to_sql_error)?,
+        correct: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
+        answer_json: row.get(8)?,
+        created_at: parse_ts(&row.get::<_, String>(9)?).map_err(to_sql_error)?,
+    })
+}
+
+fn map_mock_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<MockResultRow> {
+    Ok(MockResultRow {
+        session_id: row.get(0)?,
+        exam_id: row.get(1)?,
+        submitted_at: parse_ts(&row.get::<_, String>(2)?).map_err(to_sql_error)?,
+        total: row.get::<_, i64>(3)? as u32,
+        correct: row.get::<_, i64>(4)? as u32,
+        incorrect: row.get::<_, i64>(5)? as u32,
+        unanswered: row.get::<_, i64>(6)? as u32,
+        ungraded: row.get::<_, i64>(7)? as u32,
+        duration_ms: row.get(8)?,
     })
 }
 
@@ -2125,6 +2549,49 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
                bytes BLOB NOT NULL,
                PRIMARY KEY(workbook_id, asset_id)
              );",
+        )?;
+    }
+    if from < 4 {
+        transaction.execute_batch(
+            "CREATE TABLE exams(
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               description TEXT,
+               target_date TEXT,
+               target_score REAL,
+               scope_json TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               archived_at TEXT
+             );
+             CREATE INDEX exams_archive ON exams(archived_at, target_date);
+             ALTER TABLE sessions ADD COLUMN exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL;
+             ALTER TABLE sessions ADD COLUMN time_limit_seconds INTEGER;
+             CREATE TABLE mock_answers(
+               id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               item_id TEXT NOT NULL UNIQUE REFERENCES session_items(id) ON DELETE CASCADE,
+               workbook_id TEXT NOT NULL,
+               note_id TEXT NOT NULL,
+               question_id TEXT NOT NULL,
+               answered_at TEXT NOT NULL,
+               correct INTEGER,
+               answer_json TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX mock_answers_session ON mock_answers(session_id, answered_at);
+             CREATE TABLE mock_results(
+               session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+               exam_id TEXT NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+               submitted_at TEXT NOT NULL,
+               total INTEGER NOT NULL,
+               correct INTEGER NOT NULL,
+               incorrect INTEGER NOT NULL,
+               unanswered INTEGER NOT NULL,
+               ungraded INTEGER NOT NULL,
+               duration_ms INTEGER NOT NULL
+             );
+             CREATE INDEX mock_results_exam ON mock_results(exam_id, submitted_at DESC);",
         )?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;

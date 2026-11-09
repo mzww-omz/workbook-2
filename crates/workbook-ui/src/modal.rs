@@ -237,6 +237,38 @@ impl WorkbookApp {
                         .into_any_element(),
                 )
             }
+            Modal::DeleteExam { id, title } => (
+                "試験を削除しますか？".to_string(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!("「{title}」を削除します。"))
+                    .child("問題・FSRS状態・教材は削除されません。試験の条件と模試履歴は削除されます。")
+                    .child("削除前に安全用バックアップを自動作成します。")
+                    .into_any_element(),
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("modal-delete-exam-cancel")
+                            .label("キャンセル")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("modal-delete-exam-confirm")
+                            .label("削除する")
+                            .danger()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_delete_exam(id.clone(), window, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            ),
             Modal::ResetHistory => (
                 "学習履歴をリセット".to_string(),
                 div()

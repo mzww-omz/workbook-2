@@ -206,3 +206,21 @@ v1/v2のバックアップも復元時に同じ移行を行う。
   操作前バックアップはユーザーが明示的に削除するまで保持する。
 - 復元は別DBで application_id / user_version / スキーマ / trigger / integrity / FK / 教材JSON / settings / review_states を検証
 - 復元失敗時は旧DBへ戻す
+
+## Exam
+
+```text
+Exam scope (JSON)
+  │  resolve_scope（純粋関数、現在のWorkbook一覧とタグ）
+  ▼
+ScopeQuestion [(workbook_id, question_id)]
+  │
+  ├─ Review   → 既存 review_candidates を範囲で絞り、既存 Session / Attempt / FSRS を共有
+  ├─ Practice → 戦略で絞り、既存 Session / attempts に記録。review_states は書かない
+  └─ Mock     → session_items を固定し、mock_answers / mock_results に記録
+```
+
+スコープ解決は `workbook-domain/src/exam.rs` の純粋関数で、DB にも UI にも依存しない。
+`workbook-service` は教材一覧からカタログを構築して解決し、セッション開始時に
+`session_items` へ固定する。したがって、学習中に教材をインポートしてもその
+セッションの出題は変わらない。統計・プレビューは毎回現在のカタログから再計算する。

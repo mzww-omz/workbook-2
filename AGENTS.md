@@ -23,6 +23,7 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 | Setup and usage | `README.md` |
 | Architecture and data flow | `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` |
 | FSRS compatibility and legacy audit | `docs/COMPATIBILITY.md`, `docs/AUDIT.md` |
+| 試験のスコープ・学習モード・統計 | `docs/EXAMS.md` |
 | Linter CLI and diagnostic codes | `docs/WORKBOOK-LINTER.md` |
 | AI authoring workflow and samples | `.agents/skills/workbook-authoring/SKILL.md` |
 | Migration and restore | `docs/MIGRATION.md` |

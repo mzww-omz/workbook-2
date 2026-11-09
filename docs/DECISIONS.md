@@ -160,3 +160,13 @@
   削除する。任意ディレクトリの `remove_dir_all` は行わない
 - 通常 Import も検証成功後に一意名の `pre-import-*.sqlite` を作る。バックアップ失敗時は
   Import しない。日次バックアップのみ7世代で、操作前バックアップは自動削除しない
+
+## 18. Exam はコピーせず条件を保持する
+
+- Exam は Question を複製せず、Workbook / Workbookタグ / 個別問題の条件を JSON で保存する
+- 条件は `OR` グループ内の `AND`、同一条件内の複数値は `OR`。除外は包含の後に適用する
+- 解決は毎回現在の教材一覧から行い、セッション開始時に `session_items` として固定する
+- Review は既存の FSRS 状態・スケジューラ・兄弟抑制をそのまま共有する
+- Practice と Mock は `attempts` / `mock_answers` に記録し、`review_states` を変更しない
+- Mock は正解・不正解・未回答・採点なしを分離し、得点の分母は正解 + 不正解とする
+- schema v4 で `exams`、`mock_answers`、`mock_results` と session の exam/time-limit 列を追加する
