@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -29,6 +29,28 @@ CREATE TABLE questions(
   FOREIGN KEY(workbook_id, note_id) REFERENCES notes(workbook_id, note_id) ON DELETE CASCADE
 );
 CREATE INDEX questions_note ON questions(workbook_id, note_id);
+
+CREATE TABLE topics(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  name_key TEXT NOT NULL,
+  parent_id TEXT REFERENCES topics(id) ON DELETE RESTRICT,
+  description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX topics_parent_name ON topics(IFNULL(parent_id,''), name_key);
+CREATE INDEX topics_parent ON topics(parent_id);
+
+CREATE TABLE question_topics(
+  workbook_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  PRIMARY KEY(workbook_id, question_id, topic_id),
+  FOREIGN KEY(workbook_id, question_id)
+    REFERENCES questions(workbook_id, question_id) ON DELETE CASCADE
+);
+CREATE INDEX question_topics_topic ON question_topics(topic_id, workbook_id, question_id);
 
 CREATE TABLE assets(
   workbook_id TEXT NOT NULL REFERENCES workbooks(local_id) ON DELETE CASCADE,
@@ -205,6 +227,25 @@ pub const EXPECTED_TABLES: &[&str] = &[
     "mock_answers",
     "mock_results",
     "notes",
+    "question_topics",
+    "questions",
+    "review_states",
+    "session_items",
+    "session_workbooks",
+    "sessions",
+    "settings",
+    "topics",
+    "workbooks",
+];
+
+pub const EXPECTED_TABLES_V6: &[&str] = &[
+    "assets",
+    "attempts",
+    "exams",
+    "meta",
+    "mock_answers",
+    "mock_results",
+    "notes",
     "questions",
     "review_states",
     "session_items",
@@ -233,6 +274,8 @@ pub fn expected_tables(version: i64) -> &'static [&'static str] {
         EXPECTED_TABLES_V1
     } else if version < 4 {
         EXPECTED_TABLES_V3
+    } else if version < 7 {
+        EXPECTED_TABLES_V6
     } else {
         EXPECTED_TABLES
     }

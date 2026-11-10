@@ -50,11 +50,15 @@ pub struct ExamScopeGroup {
     pub workbook_ids: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Topic IDs. Selecting a topic also includes its descendants; the service
+    /// expands the hierarchy before resolution.
+    #[serde(default)]
+    pub topics: Vec<String>,
 }
 
 impl ExamScopeGroup {
     pub fn is_empty(&self) -> bool {
-        self.workbook_ids.is_empty() && self.tags.is_empty()
+        self.workbook_ids.is_empty() && self.tags.is_empty() && self.topics.is_empty()
     }
 }
 
@@ -82,6 +86,8 @@ pub struct ExamScope {
     pub exclude_workbooks: Vec<String>,
     #[serde(default)]
     pub exclude_tags: Vec<String>,
+    #[serde(default)]
+    pub exclude_topics: Vec<String>,
 }
 
 impl ExamScope {
@@ -117,6 +123,14 @@ impl ExamScope {
                     ));
                 }
             }
+            for (i, topic) in group.topics.iter().enumerate() {
+                if topic.trim().is_empty() {
+                    return Err(ValidationError::new(
+                        format!("scope.groups[{index}].topics[{i}]"),
+                        "Topic IDが空です",
+                    ));
+                }
+            }
         }
         for (field, refs) in [
             ("scope.includeQuestions", &self.include_questions),
@@ -144,6 +158,14 @@ impl ExamScope {
                 return Err(ValidationError::new(
                     format!("scope.excludeTags[{index}]"),
                     "除外タグが空です",
+                ));
+            }
+        }
+        for (index, topic) in self.exclude_topics.iter().enumerate() {
+            if topic.trim().is_empty() {
+                return Err(ValidationError::new(
+                    format!("scope.excludeTopics[{index}]"),
+                    "除外Topic IDが空です",
                 ));
             }
         }
@@ -176,6 +198,8 @@ pub struct ExamCatalogQuestion {
     /// history exists.
     pub question_kind: String,
     pub workbook_tags: Vec<String>,
+    /// Stable topic IDs assigned to this question. Empty when none.
+    pub topic_ids: Vec<String>,
 }
 
 impl ExamCatalogQuestion {
@@ -185,6 +209,10 @@ impl ExamCatalogQuestion {
 
     fn has_tag(&self, tag: &str) -> bool {
         self.workbook_tags.iter().any(|value| value == tag)
+    }
+
+    fn has_topic(&self, topic_id: &str) -> bool {
+        self.topic_ids.iter().any(|value| value == topic_id)
     }
 }
 
@@ -238,6 +266,10 @@ fn is_excluded(scope: &ExamScope, question: &ExamCatalogQuestion) -> bool {
             .iter()
             .any(|workbook_id| workbook_id == &question.workbook_id)
         || scope.exclude_tags.iter().any(|tag| question.has_tag(tag))
+        || scope
+            .exclude_topics
+            .iter()
+            .any(|topic| question.has_topic(topic))
 }
 
 fn group_matches(group: &ExamScopeGroup, question: &ExamCatalogQuestion) -> bool {
@@ -250,7 +282,9 @@ fn group_matches(group: &ExamScopeGroup, question: &ExamCatalogQuestion) -> bool
             .iter()
             .any(|workbook_id| workbook_id == &question.workbook_id);
     let tag_matches = group.tags.is_empty() || group.tags.iter().any(|tag| question.has_tag(tag));
-    workbook_matches && tag_matches
+    let topic_matches =
+        group.topics.is_empty() || group.topics.iter().any(|topic| question.has_topic(topic));
+    workbook_matches && tag_matches && topic_matches
 }
 
 fn reference_matches(reference: &QuestionRef, question: &ExamCatalogQuestion) -> bool {
@@ -503,6 +537,7 @@ mod tests {
             question_prompt: format!("prompt {id}"),
             question_kind: "true_false".to_string(),
             workbook_tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            topic_ids: Vec::new(),
         }
     }
 
@@ -530,6 +565,7 @@ mod tests {
             groups: vec![ExamScopeGroup {
                 workbook_ids: vec!["A".into()],
                 tags: vec![],
+                topics: Vec::new(),
             }],
             ..Default::default()
         };
@@ -542,6 +578,7 @@ mod tests {
             groups: vec![ExamScopeGroup {
                 workbook_ids: vec![],
                 tags: vec!["electricity".into()],
+                topics: Vec::new(),
             }],
             ..Default::default()
         };
@@ -556,6 +593,7 @@ mod tests {
             groups: vec![ExamScopeGroup {
                 workbook_ids: vec!["A".into()],
                 tags: vec!["electricity".into(), "chemistry".into()],
+                topics: Vec::new(),
             }],
             ..Default::default()
         };
@@ -569,10 +607,12 @@ mod tests {
                 ExamScopeGroup {
                     workbook_ids: vec!["A".into()],
                     tags: vec!["chemistry".into()],
+                    topics: Vec::new(),
                 },
                 ExamScopeGroup {
                     workbook_ids: vec!["B".into()],
                     tags: vec![],
+                    topics: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -595,11 +635,13 @@ mod tests {
             groups: vec![ExamScopeGroup {
                 workbook_ids: vec!["A".into()],
                 tags: vec![],
+                topics: Vec::new(),
             }],
             include_questions: vec![QuestionRef::new("B", "q5")],
             exclude_questions: vec![QuestionRef::new("A", "q2")],
             exclude_workbooks: vec!["B".into()],
             exclude_tags: vec!["advanced".into()],
+            exclude_topics: Vec::new(),
         };
         assert_eq!(ids(&scope), ["q1", "q3"]);
     }
@@ -611,10 +653,12 @@ mod tests {
                 ExamScopeGroup {
                     workbook_ids: vec!["A".into()],
                     tags: vec![],
+                    topics: Vec::new(),
                 },
                 ExamScopeGroup {
                     workbook_ids: vec![],
                     tags: vec!["electricity".into()],
+                    topics: Vec::new(),
                 },
             ],
             include_questions: vec![QuestionRef::new("A", "q1")],
@@ -628,6 +672,7 @@ mod tests {
         assert!(ids(&ExamScope::default()).is_empty());
         let exclusion_only = ExamScope {
             exclude_tags: vec!["advanced".into()],
+            exclude_topics: Vec::new(),
             ..Default::default()
         };
         assert!(ids(&exclusion_only).is_empty());
@@ -651,6 +696,7 @@ mod tests {
             groups: vec![ExamScopeGroup {
                 workbook_ids: vec![],
                 tags: vec!["electricity".into()],
+                topics: Vec::new(),
             }],
             ..Default::default()
         };
@@ -687,6 +733,7 @@ mod tests {
             groups: vec![ExamScopeGroup {
                 workbook_ids: vec![String::new()],
                 tags: vec![],
+                topics: Vec::new(),
             }],
             ..Default::default()
         };
@@ -710,6 +757,7 @@ mod tests {
         exam.scope.groups.push(ExamScopeGroup {
             workbook_ids: vec!["A".into()],
             tags: vec![],
+            topics: Vec::new(),
         });
         assert!(exam.validate().is_ok());
     }
@@ -735,6 +783,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exam.daily_minutes, default_daily_minutes());
+    }
+
+    #[test]
+    fn topic_groups_are_anded_with_workbooks_and_exclusions_win() {
+        let mut catalog = catalog();
+        catalog[0].topic_ids = vec!["linear".into()];
+        catalog[1].topic_ids = vec!["linear".into(), "algebra".into()];
+        catalog[4].topic_ids = vec!["linear".into()];
+        let scope = ExamScope {
+            groups: vec![ExamScopeGroup {
+                workbook_ids: vec!["A".into()],
+                tags: Vec::new(),
+                topics: vec!["algebra".into()],
+            }],
+            exclude_topics: vec!["linear".into()],
+            ..Default::default()
+        };
+        let resolved = resolve_scope(&scope, &catalog);
+        // q2 is the only A question in algebra, but it is also excluded by the
+        // linear exclusion. Exclusions apply after inclusion.
+        assert!(resolved.is_empty());
+        let scope = ExamScope {
+            groups: vec![ExamScopeGroup {
+                workbook_ids: vec!["A".into()],
+                tags: Vec::new(),
+                topics: vec!["algebra".into()],
+            }],
+            ..Default::default()
+        };
+        let resolved: Vec<String> = resolve_scope(&scope, &catalog)
+            .into_iter()
+            .map(|question| question.question_id)
+            .collect();
+        assert_eq!(resolved, ["q2"]);
+    }
+
+    #[test]
+    fn questions_without_topics_are_not_matched_by_a_topic_group() {
+        let scope = ExamScope {
+            groups: vec![ExamScopeGroup {
+                workbook_ids: Vec::new(),
+                tags: Vec::new(),
+                topics: vec!["linear".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(ids(&scope).is_empty());
     }
 
     #[test]

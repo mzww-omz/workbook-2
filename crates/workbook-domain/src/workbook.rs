@@ -144,6 +144,10 @@ pub struct Question {
     pub hotspot: Option<HotspotSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labeling: Option<LabelingSpec>,
+    /// Authored topic paths (for example `数学/一次関数`). Stored as stable
+    /// topic IDs at import time. Empty means no topic assignment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
 }
 
 impl Question {
@@ -702,6 +706,23 @@ impl Question {
                 format!("{path}.revision"),
                 "1以上の整数にしてください",
             ));
+        }
+        if self.topics.len() > 50 {
+            return Err(ValidationError::new(
+                format!("{path}.topics"),
+                "Topicは50個以下にしてください",
+            ));
+        }
+        let mut seen_topics = BTreeSet::new();
+        for (index, topic) in self.topics.iter().enumerate() {
+            let segments = crate::topic::parse_topic_path(topic)?;
+            let key = segments.join("/");
+            if !seen_topics.insert(key) {
+                return Err(ValidationError::new(
+                    format!("{path}.topics[{index}]"),
+                    "同じTopicが重複しています",
+                ));
+            }
         }
         if schema_version == 1 && self.kind.requires_schema_v2() {
             return Err(ValidationError::new(

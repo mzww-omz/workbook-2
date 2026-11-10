@@ -55,3 +55,43 @@
 ### 既知の制約
 - 予算は選択目標であり、経過時間による自動終了は行わない（意図どおり）
 - 実機UIでの3分/20分表示確認は未実施（Phase A〜E完了後にまとめて確認）
+
+## Phase C — Topic / Scope System
+
+### 実装済み
+- `Topic` ドメイン型（安定ID、名前、任意の親、説明）と正規化・パス解析
+- 同一親の下だけ同名を衝突扱い。別の親の同名Topicは別IDのまま
+- Question JSONに任意の `topics` パス（例 `数学/一次関数`）を追加。schema v1/v2双方で省略可能
+- Import時にTopicパスを解決・共有し、Workbook横断で同じTopic IDを再利用
+- `topics` / `question_topics` を schema v7 で追加。v6から前方マイグレーション + バックアップ
+- ScopeにTopic条件を追加（グループ内のWorkbook/Tag/TopicはAND、グループ間はOR）
+- 親Topicを選ぶと子孫Topicを解決時に自動展開
+- `exclude_topics` を追加。除外は包含の後に適用
+- `ScopePreview`（対象・学習済み・未学習・復習期限・苦手・Workbook別・Topic別）を実測で算出
+- `start_scope_plan` / `start_scope_review` / `start_scope_practice` を追加
+- New教材は次回のScope解決から反映し、進行中Sessionの `session_items` は変更しない
+- UI: 「範囲」画面。Topicツリー、Workbook、個別Questionの包含/除外、AND/OR切替、時間予算、開始操作
+- UI: Topicの作成・改名・削除（子がある場合は拒否）、親指定
+- Libraryから「範囲学習」へ遷移
+
+### 主要ファイル
+- `crates/workbook-domain/src/topic.rs`（新規）
+- `crates/workbook-domain/src/exam.rs`, `workbook.rs`, `lib.rs`
+- `crates/workbook-storage/src/schema.rs`, `lib.rs`
+- `crates/workbook-service/src/lib.rs`
+- `crates/workbook-ui/src/lib.rs`, `views.rs`, `modal.rs`
+- `crates/workbook-service/tests/topics.rs`（新規）
+- `crates/workbook-storage/tests/storage.rs`
+
+### テスト
+- Topicパス共有、親子解決、別親同名の非同一視、重複拒否、子あり削除拒否
+- 個別QuestionのTopic割当変更
+- Scopeの包含・除外・個別問題、未学習/復習/苦手の実測
+- 横断ScopeのPlan開始、動的反映、進行中Sessionの固定
+- 期限到来Short-termのScope復習
+- schema v6→v7マイグレーション
+
+### 既知の制約
+- Topicの一括割当UIはPhase Eのエディタで扱う（現状はImportの `topics` と個別API）
+- 実機UI確認は未実施
+

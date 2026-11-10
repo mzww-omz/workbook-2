@@ -235,6 +235,7 @@ fn exam_draft(title: &str, workbook_ids: &[&str], tags: &[&str]) -> ExamDraft {
             groups: vec![ExamScopeGroup {
                 workbook_ids: workbook_ids.iter().map(|id| id.to_string()).collect(),
                 tags: tags.iter().map(|tag| tag.to_string()).collect(),
+                topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -866,6 +867,7 @@ fn exam_dated(
             groups: vec![ExamScopeGroup {
                 workbook_ids: vec![workbook_id.to_string()],
                 tags: vec![],
+                topics: Vec::new(),
             }],
             ..Default::default()
         },

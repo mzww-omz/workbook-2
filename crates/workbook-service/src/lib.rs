@@ -9,13 +9,14 @@ use workbook_domain::{
     GradeResult, GradeStatus, MockOptions, Mode, NearMissReason, NearMissRecord, Phase,
     PracticeOptions, PracticeStrategy, Question, QuestionType, Rating, RatingSource,
     SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
-    answer_is_blank, automatic_rating, grade_answer_detailed, parse_workbook, resolve_scope,
+    answer_is_blank, automatic_rating, expand_topic_ids, grade_answer_detailed, parse_workbook,
+    resolve_scope,
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{
     BudgetCategory, BudgetQuestion, Clock, ExamPlan, PlanCard, PlanInput, PlanQuestion,
-    QueueChoice, QueueInput, QueueKind, Scheduler, SchedulerSettings, estimated_seconds,
-    exam_deadline, plan_exam, select_next, select_within_budget,
+    PlanWarning, QueueChoice, QueueInput, QueueKind, Scheduler, SchedulerSettings,
+    estimated_seconds, exam_deadline, plan_exam, select_next, select_within_budget,
 };
 use workbook_storage::{
     AttemptRow, BudgetPool, CommitWrite, CorrectionWrite, ExamPracticeStats, MockAnswerRow,
@@ -339,6 +340,54 @@ pub struct MockSessionView {
     pub submitted: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct TopicSummary {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    /// Human-readable path such as `数学 / 一次関数`.
+    pub path: String,
+    pub description: String,
+    pub question_count: usize,
+    pub studied: usize,
+    pub due: usize,
+    pub weak: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScopeCount {
+    pub id: String,
+    pub title: String,
+    pub total: usize,
+    pub studied: usize,
+    pub due: usize,
+    pub weak: usize,
+}
+
+/// Measured counts for the currently selected scope. These are observations
+/// from stored questions, FSRS states, and attempts; no mastery estimate is
+/// invented here.
+#[derive(Clone, Debug, Default)]
+pub struct ScopePreview {
+    pub total: usize,
+    pub studied: usize,
+    pub unstudied: usize,
+    pub due: usize,
+    pub weak: usize,
+    pub workbooks: Vec<ScopeCount>,
+    pub topics: Vec<ScopeCount>,
+}
+
+impl ScopePreview {
+    pub fn coverage(&self) -> Option<f64> {
+        if self.total == 0 {
+            None
+        } else {
+            Some(self.studied as f64 / self.total as f64)
+        }
+    }
+}
+
 pub fn mock_score_percent(correct: u32, incorrect: u32) -> Option<f64> {
     let graded = correct + incorrect;
     if graded == 0 {
@@ -570,6 +619,252 @@ impl WorkbookService {
         Ok(())
     }
 
+    // ---- topics and scope -----------------------------------------------
+
+    pub fn topics(&self) -> Result<Vec<TopicSummary>> {
+        let storage = self.storage()?;
+        let now = self.clock.now();
+        topic_summaries(&storage, now)
+    }
+
+    pub fn create_topic(
+        &self,
+        name: &str,
+        parent_id: Option<&str>,
+        description: &str,
+    ) -> Result<String> {
+        let topic = workbook_domain::Topic {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.trim().to_string(),
+            parent_id: parent_id.map(ToOwned::to_owned),
+            description: description.trim().to_string(),
+        };
+        topic.validate()?;
+        let mut storage = self.storage()?;
+        storage.insert_topic(&topic, self.clock.now())?;
+        Ok(topic.id)
+    }
+
+    pub fn update_topic(
+        &self,
+        id: &str,
+        name: &str,
+        parent_id: Option<&str>,
+        description: &str,
+    ) -> Result<()> {
+        let topic = workbook_domain::Topic {
+            id: id.to_string(),
+            name: name.trim().to_string(),
+            parent_id: parent_id.map(ToOwned::to_owned),
+            description: description.trim().to_string(),
+        };
+        topic.validate()?;
+        let mut storage = self.storage()?;
+        storage.update_topic(&topic, self.clock.now())?;
+        Ok(())
+    }
+
+    pub fn delete_topic(&self, id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        self.write_action_backup(&storage, "pre-delete-topic")?;
+        storage.delete_topic(id)?;
+        Ok(())
+    }
+
+    pub fn set_question_topics(
+        &self,
+        workbook_id: &str,
+        question_id: &str,
+        topic_ids: &[String],
+    ) -> Result<()> {
+        let mut storage = self.storage()?;
+        storage.set_question_topics(workbook_id, question_id, topic_ids)?;
+        Ok(())
+    }
+
+    pub fn scope_preview(&self, scope: &ExamScope) -> Result<ScopePreview> {
+        let storage = self.storage()?;
+        scope_preview_inner(&storage, scope, self.clock.now())
+    }
+
+    /// Plans a cross-workbook scope with the existing deadline-aware planner.
+    /// No target date means "today's useful set", not an exam deadline.
+    pub fn start_scope_plan(&self, scope: &ExamScope, budget_seconds: Option<u32>) -> Result<()> {
+        if budget_seconds == Some(0) {
+            return Err(ServiceError::Invalid(
+                "学習時間は1分以上を指定してください".to_string(),
+            ));
+        }
+        let mut storage = self.storage()?;
+        ensure_no_active_session(&storage)?;
+        let now = self.clock.now();
+        let catalog = exam_catalog(&storage)?;
+        let resolved = resolve_scope_for(&storage, scope, &catalog)?;
+        if resolved.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この範囲に対象の問題がありません".to_string(),
+            ));
+        }
+        let context = exam_plan_context(&storage, now)?;
+        let questions = plan_questions_for(&resolved, &context, None, now);
+        let minutes = budget_seconds
+            .map(|seconds| seconds.div_ceil(60).max(1))
+            .unwrap_or(30);
+        let plan = plan_exam(PlanInput {
+            now,
+            calendar: &context.calendar,
+            target_date: None,
+            daily_minutes: minutes,
+            new_limit_remaining: context.new_limit_remaining,
+            studied_seconds_today: 0,
+            questions: &questions,
+        });
+        let candidates: Vec<SessionCandidate> = plan
+            .selected
+            .iter()
+            .map(|item| SessionCandidate {
+                workbook_id: item.workbook_id.clone(),
+                note_id: item.note_id.clone(),
+                question_id: item.question_id.clone(),
+                due_at: None,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                plan.warnings
+                    .first()
+                    .map(PlanWarning::message)
+                    .unwrap_or_else(|| "この範囲で今日の学習を作れませんでした".to_string()),
+            ));
+        }
+        let (bundle, _) =
+            build_session_bundle(Mode::Plan, &candidates, now, None, None, budget_seconds)?;
+        persist_started_bundle(&mut storage, bundle, now)
+    }
+
+    /// Starts a review limited to a scope. If nothing is due, Learn Ahead
+    /// cards inside the scope may be used, preserving the 20-minute and 4 a.m.
+    /// learning-day rules.
+    pub fn start_scope_review(&self, scope: &ExamScope, budget_seconds: Option<u32>) -> Result<()> {
+        if budget_seconds == Some(0) {
+            return Err(ServiceError::Invalid(
+                "学習時間は1分以上を指定してください".to_string(),
+            ));
+        }
+        let mut storage = self.storage()?;
+        ensure_no_active_session(&storage)?;
+        let now = self.clock.now();
+        let catalog = exam_catalog(&storage)?;
+        let resolved = resolve_scope_for(&storage, scope, &catalog)?;
+        if resolved.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この範囲に対象の問題がありません".to_string(),
+            ));
+        }
+        let context = exam_plan_context(&storage, now)?;
+        let mut candidates = scope_due_candidates(&resolved, &context, now)?;
+        if candidates.is_empty() {
+            candidates = scope_learn_ahead_candidates(&resolved, &context, now)?;
+        }
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この範囲に期限が来た復習はありません".to_string(),
+            ));
+        }
+        if let Some(budget) = budget_seconds {
+            let estimates = BudgetEstimates::load(&storage)?;
+            let questions: Vec<BudgetQuestion> = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    budget_question(
+                        &estimates,
+                        candidate.workbook_id.clone(),
+                        candidate.note_id.clone(),
+                        candidate.question_id.clone(),
+                        BudgetPool::DueReview,
+                        candidate.due_at,
+                        index as u32,
+                    )
+                })
+                .collect();
+            candidates = select_within_budget(&questions, budget)
+                .selected
+                .into_iter()
+                .map(session_candidate)
+                .collect();
+        }
+        let (bundle, _) =
+            build_session_bundle(Mode::Review, &candidates, now, None, None, budget_seconds)?;
+        persist_started_bundle(&mut storage, bundle, now)
+    }
+
+    pub fn start_scope_practice(
+        &self,
+        scope: &ExamScope,
+        budget_seconds: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<()> {
+        if budget_seconds == Some(0) {
+            return Err(ServiceError::Invalid(
+                "学習時間は1分以上を指定してください".to_string(),
+            ));
+        }
+        let mut storage = self.storage()?;
+        ensure_no_active_session(&storage)?;
+        let now = self.clock.now();
+        let catalog = exam_catalog(&storage)?;
+        let resolved = resolve_scope_for(&storage, scope, &catalog)?;
+        if resolved.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この範囲に対象の問題がありません".to_string(),
+            ));
+        }
+        let mut candidates: Vec<SessionCandidate> = resolved
+            .iter()
+            .map(|question| SessionCandidate {
+                workbook_id: question.workbook_id.clone(),
+                note_id: question.note_id.clone(),
+                question_id: question.question_id.clone(),
+                due_at: None,
+            })
+            .collect();
+        if let Some(limit) = limit {
+            candidates.truncate(limit as usize);
+        }
+        if let Some(budget) = budget_seconds {
+            let estimates = BudgetEstimates::load(&storage)?;
+            let questions: Vec<BudgetQuestion> = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    budget_question(
+                        &estimates,
+                        candidate.workbook_id.clone(),
+                        candidate.note_id.clone(),
+                        candidate.question_id.clone(),
+                        BudgetPool::DueReview,
+                        candidate.due_at,
+                        index as u32,
+                    )
+                })
+                .collect();
+            candidates = select_within_budget(&questions, budget)
+                .selected
+                .into_iter()
+                .map(session_candidate)
+                .collect();
+        }
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この範囲に対象の問題がありません".to_string(),
+            ));
+        }
+        let (bundle, _) =
+            build_session_bundle(Mode::Practice, &candidates, now, None, None, budget_seconds)?;
+        persist_started_bundle(&mut storage, bundle, now)
+    }
+
     // ---- exams ----------------------------------------------------------
 
     pub fn exams(&self, include_archived: bool) -> Result<Vec<ExamSummary>> {
@@ -604,7 +899,8 @@ impl WorkbookService {
 
     pub fn preview_exam_scope(&self, scope: &ExamScope) -> Result<Vec<ExamCatalogQuestion>> {
         let storage = self.storage()?;
-        Ok(resolve_scope(scope, &exam_catalog(&storage)?))
+        let catalog = exam_catalog(&storage)?;
+        resolve_scope_for(&storage, scope, &catalog)
     }
 
     pub fn create_exam(&self, draft: ExamDraft) -> Result<String> {
@@ -642,7 +938,7 @@ impl WorkbookService {
         ensure_no_active_session(&storage)?;
         let exam = storage.exam(exam_id)?;
         let catalog = exam_catalog(&storage)?;
-        let scope: BTreeSet<(String, String)> = resolve_scope(&exam.scope, &catalog)
+        let scope: BTreeSet<(String, String)> = resolve_scope_for(&storage, &exam.scope, &catalog)?
             .into_iter()
             .map(|question| (question.workbook_id, question.question_id))
             .collect();
@@ -705,7 +1001,7 @@ impl WorkbookService {
         ensure_no_active_session(&storage)?;
         let exam = storage.exam(exam_id)?;
         let catalog = exam_catalog(&storage)?;
-        let resolved = resolve_scope(&exam.scope, &catalog);
+        let resolved = resolve_scope_for(&storage, &exam.scope, &catalog)?;
         if resolved.is_empty() {
             return Err(ServiceError::Invalid(
                 "この試験の範囲に問題がありません".to_string(),
@@ -784,15 +1080,16 @@ impl WorkbookService {
         ensure_no_active_session(&storage)?;
         let exam = storage.exam(exam_id)?;
         let catalog = exam_catalog(&storage)?;
-        let mut candidates: Vec<SessionCandidate> = resolve_scope(&exam.scope, &catalog)
-            .into_iter()
-            .map(|question| SessionCandidate {
-                workbook_id: question.workbook_id,
-                note_id: question.note_id,
-                question_id: question.question_id,
-                due_at: None,
-            })
-            .collect();
+        let mut candidates: Vec<SessionCandidate> =
+            resolve_scope_for(&storage, &exam.scope, &catalog)?
+                .into_iter()
+                .map(|question| SessionCandidate {
+                    workbook_id: question.workbook_id,
+                    note_id: question.note_id,
+                    question_id: question.question_id,
+                    due_at: None,
+                })
+                .collect();
         if candidates.is_empty() {
             return Err(ServiceError::Invalid(
                 "この試験の範囲に問題がありません".to_string(),
@@ -2381,11 +2678,22 @@ impl WorkbookService {
 }
 
 fn exam_catalog(storage: &Storage) -> Result<Vec<ExamCatalogQuestion>> {
+    let mut topics_by_question: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for (workbook_id, question_id, topic_id) in storage.question_topics()? {
+        topics_by_question
+            .entry((workbook_id, question_id))
+            .or_default()
+            .push(topic_id);
+    }
     let mut catalog = Vec::new();
     for record in storage.workbooks()? {
         let workbook = parse_workbook(&record.content_json)?;
         for note in &workbook.notes {
             for question in &note.questions {
+                let key = (record.local_id.clone(), question.id.clone());
+                let mut topic_ids = topics_by_question.get(&key).cloned().unwrap_or_default();
+                topic_ids.sort();
+                topic_ids.dedup();
                 catalog.push(ExamCatalogQuestion {
                     workbook_id: record.local_id.clone(),
                     workbook_title: workbook.title.clone(),
@@ -2394,6 +2702,7 @@ fn exam_catalog(storage: &Storage) -> Result<Vec<ExamCatalogQuestion>> {
                     question_prompt: question.prompt_text(),
                     question_kind: question.kind.as_str().to_string(),
                     workbook_tags: workbook.tags.clone(),
+                    topic_ids,
                 });
             }
         }
@@ -2407,10 +2716,302 @@ fn exam_catalog(storage: &Storage) -> Result<Vec<ExamCatalogQuestion>> {
     Ok(catalog)
 }
 
+/// Expands selected topics to their descendants before exact-ID resolution.
+/// A scope therefore follows a hierarchy without freezing the descendant list
+/// at save time: new child topics are included on the next resolution.
+fn scope_with_topic_descendants(scope: &ExamScope, topics: &[workbook_domain::Topic]) -> ExamScope {
+    let mut expanded = scope.clone();
+    for group in &mut expanded.groups {
+        let ids = expand_topic_ids(topics, &group.topics);
+        group.topics = ids.into_iter().collect();
+    }
+    let excluded = expand_topic_ids(topics, &expanded.exclude_topics);
+    expanded.exclude_topics = excluded.into_iter().collect();
+    expanded
+}
+
+fn resolve_scope_for(
+    storage: &Storage,
+    scope: &ExamScope,
+    catalog: &[ExamCatalogQuestion],
+) -> Result<Vec<ExamCatalogQuestion>> {
+    let topics = storage.topics()?;
+    let expanded = scope_with_topic_descendants(scope, &topics);
+    Ok(resolve_scope(&expanded, catalog))
+}
+
+fn question_is_due(card: &workbook_domain::StoredCard, buried: bool, now: DateTime<Utc>) -> bool {
+    card.due_at <= now && !(card.state == CardState::Review && buried)
+}
+
+fn question_is_weak(
+    card: Option<&workbook_domain::StoredCard>,
+    stat: Option<&workbook_storage::QuestionAttemptStat>,
+) -> bool {
+    card.is_some_and(|card| card.lapses > 0 || card.difficulty >= 7.0)
+        || stat.is_some_and(|stat| stat.incorrect > 0)
+}
+
+fn topic_summaries(storage: &Storage, now: DateTime<Utc>) -> Result<Vec<TopicSummary>> {
+    let catalog = exam_catalog(storage)?;
+    let topics = storage.topics()?;
+    let context = exam_plan_context(storage, now)?;
+    let mut output = Vec::new();
+    for topic in &topics {
+        let effective = expand_topic_ids(&topics, [&topic.id]);
+        let mut summary = TopicSummary {
+            id: topic.id.clone(),
+            name: topic.name.clone(),
+            parent_id: topic.parent_id.clone(),
+            path: workbook_domain::topic_path(&topics, &topic.id)
+                .map(|path| path.join(" / "))
+                .unwrap_or_else(|| topic.name.clone()),
+            description: topic.description.clone(),
+            question_count: 0,
+            studied: 0,
+            due: 0,
+            weak: 0,
+        };
+        for question in &catalog {
+            if !question.topic_ids.iter().any(|id| effective.contains(id)) {
+                continue;
+            }
+            let key = (question.workbook_id.clone(), question.question_id.clone());
+            let card = context.states.get(&key);
+            let stat = context.stats.get(&key);
+            summary.question_count += 1;
+            if card.is_some() {
+                summary.studied += 1;
+            }
+            if card.is_some_and(|card| question_is_due(card, context.buried.contains(&key), now)) {
+                summary.due += 1;
+            }
+            if question_is_weak(card, stat) {
+                summary.weak += 1;
+            }
+        }
+        output.push(summary);
+    }
+    output.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(output)
+}
+
+fn scope_preview_inner(
+    storage: &Storage,
+    scope: &ExamScope,
+    now: DateTime<Utc>,
+) -> Result<ScopePreview> {
+    let catalog = exam_catalog(storage)?;
+    let resolved = resolve_scope_for(storage, scope, &catalog)?;
+    let topics = storage.topics()?;
+    let context = exam_plan_context(storage, now)?;
+    let mut preview = ScopePreview::default();
+    let mut workbook_counts: BTreeMap<String, ScopeCount> = BTreeMap::new();
+    for question in &resolved {
+        let key = (question.workbook_id.clone(), question.question_id.clone());
+        let card = context.states.get(&key);
+        let stat = context.stats.get(&key);
+        let due =
+            card.is_some_and(|card| question_is_due(card, context.buried.contains(&key), now));
+        let weak = question_is_weak(card, stat);
+        preview.total += 1;
+        if card.is_some() {
+            preview.studied += 1;
+        }
+        if due {
+            preview.due += 1;
+        }
+        if weak {
+            preview.weak += 1;
+        }
+        let entry = workbook_counts
+            .entry(question.workbook_id.clone())
+            .or_insert_with(|| ScopeCount {
+                id: question.workbook_id.clone(),
+                title: question.workbook_title.clone(),
+                total: 0,
+                studied: 0,
+                due: 0,
+                weak: 0,
+            });
+        entry.total += 1;
+        entry.studied += usize::from(card.is_some());
+        entry.due += usize::from(due);
+        entry.weak += usize::from(weak);
+    }
+    preview.unstudied = preview.total.saturating_sub(preview.studied);
+    preview.workbooks = workbook_counts.into_values().collect();
+
+    let mut topic_counts = Vec::new();
+    for topic in &topics {
+        let effective = expand_topic_ids(&topics, [&topic.id]);
+        let mut count = ScopeCount {
+            id: topic.id.clone(),
+            title: workbook_domain::topic_path(&topics, &topic.id)
+                .map(|path| path.join(" / "))
+                .unwrap_or_else(|| topic.name.clone()),
+            total: 0,
+            studied: 0,
+            due: 0,
+            weak: 0,
+        };
+        for question in &resolved {
+            if !question.topic_ids.iter().any(|id| effective.contains(id)) {
+                continue;
+            }
+            let key = (question.workbook_id.clone(), question.question_id.clone());
+            let card = context.states.get(&key);
+            let stat = context.stats.get(&key);
+            count.total += 1;
+            count.studied += usize::from(card.is_some());
+            count.due += usize::from(
+                card.is_some_and(|card| question_is_due(card, context.buried.contains(&key), now)),
+            );
+            count.weak += usize::from(question_is_weak(card, stat));
+        }
+        if count.total > 0 {
+            topic_counts.push(count);
+        }
+    }
+    preview.topics = topic_counts;
+    Ok(preview)
+}
+
+fn scope_due_candidates(
+    resolved: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    now: DateTime<Utc>,
+) -> Result<Vec<SessionCandidate>> {
+    let mut rows = Vec::new();
+    for (ordinal, question) in resolved.iter().enumerate() {
+        let key = (question.workbook_id.clone(), question.question_id.clone());
+        let Some(card) = context.states.get(&key) else {
+            continue;
+        };
+        if card.due_at > now {
+            continue;
+        }
+        if card.state == CardState::Review && context.buried.contains(&key) {
+            continue;
+        }
+        rows.push((
+            card.due_at,
+            ordinal,
+            SessionCandidate {
+                workbook_id: question.workbook_id.clone(),
+                note_id: question.note_id.clone(),
+                question_id: question.question_id.clone(),
+                due_at: Some(card.due_at),
+            },
+        ));
+    }
+    rows.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.question_id.cmp(&b.2.question_id))
+    });
+    let mut seen_notes = BTreeSet::new();
+    let mut seen_questions = BTreeSet::new();
+    let mut output = Vec::new();
+    for (_, _, candidate) in rows {
+        let note_key = (candidate.workbook_id.clone(), candidate.note_id.clone());
+        let question_key = (candidate.workbook_id.clone(), candidate.question_id.clone());
+        if seen_questions.contains(&question_key) || !seen_notes.insert(note_key) {
+            continue;
+        }
+        seen_questions.insert(question_key);
+        output.push(candidate);
+    }
+    Ok(output)
+}
+
+fn scope_learn_ahead_candidates(
+    resolved: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    now: DateTime<Utc>,
+) -> Result<Vec<SessionCandidate>> {
+    let until = now + Duration::minutes(20);
+    let mut rows = Vec::new();
+    for (ordinal, question) in resolved.iter().enumerate() {
+        let key = (question.workbook_id.clone(), question.question_id.clone());
+        let Some(card) = context.states.get(&key) else {
+            continue;
+        };
+        if !card.state.is_short_term() {
+            continue;
+        }
+        if card.due_at <= now || card.due_at > until {
+            continue;
+        }
+        if !context.calendar.learn_ahead_allowed(now, card.due_at) {
+            continue;
+        }
+        rows.push((
+            card.due_at,
+            ordinal,
+            SessionCandidate {
+                workbook_id: question.workbook_id.clone(),
+                note_id: question.note_id.clone(),
+                question_id: question.question_id.clone(),
+                due_at: Some(card.due_at),
+            },
+        ));
+    }
+    rows.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.question_id.cmp(&b.2.question_id))
+    });
+    let mut seen_notes = BTreeSet::new();
+    let mut output = Vec::new();
+    for (_, _, candidate) in rows {
+        if seen_notes.insert((candidate.workbook_id.clone(), candidate.note_id.clone())) {
+            output.push(candidate);
+        }
+    }
+    Ok(output)
+}
+
+fn persist_started_bundle(
+    storage: &mut Storage,
+    mut bundle: SessionBundle,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let first_item = bundle
+        .items
+        .first()
+        .ok_or_else(|| ServiceError::Invalid("問題を選択できませんでした".to_string()))?
+        .clone();
+    let workbooks: BTreeSet<String> = bundle
+        .items
+        .iter()
+        .map(|item| item.workbook_id.clone())
+        .collect();
+    bundle.session.current_workbook_id = Some(first_item.workbook_id.clone());
+    bundle.session.current_item_id = Some(first_item.id.clone());
+    bundle.session.cursor_kind = "initial".to_string();
+    bundle.session.phase = if matches!(bundle.session.mode, Mode::New | Mode::Plan)
+        && !storage.note_introduced(&first_item.workbook_id, &first_item.note_id)?
+    {
+        Phase::Intro
+    } else {
+        Phase::Question
+    };
+    bundle.session.question_started_at = Some(now);
+    bundle.session.question_elapsed_ms = 0;
+    bundle.session.revision = 0;
+    storage.create_session(&bundle)?;
+    for workbook in workbooks {
+        storage.touch_workbook(&workbook, now)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct ExamPlanContext {
     states: BTreeMap<(String, String), workbook_domain::StoredCard>,
     stats: BTreeMap<(String, String), workbook_storage::QuestionAttemptStat>,
+    buried: BTreeSet<(String, String)>,
     calendar: StudyCalendar,
     scheduler: Scheduler,
     new_limit_remaining: usize,
@@ -2438,6 +3039,7 @@ fn exam_plan_context(storage: &Storage, now: DateTime<Utc>) -> Result<ExamPlanCo
     Ok(ExamPlanContext {
         states,
         stats,
+        buried: storage.buried_questions(now)?,
         calendar,
         scheduler,
         new_limit_remaining: (settings.new_limit as usize).saturating_sub(introduced),
@@ -2460,8 +3062,31 @@ fn build_exam_plan(
     let studied_seconds_today =
         u32::try_from(storage.exam_studied_ms_since(&exam.id, today_start)?.max(0) / 1_000)
             .unwrap_or(u32::MAX);
-    let questions: Vec<PlanQuestion> = resolve_scope(&exam.scope, catalog)
-        .into_iter()
+    let questions = plan_questions_for(
+        &resolve_scope_for(storage, &exam.scope, catalog)?,
+        context,
+        deadline,
+        now,
+    );
+    Ok(plan_exam(PlanInput {
+        now,
+        calendar: &context.calendar,
+        target_date: exam.target_date,
+        daily_minutes: exam.daily_minutes,
+        new_limit_remaining: context.new_limit_remaining,
+        studied_seconds_today,
+        questions: &questions,
+    }))
+}
+
+fn plan_questions_for(
+    questions: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    deadline: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Vec<PlanQuestion> {
+    questions
+        .iter()
         .map(|question| {
             let key = (question.workbook_id.clone(), question.question_id.clone());
             let card = context.states.get(&key);
@@ -2477,10 +3102,10 @@ fn build_exam_plan(
                 _ => None,
             };
             PlanQuestion {
-                workbook_id: question.workbook_id,
-                note_id: question.note_id,
-                question_id: question.question_id,
-                kind: question.question_kind,
+                workbook_id: question.workbook_id.clone(),
+                note_id: question.note_id.clone(),
+                question_id: question.question_id.clone(),
+                kind: question.question_kind.clone(),
                 card: card.map(|card| PlanCard {
                     due_at: card.due_at,
                     last_review_at: card.last_review_at,
@@ -2494,16 +3119,7 @@ fn build_exam_plan(
                 exam_recall,
             }
         })
-        .collect();
-    Ok(plan_exam(PlanInput {
-        now,
-        calendar: &context.calendar,
-        target_date: exam.target_date,
-        daily_minutes: exam.daily_minutes,
-        new_limit_remaining: context.new_limit_remaining,
-        studied_seconds_today,
-        questions: &questions,
-    }))
+        .collect()
 }
 
 fn exam_summary_from(

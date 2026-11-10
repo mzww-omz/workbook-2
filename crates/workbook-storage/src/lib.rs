@@ -9,8 +9,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use workbook_domain::{
     AssetContent, AssistState, CardState, Exam, ExamScope, Mode, Phase, RatingSource,
-    SessionItemStatus, SessionStatus, Settings, StoredCard, StudyCalendar, ThemeSetting, Workbook,
-    parse_workbook,
+    SessionItemStatus, SessionStatus, Settings, StoredCard, StudyCalendar, ThemeSetting, Topic,
+    Workbook, normalize_topic_name, parse_topic_path, parse_workbook,
 };
 use workbook_import::{
     LegacyAttempt, LegacyPlan, LegacySession, LegacySessionItem, LegacySessionWorkbook,
@@ -477,6 +477,20 @@ impl Storage {
                     "INSERT INTO questions(workbook_id,question_id,note_id,buried_until) VALUES(?1,?2,?3,NULL)",
                     params![local_id, question.id, note.id],
                 )?;
+                for path in &question.topics {
+                    let mut parent: Option<String> = None;
+                    for name in parse_topic_path(path)? {
+                        let topic_id = ensure_topic(&transaction, &name, parent.as_deref(), now)?;
+                        parent = Some(topic_id);
+                    }
+                    if let Some(topic_id) = parent {
+                        transaction.execute(
+                            "INSERT OR IGNORE INTO question_topics(workbook_id,question_id,topic_id)
+                             VALUES(?1,?2,?3)",
+                            params![local_id, question.id, topic_id],
+                        )?;
+                    }
+                }
             }
         }
         for asset in assets {
@@ -563,6 +577,187 @@ impl Storage {
             "UPDATE workbooks SET last_used_at=?1 WHERE local_id=?2",
             params![format_ts(now), local_id],
         )?;
+        Ok(())
+    }
+
+    // ---- topics ---------------------------------------------------------
+
+    pub fn topics(&self) -> Result<Vec<Topic>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,name,parent_id,description FROM topics
+             ORDER BY IFNULL(parent_id,''), name_key, id",
+        )?;
+        let rows = statement.query_map([], map_topic)?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
+    pub fn topic(&self, id: &str) -> Result<Topic> {
+        self.connection()?
+            .query_row(
+                "SELECT id,name,parent_id,description FROM topics WHERE id=?1",
+                [id],
+                map_topic,
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("Topic {id}")))
+    }
+
+    /// All question-to-topic assignments as `(workbook_id, question_id,
+    /// topic_id)`. The catalog uses this to resolve topic scopes without a
+    /// query per question.
+    pub fn question_topics(&self) -> Result<Vec<(String, String, String)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT workbook_id,question_id,topic_id FROM question_topics
+             ORDER BY workbook_id,question_id,topic_id",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
+    pub fn insert_topic(&mut self, topic: &Topic, now: DateTime<Utc>) -> Result<()> {
+        topic.validate()?;
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        if let Some(parent) = topic.parent_id.as_deref() {
+            ensure_topic_parent(connection, parent, None)?;
+        }
+        let name_key = normalize_topic_name(&topic.name);
+        ensure_no_sibling(connection, topic.parent_id.as_deref(), &name_key, None)?;
+        connection.execute(
+            "INSERT INTO topics(id,name,name_key,parent_id,description,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                topic.id,
+                topic.name,
+                name_key,
+                topic.parent_id,
+                topic.description,
+                format_ts(now),
+                format_ts(now)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_topic(&mut self, topic: &Topic, now: DateTime<Utc>) -> Result<()> {
+        topic.validate()?;
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM topics WHERE id=?1",
+            [&topic.id],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Err(StorageError::NotFound(format!("Topic {}", topic.id)));
+        }
+        if let Some(parent) = topic.parent_id.as_deref() {
+            ensure_topic_parent(connection, parent, Some(&topic.id))?;
+        }
+        let name_key = normalize_topic_name(&topic.name);
+        ensure_no_sibling(
+            connection,
+            topic.parent_id.as_deref(),
+            &name_key,
+            Some(&topic.id),
+        )?;
+        connection.execute(
+            "UPDATE topics SET name=?2,name_key=?3,parent_id=?4,description=?5,updated_at=?6
+             WHERE id=?1",
+            params![
+                topic.id,
+                topic.name,
+                name_key,
+                topic.parent_id,
+                topic.description,
+                format_ts(now)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_topic(&mut self, id: &str) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let children: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM topics WHERE parent_id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if children > 0 {
+            return Err(StorageError::Conflict(
+                "子Topicがあるため削除できません。先に子Topicを移動してください".to_string(),
+            ));
+        }
+        let changed = connection.execute("DELETE FROM topics WHERE id=?1", [id])?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("Topic {id}")));
+        }
+        Ok(())
+    }
+
+    /// Replaces all topic assignments for one question. Used by the authoring
+    /// editor; the workbook JSON is updated by the service in the same
+    /// operation so export and import stay consistent.
+    pub fn set_question_topics(
+        &mut self,
+        workbook_id: &str,
+        question_id: &str,
+        topic_ids: &[String],
+    ) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let transaction = connection.transaction()?;
+        let question_exists: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM questions WHERE workbook_id=?1 AND question_id=?2",
+            params![workbook_id, question_id],
+            |row| row.get(0),
+        )?;
+        if question_exists == 0 {
+            return Err(StorageError::NotFound(format!(
+                "Question {workbook_id}/{question_id}"
+            )));
+        }
+        for topic_id in topic_ids {
+            let topic_exists: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM topics WHERE id=?1",
+                [topic_id],
+                |row| row.get(0),
+            )?;
+            if topic_exists == 0 {
+                return Err(StorageError::NotFound(format!("Topic {topic_id}")));
+            }
+        }
+        transaction.execute(
+            "DELETE FROM question_topics WHERE workbook_id=?1 AND question_id=?2",
+            params![workbook_id, question_id],
+        )?;
+        for topic_id in topic_ids {
+            transaction.execute(
+                "INSERT OR IGNORE INTO question_topics(workbook_id,question_id,topic_id)
+                 VALUES(?1,?2,?3)",
+                params![workbook_id, question_id, topic_id],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1301,6 +1496,24 @@ impl Storage {
             if seen_notes.insert((candidate.workbook_id.clone(), candidate.note_id.clone())) {
                 output.push(candidate);
             }
+        }
+        Ok(output)
+    }
+
+    /// Sibling reviews postponed to the next learning day. Scope-aware
+    /// candidate selection uses this so a buried question is never selected.
+    pub fn buried_questions(&self, now: DateTime<Utc>) -> Result<BTreeSet<(String, String)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT workbook_id,question_id FROM questions
+             WHERE buried_until IS NOT NULL AND buried_until>?1",
+        )?;
+        let rows = statement.query_map([format_ts(now)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut output = BTreeSet::new();
+        for row in rows {
+            output.insert(row?);
         }
         Ok(output)
     }
@@ -2627,6 +2840,110 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     })
 }
 
+fn map_topic(row: &rusqlite::Row<'_>) -> rusqlite::Result<Topic> {
+    Ok(Topic {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        parent_id: row.get(2)?,
+        description: row.get(3)?,
+    })
+}
+
+/// Resolves one authored path segment inside an import transaction, creating
+/// the topic when it does not exist under that parent. Returning the existing
+/// id is what makes topics shared across workbooks without being merged by
+/// name alone.
+fn ensure_topic(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    parent_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let name_key = normalize_topic_name(name);
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM topics
+             WHERE IFNULL(parent_id,'')=IFNULL(?1,'') AND name_key=?2",
+            params![parent_id, name_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO topics(id,name,name_key,parent_id,description,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,'',?5,?6)",
+        params![
+            id,
+            name,
+            name_key,
+            parent_id,
+            format_ts(now),
+            format_ts(now)
+        ],
+    )?;
+    Ok(id)
+}
+
+fn ensure_topic_parent(
+    connection: &Connection,
+    parent_id: &str,
+    updating: Option<&str>,
+) -> Result<()> {
+    let mut current = Some(parent_id.to_string());
+    let mut depth = 0usize;
+    while let Some(id) = current {
+        depth += 1;
+        if depth > workbook_domain::MAX_TOPIC_DEPTH {
+            return Err(StorageError::Validation(
+                "Topicの階層が深すぎます".to_string(),
+            ));
+        }
+        if updating == Some(id.as_str()) {
+            return Err(StorageError::Validation(
+                "子Topicを親にはできません".to_string(),
+            ));
+        }
+        current = match connection
+            .query_row("SELECT parent_id FROM topics WHERE id=?1", [&id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+        {
+            Some(parent) => parent,
+            None => {
+                return Err(StorageError::NotFound(format!("Topic {id}")));
+            }
+        };
+    }
+    Ok(())
+}
+
+fn ensure_no_sibling(
+    connection: &Connection,
+    parent_id: Option<&str>,
+    name_key: &str,
+    excluding: Option<&str>,
+) -> Result<()> {
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT id FROM topics
+             WHERE IFNULL(parent_id,'')=IFNULL(?1,'') AND name_key=?2
+               AND (?3 IS NULL OR id<>?3)",
+            params![parent_id, name_key, excluding],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Err(StorageError::Conflict(
+            "同じ親の下に同名のTopicがあります".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn map_exam(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exam> {
     let target_date: Option<String> = row.get(3)?;
     let scope_json: String = row.get(6)?;
@@ -2848,6 +3165,31 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
     if from < 6 {
         transaction
             .execute_batch("ALTER TABLE sessions ADD COLUMN time_budget_seconds INTEGER;")?;
+    }
+    if from < 7 {
+        transaction.execute_batch(
+            "CREATE TABLE topics(
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               name_key TEXT NOT NULL,
+               parent_id TEXT REFERENCES topics(id) ON DELETE RESTRICT,
+               description TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE UNIQUE INDEX topics_parent_name ON topics(IFNULL(parent_id,''), name_key);
+             CREATE INDEX topics_parent ON topics(parent_id);
+             CREATE TABLE question_topics(
+               workbook_id TEXT NOT NULL,
+               question_id TEXT NOT NULL,
+               topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+               PRIMARY KEY(workbook_id, question_id, topic_id),
+               FOREIGN KEY(workbook_id, question_id)
+                 REFERENCES questions(workbook_id, question_id) ON DELETE CASCADE
+             );
+             CREATE INDEX question_topics_topic
+               ON question_topics(topic_id, workbook_id, question_id);",
+        )?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;

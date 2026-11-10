@@ -177,6 +177,7 @@ impl WorkbookApp {
         sidebar = sidebar
             .child(self.nav_item("nav-today", "今日", "⌘1", Route::Today, cx))
             .child(self.nav_item("nav-library", "教材", "⌘2", Route::Library, cx))
+            .child(self.nav_item("nav-scope", "範囲", "⌘5", Route::Scope, cx))
             .child(self.nav_item("nav-history", "履歴", "⌘3", Route::History, cx))
             .child(self.nav_item("nav-exams", "試験", "⌘4", Route::Exams, cx))
             .child(self.nav_item("nav-settings", "設定", "⌘,", Route::Settings, cx));
@@ -321,6 +322,7 @@ impl WorkbookApp {
             Route::Today => self.render_today(cx),
             Route::Library => self.render_library(cx),
             Route::BookDetail => self.render_book_detail(cx),
+            Route::Scope => self.render_scope(cx),
             Route::History => self.render_history(cx),
             Route::Settings => self.render_settings(cx),
             Route::Exams => self.render_exams(cx),
@@ -942,12 +944,25 @@ impl WorkbookApp {
                     cx,
                 ))
                 .child(
-                    Button::new("library-import")
-                        .label("JSONを読み込む")
-                        .primary()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.import_json_dialog(window, cx);
-                        })),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("library-scope")
+                                .label("範囲学習")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_scope(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("library-import")
+                                .label("JSONを読み込む")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_json_dialog(window, cx);
+                                })),
+                        ),
                 ),
         );
         page = page.child(
@@ -1278,6 +1293,606 @@ impl WorkbookApp {
             )
             .child(div().text_size(px(20.0)).child(value))
             .into_any_element()
+    }
+
+    fn render_scope(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(state) = self.scope_editor.as_ref() else {
+            return self.empty_state(
+                "範囲が読み込まれていません",
+                "教材を読み込んでから範囲を選択してください。",
+                cx,
+            );
+        };
+        let preview = state.preview.clone().unwrap_or_default();
+        let total = preview.total;
+        let mut page = div().flex().flex_col().gap_6();
+        page = page.child(self.page_header(
+            "範囲",
+            "Workbook・Topic・個別問題を組み合わせて、教材を横断して学習します。",
+            cx,
+        ));
+
+        if let Some(error) = state.error.as_ref() {
+            page = page.child(
+                div()
+                    .p_3()
+                    .border_l_3()
+                    .border_color(theme.danger)
+                    .bg(theme.danger.opacity(0.08))
+                    .text_size(px(13.0))
+                    .child(error.clone()),
+            );
+        }
+
+        page = page.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_6()
+                .py(px(14.0))
+                .border_t_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(self.detail_stat("対象", total.to_string(), cx))
+                .child(self.detail_stat("学習済み", preview.studied.to_string(), cx))
+                .child(self.detail_stat("未学習", preview.unstudied.to_string(), cx))
+                .child(self.detail_stat("復習期限", preview.due.to_string(), cx))
+                .child(self.detail_stat("苦手", preview.weak.to_string(), cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.muted_foreground)
+                                .child("カバレッジ"),
+                        )
+                        .child(div().text_size(px(20.0)).child(match preview.coverage() {
+                            Some(value) => format!("{:.0}%", value * 100.0),
+                            None => "—".to_string(),
+                        })),
+                ),
+        );
+
+        page = page.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .py(px(12.0))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("時間"),
+                        )
+                        .children(
+                            [
+                                ("3分", Some(3 * 60)),
+                                ("5分", Some(5 * 60)),
+                                ("10分", Some(10 * 60)),
+                                ("20分", Some(20 * 60)),
+                                ("制限なし", None),
+                            ]
+                            .into_iter()
+                            .map(|(label, value)| {
+                                let selected = self.budget_seconds == value;
+                                Button::new(format!("scope-budget-{label}"))
+                                    .label(label)
+                                    .when(selected, |button| button.primary())
+                                    .when(!selected, |button| button.ghost())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.budget_seconds = value;
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("scope-review")
+                                .label("範囲を復習")
+                                .secondary()
+                                .disabled(total == 0)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_scope(Mode::Review, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("scope-plan")
+                                .label("この範囲で学習")
+                                .primary()
+                                .disabled(total == 0)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_scope(Mode::Plan, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("scope-practice")
+                                .label("練習")
+                                .ghost()
+                                .disabled(total == 0)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_scope(Mode::Practice, window, cx);
+                                })),
+                        ),
+                ),
+        );
+
+        // ---- topics -----------------------------------------------------
+        page = page.child(
+            div()
+                .flex()
+                .items_baseline()
+                .justify_between()
+                .child(div().text_size(px(15.0)).child("Topic"))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child("親を選ぶと、その下に作成できます。同名でも親が違えば別Topicです。"),
+                ),
+        );
+        let mut topic_list = div().flex().flex_col();
+        if state.topics.is_empty() {
+            topic_list = topic_list.child(
+                div()
+                    .py(px(10.0))
+                    .text_size(px(13.0))
+                    .text_color(theme.muted_foreground)
+                    .child("Topicはまだありません。下の入力から作成するか、教材JSONの topics にパスを記述してください。"),
+            );
+        }
+        for topic in state.topics.clone() {
+            let topic_id = topic.id.clone();
+            let included = state.selected_topics.contains(&topic.id);
+            let excluded = state.exclude_topics.contains(&topic.id);
+            let is_parent = state.parent_topic.as_deref() == Some(topic.id.as_str());
+            let is_editing = state.editing_topic.as_deref() == Some(topic.id.as_str());
+            let include_id = topic.id.clone();
+            let exclude_id = topic.id.clone();
+            let parent_id = topic.id.clone();
+            let edit_id = topic.id.clone();
+            let delete_id = topic.id.clone();
+            let delete_name = topic.path.clone();
+            let edit_name = topic.name.clone();
+            topic_list = topic_list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .py(px(9.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .flex_1()
+                            .child(
+                                Button::new(format!("scope-topic-toggle-{topic_id}"))
+                                    .label(if included { "含む" } else { "含める" })
+                                    .when(included, |button| button.primary())
+                                    .when(!included, |button| button.secondary())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            if state.selected_topics.contains(&include_id) {
+                                                state.selected_topics.remove(&include_id);
+                                            } else {
+                                                state.selected_topics.insert(include_id.clone());
+                                            }
+                                        }
+                                        this.refresh_scope_preview(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_size(px(15.0)).child(topic.path.clone()))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!(
+                                                "{}問 · 学習済み {} · 復習 {} · 苦手 {}",
+                                                topic.question_count,
+                                                topic.studied,
+                                                topic.due,
+                                                topic.weak
+                                            )),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("scope-topic-parent-{topic_id}"))
+                                    .label(if is_parent {
+                                        "親に設定中"
+                                    } else {
+                                        "この下に追加"
+                                    })
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            state.parent_topic = if state.parent_topic.as_deref()
+                                                == Some(parent_id.as_str())
+                                            {
+                                                None
+                                            } else {
+                                                Some(parent_id.clone())
+                                            };
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("scope-topic-edit-{topic_id}"))
+                                    .label(if is_editing { "編集中" } else { "改名" })
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let input = this.scope_topic_name.clone();
+                                        input.update(cx, |state, cx| {
+                                            state.set_value(edit_name.clone(), window, cx)
+                                        });
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            state.editing_topic = Some(edit_id.clone());
+                                            state.parent_topic = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("scope-topic-exclude-{topic_id}"))
+                                    .label(if excluded { "除外中" } else { "除外" })
+                                    .when(excluded, |button| button.danger())
+                                    .when(!excluded, |button| button.ghost())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            if state.exclude_topics.contains(&exclude_id) {
+                                                state.exclude_topics.remove(&exclude_id);
+                                            } else {
+                                                state.exclude_topics.insert(exclude_id.clone());
+                                            }
+                                        }
+                                        this.refresh_scope_preview(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("scope-topic-delete-{topic_id}"))
+                                    .label("削除")
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.modal = Some(crate::Modal::DeleteTopic {
+                                            id: delete_id.clone(),
+                                            name: delete_name.clone(),
+                                        });
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        page = page.child(topic_list);
+
+        let parent_label = state
+            .parent_topic
+            .as_ref()
+            .and_then(|id| state.topics.iter().find(|topic| &topic.id == id))
+            .map(|topic| topic.path.clone())
+            .unwrap_or_else(|| "ルート".to_string());
+        let editing = state.editing_topic.is_some();
+        page = page.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(360.0))
+                        .child(Input::new(&self.scope_topic_name).id("scope-topic-name")),
+                )
+                .child(
+                    Button::new("scope-topic-save")
+                        .label(if editing {
+                            "Topicを更新"
+                        } else {
+                            "Topicを作成"
+                        })
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.save_scope_topic(window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("親: {parent_label}")),
+                )
+                .when(state.parent_topic.is_some() || editing, |row| {
+                    row.child(
+                        Button::new("scope-topic-clear")
+                            .label("解除")
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(state) = this.scope_editor.as_mut() {
+                                    state.parent_topic = None;
+                                    state.editing_topic = None;
+                                }
+                                this.scope_topic_name
+                                    .update(cx, |state, cx| state.set_value("", window, cx));
+                                cx.notify();
+                            })),
+                    )
+                }),
+        );
+
+        // ---- workbooks --------------------------------------------------
+        page = page.child(
+            div()
+                .flex()
+                .items_baseline()
+                .justify_between()
+                .child(div().text_size(px(15.0)).child("Workbook"))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child(if state.match_all {
+                            "いまは Workbook と Topic の両方を満たす問題 (AND) です"
+                        } else {
+                            "いまは Workbook または Topic に一致する問題 (OR) です"
+                        }),
+                ),
+        );
+        let mut book_list = div().flex().flex_col();
+        for book in &self.snapshot.books {
+            let include_id = book.local_id.clone();
+            let exclude_id = book.local_id.clone();
+            let included = state.selected_workbooks.contains(&book.local_id);
+            let excluded = state.exclude_workbooks.contains(&book.local_id);
+            book_list = book_list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .py(px(9.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_size(px(15.0)).child(book.title.clone()))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "{}問 · 学習済み {} · 復習 {} · 新規 {}",
+                                        book.total, book.learned, book.due, book.new_available
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("scope-book-toggle-{include_id}"))
+                                    .label(if included { "含む" } else { "含める" })
+                                    .when(included, |button| button.primary())
+                                    .when(!included, |button| button.secondary())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            if state.selected_workbooks.contains(&include_id) {
+                                                state.selected_workbooks.remove(&include_id);
+                                            } else {
+                                                state.selected_workbooks.insert(include_id.clone());
+                                            }
+                                        }
+                                        this.refresh_scope_preview(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("scope-book-exclude-{exclude_id}"))
+                                    .label(if excluded { "除外中" } else { "除外" })
+                                    .when(excluded, |button| button.danger())
+                                    .when(!excluded, |button| button.ghost())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            if state.exclude_workbooks.contains(&exclude_id) {
+                                                state.exclude_workbooks.remove(&exclude_id);
+                                            } else {
+                                                state.exclude_workbooks.insert(exclude_id.clone());
+                                            }
+                                        }
+                                        this.refresh_scope_preview(cx);
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        page = page.child(book_list);
+
+        if !state.selected_workbooks.is_empty() && !state.selected_topics.is_empty() {
+            page = page.child(
+                div().flex().items_center().gap_2().child(
+                    Button::new("scope-match-mode")
+                        .label(if state.match_all {
+                            "Workbook と Topic の両方 (AND)"
+                        } else {
+                            "Workbook または Topic (OR)"
+                        })
+                        .secondary()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(state) = this.scope_editor.as_mut() {
+                                state.match_all = !state.match_all;
+                            }
+                            this.refresh_scope_preview(cx);
+                        })),
+                ),
+            );
+        }
+
+        // ---- individual questions --------------------------------------
+        let needle = self.scope_search_text.to_lowercase();
+        let mut question_list = div().flex().flex_col();
+        let mut shown = 0usize;
+        for question in state.catalog.iter() {
+            if shown >= 40 {
+                break;
+            }
+            let haystack = format!(
+                "{} {} {}",
+                question.question_prompt, question.question_id, question.workbook_title
+            )
+            .to_lowercase();
+            if !needle.is_empty() && !haystack.contains(&needle) {
+                continue;
+            }
+            shown += 1;
+            let key =
+                crate::QuestionKey::new(question.workbook_id.clone(), question.question_id.clone());
+            let included = state.include.contains(&key);
+            let excluded = state.exclude.contains(&key);
+            let include_key = key.clone();
+            let exclude_key = key.clone();
+            let prompt = question
+                .question_prompt
+                .chars()
+                .take(90)
+                .collect::<String>();
+            question_list = question_list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .py(px(7.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(div().text_size(px(13.0)).child(if prompt.is_empty() {
+                                format!("{} / {}", question.workbook_title, question.question_id)
+                            } else {
+                                prompt
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "{} · {}",
+                                        question.workbook_title, question.question_id
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(format!(
+                                    "scope-question-include-{}",
+                                    question.question_id
+                                ))
+                                .label(if included { "追加済み" } else { "追加" })
+                                .when(included, |button| button.primary())
+                                .when(!included, |button| button.ghost())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            if state.include.contains(&include_key) {
+                                                state.include.remove(&include_key);
+                                            } else {
+                                                state.include.insert(include_key.clone());
+                                            }
+                                        }
+                                        this.refresh_scope_preview(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new(format!(
+                                    "scope-question-exclude-{}",
+                                    question.question_id
+                                ))
+                                .label(if excluded { "除外中" } else { "除外" })
+                                .when(excluded, |button| button.danger())
+                                .when(!excluded, |button| button.ghost())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if let Some(state) = this.scope_editor.as_mut() {
+                                            if state.exclude.contains(&exclude_key) {
+                                                state.exclude.remove(&exclude_key);
+                                            } else {
+                                                state.exclude.insert(exclude_key.clone());
+                                            }
+                                        }
+                                        this.refresh_scope_preview(cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+        }
+        page = page.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .justify_between()
+                        .child(div().text_size(px(15.0)).child("個別問題"))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("追加はOR、除外は最後に適用されます。"),
+                        ),
+                )
+                .child(Input::new(&self.scope_search).id("scope-question-search"))
+                .child(question_list),
+        );
+
+        page.into_any_element()
     }
 
     fn render_exams(&self, cx: &mut Context<Self>) -> AnyElement {

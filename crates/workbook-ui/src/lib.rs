@@ -52,6 +52,7 @@ pub(crate) enum Route {
     Exams,
     ExamDetail,
     ExamEditor,
+    Scope,
     Study,
 }
 
@@ -92,6 +93,10 @@ pub(crate) enum Modal {
     DeleteExam {
         id: String,
         title: String,
+    },
+    DeleteTopic {
+        id: String,
+        name: String,
     },
 }
 
@@ -134,6 +139,99 @@ pub(crate) struct ExamEditorState {
     pub question_search: Entity<InputState>,
 }
 
+/// Transient state for the cross-workbook scope screen. The saved scope lives
+/// only in exams/goals; this draft is rebuilt from the service on demand.
+pub(crate) struct ScopeState {
+    pub selected_workbooks: BTreeSet<String>,
+    pub selected_topics: BTreeSet<String>,
+    pub include: BTreeSet<QuestionKey>,
+    pub exclude: BTreeSet<QuestionKey>,
+    pub exclude_workbooks: BTreeSet<String>,
+    pub exclude_topics: BTreeSet<String>,
+    pub match_all: bool,
+    pub parent_topic: Option<String>,
+    pub editing_topic: Option<String>,
+    pub catalog: Vec<workbook_domain::ExamCatalogQuestion>,
+    pub topics: Vec<workbook_service::TopicSummary>,
+    pub preview: Option<workbook_service::ScopePreview>,
+    pub error: Option<String>,
+}
+
+impl ScopeState {
+    fn new(
+        catalog: Vec<workbook_domain::ExamCatalogQuestion>,
+        topics: Vec<workbook_service::TopicSummary>,
+    ) -> Self {
+        Self {
+            selected_workbooks: BTreeSet::new(),
+            selected_topics: BTreeSet::new(),
+            include: BTreeSet::new(),
+            exclude: BTreeSet::new(),
+            exclude_workbooks: BTreeSet::new(),
+            exclude_topics: BTreeSet::new(),
+            match_all: false,
+            parent_topic: None,
+            editing_topic: None,
+            catalog,
+            topics,
+            preview: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn scope(&self) -> ExamScope {
+        let workbook_ids: Vec<String> = self.selected_workbooks.iter().cloned().collect();
+        let topic_ids: Vec<String> = self.selected_topics.iter().cloned().collect();
+        let mut groups = Vec::new();
+        match (workbook_ids.is_empty(), topic_ids.is_empty()) {
+            (false, false) if self.match_all => groups.push(ExamScopeGroup {
+                workbook_ids,
+                tags: Vec::new(),
+                topics: topic_ids,
+            }),
+            (false, false) => {
+                groups.push(ExamScopeGroup {
+                    workbook_ids,
+                    tags: Vec::new(),
+                    topics: Vec::new(),
+                });
+                groups.push(ExamScopeGroup {
+                    workbook_ids: Vec::new(),
+                    tags: Vec::new(),
+                    topics: topic_ids,
+                });
+            }
+            (false, true) => groups.push(ExamScopeGroup {
+                workbook_ids,
+                tags: Vec::new(),
+                topics: Vec::new(),
+            }),
+            (true, false) => groups.push(ExamScopeGroup {
+                workbook_ids: Vec::new(),
+                tags: Vec::new(),
+                topics: topic_ids,
+            }),
+            (true, true) => {}
+        }
+        ExamScope {
+            groups,
+            include_questions: self
+                .include
+                .iter()
+                .map(|key| QuestionRef::new(key.workbook_id.clone(), key.question_id.clone()))
+                .collect(),
+            exclude_questions: self
+                .exclude
+                .iter()
+                .map(|key| QuestionRef::new(key.workbook_id.clone(), key.question_id.clone()))
+                .collect(),
+            exclude_workbooks: self.exclude_workbooks.iter().cloned().collect(),
+            exclude_tags: Vec::new(),
+            exclude_topics: self.exclude_topics.iter().cloned().collect(),
+        }
+    }
+}
+
 pub struct WorkbookApp {
     pub(crate) service: Arc<WorkbookService>,
     pub(crate) route: Route,
@@ -145,6 +243,11 @@ pub struct WorkbookApp {
     pub(crate) exams: Vec<ExamSummary>,
     pub(crate) selected_exam: Option<String>,
     pub(crate) exam_editor: Option<ExamEditorState>,
+    pub(crate) scope_editor: Option<ScopeState>,
+    pub(crate) scope_search_text: String,
+    pub(crate) scope_search: Entity<InputState>,
+    pub(crate) scope_topic_name: Entity<InputState>,
+    pub(crate) scope_subscription: Option<Subscription>,
     pub(crate) practice_strategy: PracticeStrategy,
     pub(crate) budget_seconds: Option<u32>,
     pub(crate) practice_limit_input: Entity<InputState>,
@@ -240,6 +343,8 @@ impl WorkbookApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("問題数（空=すべて）"));
         let mock_minutes_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("制限時間（分・空=なし）"));
+        let scope_search = cx.new(|cx| InputState::new(window, cx).placeholder("問題文・IDで検索"));
+        let scope_topic_name = cx.new(|cx| InputState::new(window, cx).placeholder("Topic名"));
 
         let mut app = Self {
             service,
@@ -252,6 +357,11 @@ impl WorkbookApp {
             exams: Vec::new(),
             selected_exam: None,
             exam_editor: None,
+            scope_editor: None,
+            scope_search_text: String::new(),
+            scope_search,
+            scope_topic_name,
+            scope_subscription: None,
             practice_strategy: PracticeStrategy::All,
             budget_seconds: Some(10 * 60),
             practice_limit_input,
@@ -297,6 +407,16 @@ impl WorkbookApp {
             }
         });
         let _ = subscription;
+
+        let scope_search = app.scope_search.clone();
+        let scope_subscription =
+            cx.subscribe_in(&scope_search, window, |this, state, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.scope_search_text = state.read(cx).value().to_string();
+                    cx.notify();
+                }
+            });
+        app.scope_subscription = Some(scope_subscription);
 
         let short = app.short_input.clone();
         let draft_subscription = cx.subscribe_in(&short, window, |this, _, event, window, cx| {
@@ -448,6 +568,10 @@ impl WorkbookApp {
             cx.notify();
             return;
         }
+        if route == Route::Scope {
+            self.open_scope(window, cx);
+            return;
+        }
         self.route = route;
         if matches!(route, Route::Today | Route::Library) {
             self.refresh(cx);
@@ -540,6 +664,188 @@ impl WorkbookApp {
             .service
             .start_session_with_budget(mode, book.as_deref(), budget)
         {
+            Ok(()) => {
+                self.refresh(cx);
+                if let Some(active) = self.snapshot.active.clone() {
+                    self.study = Some(active);
+                    self.route = Route::Study;
+                    self.notice = None;
+                    self.prepare_question(window, cx);
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn open_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let catalog = match self.service.exam_catalog() {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let topics = match self.service.topics() {
+            Ok(topics) => topics,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        match self.scope_editor.as_mut() {
+            Some(state) => {
+                state.catalog = catalog;
+                state.topics = topics;
+            }
+            None => self.scope_editor = Some(ScopeState::new(catalog, topics)),
+        }
+        self.route = Route::Scope;
+        self.notice = None;
+        self.refresh_scope_preview(cx);
+        window.focus(&self.root_focus, cx);
+    }
+
+    pub(crate) fn refresh_scope_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.scope_editor.as_mut() else {
+            return;
+        };
+        let scope = state.scope();
+        match self.service.scope_preview(&scope) {
+            Ok(preview) => {
+                state.preview = Some(preview);
+                state.error = None;
+            }
+            Err(error) => {
+                state.preview = None;
+                state.error = Some(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn reload_scope_data(&mut self, cx: &mut Context<Self>) {
+        let catalog = match self.service.exam_catalog() {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let topics = match self.service.topics() {
+            Ok(topics) => topics,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(state) = self.scope_editor.as_mut() {
+            state.catalog = catalog;
+            state.topics = topics;
+            // Drop selections that no longer exist.
+            let workbook_ids: BTreeSet<String> = state
+                .catalog
+                .iter()
+                .map(|q| q.workbook_id.clone())
+                .collect();
+            let topic_ids: BTreeSet<String> =
+                state.topics.iter().map(|topic| topic.id.clone()).collect();
+            state
+                .selected_workbooks
+                .retain(|id| workbook_ids.contains(id));
+            state.selected_topics.retain(|id| topic_ids.contains(id));
+            state.exclude_topics.retain(|id| topic_ids.contains(id));
+            if state
+                .parent_topic
+                .as_ref()
+                .is_some_and(|id| !topic_ids.contains(id))
+            {
+                state.parent_topic = None;
+            }
+        }
+        self.refresh_scope_preview(cx);
+    }
+
+    pub(crate) fn save_scope_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.scope_topic_name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            if let Some(state) = self.scope_editor.as_mut() {
+                state.error = Some("Topic名を入力してください".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        let (parent, editing) = match self.scope_editor.as_ref() {
+            Some(state) => (state.parent_topic.clone(), state.editing_topic.clone()),
+            None => (None, None),
+        };
+        let result = if let Some(id) = editing.as_deref() {
+            self.service.update_topic(id, &name, parent.as_deref(), "")
+        } else {
+            self.service
+                .create_topic(&name, parent.as_deref(), "")
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                self.scope_topic_name
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                if let Some(state) = self.scope_editor.as_mut() {
+                    state.editing_topic = None;
+                }
+                self.notice_success(if editing.is_some() {
+                    "Topicを更新しました"
+                } else {
+                    "Topicを作成しました"
+                });
+                self.reload_scope_data(cx);
+            }
+            Err(error) => {
+                if let Some(state) = self.scope_editor.as_mut() {
+                    state.error = Some(error.to_string());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn confirm_delete_topic(&mut self, id: String, cx: &mut Context<Self>) {
+        match self.service.delete_topic(&id) {
+            Ok(()) => {
+                self.modal = None;
+                self.notice_success("Topicを削除しました");
+                self.reload_scope_data(cx);
+            }
+            Err(error) => {
+                self.modal = None;
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn start_scope(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.scope_editor.as_ref() else {
+            return;
+        };
+        let scope = state.scope();
+        let budget = self.budget_seconds;
+        let result = match mode {
+            Mode::Review => self.service.start_scope_review(&scope, budget),
+            Mode::Plan => self.service.start_scope_plan(&scope, budget),
+            Mode::Practice => self.service.start_scope_practice(&scope, budget, None),
+            Mode::New | Mode::Mock => Err(workbook_service::ServiceError::Invalid(
+                "この範囲では復習・計画・練習を開始できます".to_string(),
+            )),
+        };
+        match result {
             Ok(()) => {
                 self.refresh(cx);
                 if let Some(active) = self.snapshot.active.clone() {
@@ -739,6 +1045,7 @@ impl WorkbookApp {
                 .map(|group| ExamScopeGroup {
                     workbook_ids: group.workbook_ids.iter().cloned().collect(),
                     tags: group.tags.iter().cloned().collect(),
+                    topics: Vec::new(),
                 })
                 .collect(),
             include_questions: editor
@@ -753,6 +1060,7 @@ impl WorkbookApp {
                 .collect(),
             exclude_workbooks: editor.exclude_workbooks.iter().cloned().collect(),
             exclude_tags: editor.exclude_tags.iter().cloned().collect(),
+            exclude_topics: Vec::new(),
         })
     }
 
@@ -1694,6 +2002,16 @@ impl WorkbookApp {
                 .settings_new_limit
                 .read(cx)
                 .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .scope_search
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .scope_topic_name
+                .read(cx)
+                .focus_handle(cx)
                 .is_focused(window);
         focused |= self
             .practice_limit_input
@@ -1770,6 +2088,10 @@ impl WorkbookApp {
                 }
                 "4" => {
                     self.go(Route::Exams, window, cx);
+                    return;
+                }
+                "5" => {
+                    self.go(Route::Scope, window, cx);
                     return;
                 }
                 "," => {

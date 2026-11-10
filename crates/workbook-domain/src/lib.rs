@@ -12,6 +12,7 @@ pub mod grading;
 pub mod question_format;
 pub mod session;
 pub mod settings;
+pub mod topic;
 pub mod workbook;
 
 pub use answer::{Answer, answer_is_blank, automatic_rating, grade_answer, normalize_answer};
@@ -21,6 +22,10 @@ pub use exam::{
     Exam, ExamCatalogQuestion, ExamDraft, ExamScope, ExamScopeGroup, ExamStudyMode, MockOptions,
     MockOrder, PracticeOptions, PracticeStrategy, QuestionRef, resolve_scope,
 };
+
+/// The general name for the same composable selection rules used by exams and
+/// goals. Exam names remain for backward compatibility.
+pub type StudyScope = ExamScope;
 pub use grading::{
     AssistState, GradeDiagnostic, GradeResult, GradeStatus, NearMissReason, NearMissRecord,
     grade_answer_detailed,
@@ -36,6 +41,10 @@ pub use session::{
     CardState, Mode, Phase, Rating, RatingSource, SessionItemStatus, SessionStatus, StoredCard,
 };
 pub use settings::{Settings, ThemeSetting};
+pub use topic::{
+    MAX_TOPIC_DEPTH, MAX_TOPIC_DESCRIPTION_CHARS, MAX_TOPIC_NAME_CHARS, Topic, expand_topic_ids,
+    normalize_topic_name, parse_topic_path, topic_path, validate_topic_name,
+};
 pub use workbook::{
     ChoiceOption, MAX_JSON_BYTES, Note, Question, QuestionType, ValidationError, Workbook,
     parse_workbook, parse_workbook_value,

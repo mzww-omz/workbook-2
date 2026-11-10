@@ -269,6 +269,38 @@ impl WorkbookApp {
                     )
                     .into_any_element(),
             ),
+            Modal::DeleteTopic { id, name } => (
+                "Topicを削除しますか？".to_string(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!("「{name}」を削除します。"))
+                    .child("問題・学習履歴・FSRS状態は削除されません。このTopicへの割当だけが外れます。")
+                    .child("子Topicがある場合は削除できません。先に子Topicを移動してください。")
+                    .into_any_element(),
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("modal-delete-topic-cancel")
+                            .label("キャンセル")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("modal-delete-topic-confirm")
+                            .label("削除する")
+                            .danger()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm_delete_topic(id.clone(), cx);
+                            })),
+                    )
+                    .into_any_element(),
+            ),
             Modal::ResetHistory => (
                 "学習履歴をリセット".to_string(),
                 div()

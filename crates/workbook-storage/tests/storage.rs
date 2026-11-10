@@ -7,6 +7,30 @@ use workbook_scheduler::{Clock, FixedClock};
 use workbook_service::{SAMPLE_WORKBOOK_JSON, WorkbookService};
 use workbook_storage::Storage;
 
+const TOPIC_SCHEMA: &str = r#"CREATE TABLE topics(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  name_key TEXT NOT NULL,
+  parent_id TEXT REFERENCES topics(id) ON DELETE RESTRICT,
+  description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX topics_parent_name ON topics(IFNULL(parent_id,''), name_key);
+CREATE INDEX topics_parent ON topics(parent_id);
+
+CREATE TABLE question_topics(
+  workbook_id TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  PRIMARY KEY(workbook_id, question_id, topic_id),
+  FOREIGN KEY(workbook_id, question_id)
+    REFERENCES questions(workbook_id, question_id) ON DELETE CASCADE
+);
+CREATE INDEX question_topics_topic ON question_topics(topic_id, workbook_id, question_id);
+
+"#;
+
 #[test]
 fn version_one_data_survives_the_v4_migration() {
     let dir = tempdir().unwrap();
@@ -61,6 +85,7 @@ fn version_one_data_survives_the_v4_migration() {
 
 fn v3_schema_sql() -> String {
     workbook_storage::schema::SCHEMA_SQL
+        .replace(TOPIC_SCHEMA, "")
         .replace(
             "  revision INTEGER NOT NULL DEFAULT 0,\n  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,\n  time_limit_seconds INTEGER,\n  time_budget_seconds INTEGER\n",
             "  revision INTEGER NOT NULL DEFAULT 0\n",
@@ -190,7 +215,7 @@ fn version_five_database_gains_time_budget_without_losing_sessions() {
     {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch(workbook_storage::schema::SCHEMA_SQL)
+            .execute_batch(&workbook_storage::schema::SCHEMA_SQL.replace(TOPIC_SCHEMA, ""))
             .unwrap();
         connection
             .execute_batch(
@@ -222,6 +247,46 @@ fn version_five_database_gains_time_budget_without_losing_sessions() {
 }
 
 #[test]
+fn version_six_database_gains_topics_without_losing_learning_state() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&workbook_storage::schema::SCHEMA_SQL.replace(TOPIC_SCHEMA, ""))
+            .unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA application_id=1463962418;
+                 PRAGMA user_version=6;
+                 INSERT INTO meta(key,value) VALUES('app','workbook-2');
+                 INSERT INTO sessions(id,mode,status,started_at,phase)
+                   VALUES('s1','review','ended','2026-01-01T00:00:00.000Z','overall_result');",
+            )
+            .unwrap();
+    }
+    let storage = Storage::open(dir.path()).unwrap();
+    assert!(storage.topics().unwrap().is_empty());
+    assert!(storage.question_topics().unwrap().is_empty());
+    assert_eq!(storage.session_bundle("s1").unwrap().session.id, "s1");
+    drop(storage);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+               AND name IN ('topics','question_topics')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 2);
+}
+
+#[test]
 fn daily_backups_keep_seven_generations_and_private_permissions() {
     let dir = tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
@@ -245,6 +310,7 @@ fn daily_backups_keep_seven_generations_and_private_permissions() {
 
 fn v1_schema_sql() -> String {
     workbook_storage::schema::SCHEMA_SQL
+        .replace(TOPIC_SCHEMA, "")
         .replace("  rating_source TEXT NOT NULL DEFAULT 'manual',\n", "")
         .replace("  assist_json TEXT,\n", "")
         .replace(
@@ -412,7 +478,7 @@ fn version_four_backup_without_daily_minutes_is_validated_and_upgraded() {
     {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch(workbook_storage::schema::SCHEMA_SQL)
+            .execute_batch(&workbook_storage::schema::SCHEMA_SQL.replace(TOPIC_SCHEMA, ""))
             .unwrap();
         connection
             .execute_batch(
