@@ -301,6 +301,39 @@ impl WorkbookApp {
                     )
                     .into_any_element(),
             ),
+            Modal::DeleteGoal { id, title } => (
+                "Goalを削除しますか？".to_string(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!("「{title}」を削除します。"))
+                    .child("教材・問題・学習履歴・FSRS状態は削除されません。Goalの条件だけが削除されます。")
+                    .child("試験をGoal一覧から削除した場合は、試験の模試履歴も削除されます。")
+                    .child("削除前に安全用バックアップを自動作成します。")
+                    .into_any_element(),
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("modal-delete-goal-cancel")
+                            .label("キャンセル")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("modal-delete-goal-confirm")
+                            .label("削除する")
+                            .danger()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm_delete_goal(id.clone(), cx);
+                            })),
+                    )
+                    .into_any_element(),
+            ),
             Modal::ResetHistory => (
                 "学習履歴をリセット".to_string(),
                 div()

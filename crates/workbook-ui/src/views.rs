@@ -179,7 +179,7 @@ impl WorkbookApp {
             .child(self.nav_item("nav-library", "教材", "⌘2", Route::Library, cx))
             .child(self.nav_item("nav-scope", "範囲", "⌘5", Route::Scope, cx))
             .child(self.nav_item("nav-history", "履歴", "⌘3", Route::History, cx))
-            .child(self.nav_item("nav-exams", "試験", "⌘4", Route::Exams, cx))
+            .child(self.nav_item("nav-goals", "目標", "⌘4", Route::Exams, cx))
             .child(self.nav_item("nav-settings", "設定", "⌘,", Route::Settings, cx));
 
         if let Some(active) = self.snapshot.active.as_ref()
@@ -328,6 +328,7 @@ impl WorkbookApp {
             Route::Exams => self.render_exams(cx),
             Route::ExamDetail => self.render_exam_detail(cx),
             Route::ExamEditor => self.render_exam_editor(cx),
+            Route::GoalDetail => self.render_goal_detail(cx),
             Route::Study => self.render_study(cx),
         };
         container.child(page).into_any_element()
@@ -653,6 +654,67 @@ impl WorkbookApp {
                         ),
                 ),
         );
+
+        if !self.snapshot.goals.is_empty() {
+            let mut goals = div().flex().flex_col();
+            for goal in self.snapshot.goals.iter().take(4) {
+                let id = goal.id.clone();
+                let coverage = goal
+                    .coverage
+                    .map(|value| format!("{:.0}%", value * 100.0))
+                    .unwrap_or_else(|| "—".to_string());
+                let target = match goal.target_date {
+                    Some(date) if goal.expired => format!("期限切れ {date}"),
+                    Some(date) => format!(
+                        "{date}（あと{}日）",
+                        goal.days_remaining.unwrap_or(0).max(0)
+                    ),
+                    None => "期限なし".to_string(),
+                };
+                goals = goals.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .py(px(10.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_size(px(15.0)).child(goal.title.clone()))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!(
+                                            "{target} · 対象 {} · 学習済み {} · 復習 {} · カバレッジ {}",
+                                            goal.total, goal.studied, goal.due, coverage
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Button::new(format!("today-goal-{id}"))
+                                .label("開く")
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_goal(id.clone(), window, cx);
+                                })),
+                        ),
+                );
+            }
+            page = page
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child("目標"),
+                )
+                .child(goals);
+        }
 
         if today.due == 0 && today.short_term_pending > 0 {
             page = page.child(
@@ -1892,21 +1954,100 @@ impl WorkbookApp {
                 .child(question_list),
         );
 
+        page = page.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .justify_between()
+                        .child(div().text_size(px(15.0)).child("この範囲をGoalにする"))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("期限は任意です。1日の学習時間から今日の計画を作ります。"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_end()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .w(px(320.0))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child("Goal名"),
+                                )
+                                .child(Input::new(&self.goal_title_input).id("scope-goal-title")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .w(px(220.0))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child("期限（任意）"),
+                                )
+                                .child(Input::new(&self.goal_date_input).id("scope-goal-date")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .w(px(150.0))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child("1日の学習時間（分）"),
+                                )
+                                .child(
+                                    Input::new(&self.goal_minutes_input).id("scope-goal-minutes"),
+                                ),
+                        )
+                        .child(
+                            Button::new("scope-goal-create")
+                                .label("Goalを作成")
+                                .primary()
+                                .disabled(total == 0)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.create_goal_from_scope(window, cx);
+                                })),
+                        ),
+                ),
+        );
+
         page.into_any_element()
     }
 
     fn render_exams(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let active: Vec<_> = self
-            .exams
+            .goals
             .iter()
-            .filter(|summary| !summary.exam.is_archived())
+            .filter(|summary| !summary.goal.is_archived())
             .cloned()
             .collect();
         let archived: Vec<_> = self
-            .exams
+            .goals
             .iter()
-            .filter(|summary| summary.exam.is_archived())
+            .filter(|summary| summary.goal.is_archived())
             .cloned()
             .collect();
         let mut page = div().flex().flex_col().gap_6();
@@ -1916,24 +2057,37 @@ impl WorkbookApp {
                 .items_end()
                 .justify_between()
                 .child(self.page_header(
-                    "試験",
-                    "範囲は保存された条件から毎回解決されます。問題をコピーしません。",
+                    "目標",
+                    "期限のある試験も、期限のない個人学習も同じモデルです。範囲は保存された条件から毎回解決されます。",
                     cx,
                 ))
                 .child(
-                    Button::new("exam-new")
-                        .label("新しい試験")
-                        .primary()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_exam_editor(None, window, cx);
-                        })),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("goal-new")
+                                .label("新しいGoal")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_scope(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("exam-new")
+                                .label("新しい試験")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_exam_editor(None, window, cx);
+                                })),
+                        ),
                 ),
         );
         if active.is_empty() && archived.is_empty() {
             return page
                 .child(self.empty_state(
-                    "試験がありません",
-                    "教材・タグ・個別問題を組み合わせて、学習範囲を作成できます。",
+                    "目標がありません",
+                    "範囲を選んでGoalを作成するか、模試付きの試験を作成できます。",
                     cx,
                 ))
                 .into_any_element();
@@ -1941,7 +2095,7 @@ impl WorkbookApp {
 
         let mut list = div().flex().flex_col();
         for summary in &active {
-            list = list.child(self.exam_row(summary, cx));
+            list = list.child(self.goal_row(summary, cx));
         }
         page = page.child(list);
         if !archived.is_empty() {
@@ -1954,28 +2108,45 @@ impl WorkbookApp {
             );
             let mut archive_list = div().flex().flex_col();
             for summary in &archived {
-                archive_list = archive_list.child(self.exam_row(summary, cx));
+                archive_list = archive_list.child(self.goal_row(summary, cx));
             }
             page = page.child(archive_list);
         }
         page.into_any_element()
     }
 
-    fn exam_row(
+    fn goal_row(
         &self,
-        summary: &workbook_service::ExamSummary,
+        summary: &workbook_service::GoalSummary,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
-        let id_open = summary.exam.id.clone();
-        let id_archive = summary.exam.id.clone();
-        let archived = summary.exam.is_archived();
-        let title = summary.exam.title.clone();
-        let target = exam_target_line(summary);
+        let id_open = summary.goal.id.clone();
+        let id_archive = summary.goal.id.clone();
+        let id_exam = summary.goal.exam_id.clone();
+        let archived = summary.goal.is_archived();
+        let title = summary.goal.title.clone();
+        let source = if summary.goal.exam_id.is_some() {
+            "試験"
+        } else {
+            "個人目標"
+        };
+        let target = goal_target_line(summary);
         let coverage = summary
             .coverage
             .map(|value| format!("{:.0}%", value * 100.0))
             .unwrap_or_else(|| "—".to_string());
+        let accuracy = summary
+            .first_pass_accuracy
+            .map(|value| {
+                format!(
+                    "初回正答 {} / {} ({:.0}%)",
+                    summary.first_pass_correct,
+                    summary.first_pass_graded,
+                    value * 100.0
+                )
+            })
+            .unwrap_or_else(|| "初回正答 —".to_string());
         div()
             .flex()
             .flex_col()
@@ -2001,6 +2172,12 @@ impl WorkbookApp {
                                     .items_baseline()
                                     .gap_3()
                                     .child(div().text_size(px(20.0)).child(title))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(source),
+                                    )
                                     .when(archived, |row| {
                                         row.child(
                                             div()
@@ -2015,46 +2192,55 @@ impl WorkbookApp {
                                     .text_size(px(12.0))
                                     .text_color(theme.muted_foreground)
                                     .child(format!(
-                                        "範囲 {} · 学習済み {} · 期限 {} · 苦手 {} · 今日 {}問 · カバレッジ {}",
+                                        "対象 {} · 学習済み {} · 未学習 {} · 期限 {} · 苦手 {} · カバレッジ {}",
                                         summary.total,
                                         summary.studied,
+                                        summary.unstudied,
                                         summary.due,
                                         summary.weak,
-                                        summary.plan.coverage.selected,
                                         coverage
                                     )),
                             )
-                            .when_some(target, |column, target| {
-                                column.child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(theme.muted_foreground)
-                                        .child(target),
-                                )
-                            }),
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "{} · {accuracy} · 1日 {}分 · 今日 {}問",
+                                        target,
+                                        summary.goal.daily_minutes,
+                                        summary.plan.coverage.selected
+                                    )),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .child(
-                                Button::new(format!("exam-open-{}", summary.exam.id))
+                                Button::new(format!("goal-open-{}", summary.goal.id))
                                     .label("開く")
                                     .secondary()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_exam(id_open.clone(), cx);
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_goal(id_open.clone(), window, cx);
                                     })),
                             )
+                            .when_some(id_exam.clone(), |row, exam_id| {
+                                row.child(
+                                    Button::new(format!("goal-exam-{exam_id}"))
+                                        .label("試験詳細")
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_exam(exam_id.clone(), cx);
+                                        })),
+                                )
+                            })
                             .child(
-                                Button::new(format!("exam-archive-{}", summary.exam.id))
-                                    .label(if archived {
-                                        "再開"
-                                    } else {
-                                        "アーカイブ"
-                                    })
+                                Button::new(format!("goal-archive-{}", summary.goal.id))
+                                    .label(if archived { "再開" } else { "アーカイブ" })
                                     .ghost()
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_exam_archive(id_archive.clone(), !archived, cx);
+                                        this.toggle_goal_archive(id_archive.clone(), !archived, cx);
                                     })),
                             ),
                     ),
@@ -2488,6 +2674,324 @@ impl WorkbookApp {
             }
             page = page.child(rows);
         }
+
+        page.into_any_element()
+    }
+
+    fn render_goal_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(summary) = self.selected_goal_summary().cloned() else {
+            return self.empty_state("目標が見つかりません", "目標一覧へ戻ってください。", cx);
+        };
+        let id_delete = summary.goal.id.clone();
+        let title = summary.goal.title.clone();
+        let is_exam = summary.goal.exam_id.is_some();
+        let exam_id = summary.goal.exam_id.clone();
+        let archived = summary.goal.is_archived();
+        let coverage = summary
+            .coverage
+            .map(|value| format!("{:.0}%", value * 100.0))
+            .unwrap_or_else(|| "—".to_string());
+        let accuracy = summary
+            .first_pass_accuracy
+            .map(|value| {
+                format!(
+                    "{} / {}（{:.0}%）",
+                    summary.first_pass_correct,
+                    summary.first_pass_graded,
+                    value * 100.0
+                )
+            })
+            .unwrap_or_else(|| "—".to_string());
+        let mut page = div().flex().flex_col().gap_6();
+        page = page
+            .child(
+                Button::new("goal-detail-back")
+                    .label("← 目標一覧")
+                    .text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.go(Route::Exams, window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .justify_between()
+                    .child(self.page_header(title.clone(), goal_target_line(&summary), cx))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("goal-detail-plan")
+                                    .label("今日の学習を始める")
+                                    .primary()
+                                    .disabled(archived || summary.total == 0)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_goal(Mode::Plan, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("goal-detail-review")
+                                    .label("復習")
+                                    .secondary()
+                                    .disabled(archived)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_goal(Mode::Review, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("goal-detail-practice")
+                                    .label("練習")
+                                    .ghost()
+                                    .disabled(archived)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_goal(Mode::Practice, window, cx);
+                                    })),
+                            )
+                            .when_some(exam_id.clone(), |row, exam_id| {
+                                row.child(
+                                    Button::new("goal-detail-exam")
+                                        .label("試験詳細・模試")
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_exam(exam_id.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("goal-detail-archive")
+                                    .label(if archived {
+                                        "再開"
+                                    } else {
+                                        "アーカイブ"
+                                    })
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_goal_archive(!archived, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("goal-detail-delete")
+                                    .label("削除")
+                                    .danger()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.modal = Some(crate::Modal::DeleteGoal {
+                                            id: id_delete.clone(),
+                                            title: title.clone(),
+                                        });
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_6()
+                    .py(px(14.0))
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(self.detail_stat("対象", summary.total.to_string(), cx))
+                    .child(self.detail_stat("学習済み", summary.studied.to_string(), cx))
+                    .child(self.detail_stat("未学習", summary.unstudied.to_string(), cx))
+                    .child(self.detail_stat("復習期限", summary.due.to_string(), cx))
+                    .child(self.detail_stat("苦手", summary.weak.to_string(), cx))
+                    .child(self.detail_stat("カバレッジ", coverage, cx))
+                    .child(self.detail_stat("初回正答", accuracy, cx)),
+            );
+
+        if archived {
+            page = page.child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme.muted_foreground)
+                    .child("このGoalはアーカイブされています。再開すると学習を開始できます。"),
+            );
+        }
+        if summary.expired {
+            page = page.child(
+                div()
+                    .p_3()
+                    .border_l_3()
+                    .border_color(theme.danger)
+                    .bg(theme.danger.opacity(0.08))
+                    .text_size(px(13.0))
+                    .child("目標日を過ぎています。通常の復習を続けてください。"),
+            );
+        }
+        for warning in &summary.plan.warnings {
+            page = page.child(
+                div()
+                    .p_3()
+                    .border_l_3()
+                    .border_color(theme.accent)
+                    .bg(theme.accent.opacity(0.08))
+                    .text_size(px(13.0))
+                    .child(warning.message()),
+            );
+        }
+
+        page = page.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .py(px(12.0))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child("今日の計画（実測と既存Plannerの結果）"),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .child(format!(
+                            "{}問 · 推定 {}分 · 必要 {}分 / 利用可能 {}分",
+                            summary.plan.coverage.selected,
+                            (summary.plan.planned_seconds as f64 / 60.0).ceil() as u32,
+                            summary.plan.required_minutes,
+                            summary.plan.available_minutes
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "内訳: 未学習 {} · 復習期限 {} · 苦手 {} · 試験前確認 {} · 今日の学習済み {}分",
+                            summary.plan.coverage.selected_new,
+                            summary.plan.coverage.selected_due,
+                            summary.plan.coverage.selected_weak,
+                            summary.plan.coverage.selected_early,
+                            summary.plan.studied_seconds_today / 60
+                        )),
+                ),
+        );
+
+        page = page.child(section_heading("Goalの設定", cx)).child(
+            div()
+                .flex()
+                .items_end()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .w(px(320.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("名前"),
+                        )
+                        .child(Input::new(&self.goal_title_input).id("goal-title")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .w(px(220.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("期限（任意）"),
+                        )
+                        .child(Input::new(&self.goal_date_input).id("goal-date")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .w(px(150.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("1日の学習時間（分）"),
+                        )
+                        .child(Input::new(&self.goal_minutes_input).id("goal-minutes")),
+                )
+                .child(
+                    Button::new("goal-save")
+                        .label("保存")
+                        .primary()
+                        .disabled(is_exam)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.save_goal_fields(window, cx);
+                        })),
+                )
+                .when(is_exam, |row| {
+                    row.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child("試験の設定は「試験詳細」から変更してください"),
+                    )
+                }),
+        );
+
+        let mut topics = div().flex().flex_col();
+        for topic in &summary.topics {
+            let accuracy = topic
+                .first_pass_accuracy
+                .map(|value| format!("{:.0}%", value * 100.0))
+                .unwrap_or_else(|| "—".to_string());
+            topics = topics.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .py(px(9.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().text_size(px(14.0)).child(topic.title.clone()))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "{}問 · 学習済み {} · 未学習 {} · 復習 {} · 苦手 {} · 回答 {} · 初回正答 {}",
+                                topic.total,
+                                topic.studied,
+                                topic.unstudied,
+                                topic.due,
+                                topic.weak,
+                                topic.attempts,
+                                accuracy
+                            )),
+                    ),
+            );
+        }
+        if summary.topics.is_empty() {
+            topics = topics.child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme.muted_foreground)
+                    .child("Topicが設定されていません。範囲画面または教材エディタで設定できます。"),
+            );
+        }
+        page = page
+            .child(section_heading("Topic別の実測", cx))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        "習得率ではありません。保存済みの学習状態と回答結果だけを集計しています。",
+                    ),
+            )
+            .child(topics);
 
         page.into_any_element()
     }
@@ -3503,6 +4007,14 @@ impl WorkbookApp {
                     .gap_4()
                     .when_some(view.exam_title.clone(), |row, title| {
                         row.child(div().text_size(px(13.0)).child(title))
+                    })
+                    .when_some(view.goal_title.clone(), |row, title| {
+                        row.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child(format!("目標: {title}")),
+                        )
                     })
                     .child(
                         div()
@@ -5366,6 +5878,28 @@ impl WorkbookApp {
             ))
             .into_any_element()
     }
+}
+
+fn goal_target_line(summary: &workbook_service::GoalSummary) -> String {
+    let mut parts = Vec::new();
+    match summary.goal.target_date {
+        Some(date) => {
+            let remaining = if summary.expired {
+                "期限切れ".to_string()
+            } else {
+                summary
+                    .days_remaining
+                    .map(|days| format!("あと{days}日"))
+                    .unwrap_or_default()
+            };
+            parts.push(format!("目標日 {date}（{remaining}）"));
+        }
+        None => parts.push("期限なし".to_string()),
+    }
+    if let Some(score) = summary.goal.target_score {
+        parts.push(format!("目標 {score}"));
+    }
+    parts.join(" · ")
 }
 
 fn exam_target_line(summary: &workbook_service::ExamSummary) -> Option<String> {

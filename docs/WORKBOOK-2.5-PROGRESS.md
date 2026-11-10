@@ -95,3 +95,46 @@
 - Topicの一括割当UIはPhase Eのエディタで扱う（現状はImportの `topics` と個別API）
 - 実機UI確認は未実施
 
+## Phase D — Goals / Advanced Planning
+
+### 実装済み
+- `Goal` ドメイン型（名前、Scope、任意の期限・目標スコア、1日の学習時間、アーカイブ、説明）
+- 期限のないGoalを正式にサポート
+- 既存Examを `Goal::from_exam` で読み取り専用に適合。Exam行・模試結果・Sessionは変更しない
+- `goals` テーブルと `sessions.goal_id` を schema v8 で追加。v7から前方マイグレーション + バックアップ
+- Goal CRUD、アーカイブ、削除（履歴・教材は保持）
+- Goal削除時は安全バックアップ。試験由来Goalの削除は試験削除と同じ扱い
+- 既存Plannerを再利用した `build_goal_plan`。期限・1日の学習時間・今日の学習済み時間・新規上限・想起確率・苦手・未学習を使う
+- Goal Plan/Review/Practiceの開始。Sessionに `goal_id` を保存
+- `GoalSummary`: 対象/学習済み/未学習/復習期限/苦手/カバレッジ/初回正答/今日の計画
+- Topic別の実測統計（対象、学習済み、未学習、復習期限、苦手、回答数、初回正答率）
+- 習得率・合否予測は表示しない。初回正答率は「最初の記録済み回答」のみ
+- TodayにGoal/Examの進捗（期限、対象、学習済み、復習、カバレッジ）を表示
+- 目標一覧をGoalとExamの統一リストへ変更。Examは「試験詳細・模試」から従来機能へ
+- 範囲画面から「この範囲をGoalにする」フォーム
+- Goal詳細で名前・期限・1日の学習時間の編集、計画サマリ、Topic別実測を表示
+
+### 主要ファイル
+- `crates/workbook-domain/src/goal.rs`（新規）
+- `crates/workbook-storage/src/schema.rs`, `lib.rs`
+- `crates/workbook-service/src/lib.rs`
+- `crates/workbook-ui/src/lib.rs`, `views.rs`, `modal.rs`
+- `crates/workbook-service/tests/goals.rs`（新規）
+- `crates/workbook-storage/tests/storage.rs`
+
+### テスト
+- 期限なしGoal、実測カウント、Topic別集計
+- 回答後の初回正答率、Goal Sessionの `goal_id`
+- ExamがGoal一覧に重複せず出ること
+- アーカイブ・削除後も教材が残ること
+- 期限不足を `Insufficient` として表示し、達成可能と偽らないこと
+- TodayのGoal brief
+- 個別Question ScopeのGoal
+- 1日の学習時間に応じたPlan件数
+- schema v7→v8マイグレーション
+
+### 既知の制約
+- 実機UI確認は未実施
+- GoalのScope編集は範囲画面から作り直す（詳細画面では名前・期限・時間のみ編集）
+
+

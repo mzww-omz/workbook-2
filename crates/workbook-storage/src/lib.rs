@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 use workbook_domain::{
-    AssetContent, AssistState, CardState, Exam, ExamScope, Mode, Phase, RatingSource,
+    AssetContent, AssistState, CardState, Exam, ExamScope, Goal, Mode, Phase, RatingSource,
     SessionItemStatus, SessionStatus, Settings, StoredCard, StudyCalendar, ThemeSetting, Topic,
     Workbook, normalize_topic_name, parse_topic_path, parse_workbook,
 };
@@ -117,6 +117,7 @@ pub struct SessionRow {
     pub assist_json: Option<String>,
     pub revision: u64,
     pub exam_id: Option<String>,
+    pub goal_id: Option<String>,
     pub time_limit_seconds: Option<u32>,
     /// Selection target for time-budgeted sessions. `None` means no target.
     /// It is never a hard deadline.
@@ -888,6 +889,172 @@ impl Storage {
         Ok(())
     }
 
+    // ---- goals ----------------------------------------------------------
+
+    pub fn goals(&self, include_archived: bool) -> Result<Vec<Goal>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,title,description,target_date,target_score,daily_minutes,scope_json,
+                    created_at,updated_at,archived_at
+             FROM goals
+             WHERE ?1=1 OR archived_at IS NULL
+             ORDER BY archived_at IS NOT NULL,
+                      COALESCE(target_date,'9999-12-31'),
+                      updated_at DESC, title, id",
+        )?;
+        let rows = statement.query_map([i64::from(include_archived)], map_goal)?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
+    pub fn goal(&self, id: &str) -> Result<Goal> {
+        self.connection()?
+            .query_row(
+                "SELECT id,title,description,target_date,target_score,daily_minutes,scope_json,
+                        created_at,updated_at,archived_at
+                 FROM goals WHERE id=?1",
+                [id],
+                map_goal,
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("Goal {id}")))
+    }
+
+    pub fn insert_goal(&mut self, goal: &Goal) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        connection.execute(
+            "INSERT INTO goals(id,title,description,target_date,target_score,daily_minutes,
+                    scope_json,created_at,updated_at,archived_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                goal.id,
+                goal.title,
+                goal.description,
+                goal.target_date.map(|date| date.to_string()),
+                goal.target_score,
+                i64::from(goal.daily_minutes),
+                serde_json::to_string(&goal.scope)?,
+                format_ts(goal.created_at),
+                format_ts(goal.updated_at),
+                goal.archived_at.map(format_ts)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_goal(&mut self, goal: &Goal) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let changed = connection.execute(
+            "UPDATE goals SET title=?2,description=?3,target_date=?4,target_score=?5,
+                    daily_minutes=?6,scope_json=?7,updated_at=?8,archived_at=?9
+             WHERE id=?1",
+            params![
+                goal.id,
+                goal.title,
+                goal.description,
+                goal.target_date.map(|date| date.to_string()),
+                goal.target_score,
+                i64::from(goal.daily_minutes),
+                serde_json::to_string(&goal.scope)?,
+                format_ts(goal.updated_at),
+                goal.archived_at.map(format_ts)
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("Goal {}", goal.id)));
+        }
+        Ok(())
+    }
+
+    pub fn archive_goal(&mut self, id: &str, archived: bool, now: DateTime<Utc>) -> Result<()> {
+        let changed = self.connection()?.execute(
+            "UPDATE goals SET archived_at=?2,updated_at=?3 WHERE id=?1",
+            params![
+                id,
+                if archived { Some(format_ts(now)) } else { None },
+                format_ts(now)
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("Goal {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn delete_goal(&mut self, id: &str) -> Result<()> {
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let active: Option<String> = connection
+            .query_row(
+                "SELECT id FROM sessions WHERE status='active' AND goal_id=?1 LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if active.is_some() {
+            return Err(StorageError::Conflict(
+                "この目標の学習中は削除できません".to_string(),
+            ));
+        }
+        let changed = connection.execute("DELETE FROM goals WHERE id=?1", [id])?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("Goal {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn goal_studied_ms_since(&self, goal_id: &str, since: DateTime<Utc>) -> Result<i64> {
+        let connection = self.connection()?;
+        let total: i64 = connection.query_row(
+            "SELECT COALESCE(SUM(a.elapsed_ms),0)
+             FROM attempts a JOIN sessions s ON s.id=a.session_id
+             WHERE s.goal_id=?1 AND a.answered_at>=?2",
+            params![goal_id, format_ts(since)],
+            |row| row.get(0),
+        )?;
+        Ok(total)
+    }
+
+    /// First recorded answer for each question, in attempt order. Used for the
+    /// transparent first-pass accuracy shown for goals and topics. It is not a
+    /// mastery estimate.
+    pub fn first_attempt_results(&self) -> Result<Vec<(String, String, Option<bool>)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT workbook_id,question_id,correct FROM (
+               SELECT workbook_id,question_id,correct,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY workbook_id,question_id
+                        ORDER BY answered_at, id
+                      ) AS rn
+               FROM attempts
+             ) WHERE rn=1",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+            ))
+        })?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
     /// Attempt counts by question, used by Practice selection strategies.
     /// Only deterministic attempt history is counted; practice answers are
     /// already stored in `attempts` without touching FSRS.
@@ -1598,7 +1765,7 @@ impl Storage {
                 "SELECT id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,phase,
                         draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
                         question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision,
-                        exam_id,time_limit_seconds,time_budget_seconds
+                        exam_id,goal_id,time_limit_seconds,time_budget_seconds
                  FROM sessions WHERE id=?1",
                 [session_id],
                 map_session,
@@ -2402,6 +2569,7 @@ fn insert_legacy_session(
         assist_json: None,
         revision: session.revision,
         exam_id: None,
+        goal_id: None,
         time_limit_seconds: None,
         time_budget_seconds: None,
     };
@@ -2468,8 +2636,8 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
         "INSERT INTO sessions(id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,
                 phase,draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
                 question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision,
-                exam_id,time_limit_seconds,time_budget_seconds)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                exam_id,goal_id,time_limit_seconds,time_budget_seconds)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
         params![
             session.id,
             session.mode.as_str(),
@@ -2494,6 +2662,7 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
             session.assist_json,
             session.revision as i64,
             session.exam_id,
+            session.goal_id,
             session.time_limit_seconds.map(i64::from),
             session.time_budget_seconds.map(i64::from)
         ],
@@ -2507,8 +2676,8 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
                 current_item_id=?6,phase=?7,draft_json=?8,hint=?9,revealed=?10,pending_correct=?11,
                 pending_unknown=?12,pending_at=?13,question_started_at=?14,question_elapsed_ms=?15,
                 cursor_kind=?16,assist_json=?17,revision=?18,exam_id=?19,time_limit_seconds=?20,
-                time_budget_seconds=?21
-                WHERE id=?22",
+                time_budget_seconds=?21,goal_id=?22
+                WHERE id=?23",
         params![
             session.mode.as_str(),
             match session.status {
@@ -2534,6 +2703,7 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
             session.exam_id,
             session.time_limit_seconds.map(i64::from),
             session.time_budget_seconds.map(i64::from),
+            session.goal_id,
             session.id
         ],
     )?;
@@ -2831,11 +3001,12 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         assist_json: row.get(17)?,
         revision: row.get::<_, i64>(18)? as u64,
         exam_id: row.get(19)?,
+        goal_id: row.get(20)?,
         time_limit_seconds: row
-            .get::<_, Option<i64>>(20)?
+            .get::<_, Option<i64>>(21)?
             .and_then(|value| u32::try_from(value).ok()),
         time_budget_seconds: row
-            .get::<_, Option<i64>>(21)?
+            .get::<_, Option<i64>>(22)?
             .and_then(|value| u32::try_from(value).ok()),
     })
 }
@@ -2942,6 +3113,42 @@ fn ensure_no_sibling(
         ));
     }
     Ok(())
+}
+
+fn map_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Goal> {
+    let target_date: Option<String> = row.get(3)?;
+    let scope_json: String = row.get(6)?;
+    Ok(Goal {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        target_date: target_date
+            .as_deref()
+            .map(|value| {
+                chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+        target_score: row.get(4)?,
+        daily_minutes: row.get::<_, i64>(5)? as u32,
+        scope: serde_json::from_str::<ExamScope>(&scope_json)
+            .map_err(StorageError::from)
+            .map_err(to_sql_error)?,
+        created_at: parse_ts(&row.get::<_, String>(7)?).map_err(to_sql_error)?,
+        updated_at: parse_ts(&row.get::<_, String>(8)?).map_err(to_sql_error)?,
+        archived_at: row
+            .get::<_, Option<String>>(9)?
+            .as_deref()
+            .map(parse_ts)
+            .transpose()
+            .map_err(to_sql_error)?,
+        exam_id: None,
+    })
 }
 
 fn map_exam(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exam> {
@@ -3189,6 +3396,24 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
              );
              CREATE INDEX question_topics_topic
                ON question_topics(topic_id, workbook_id, question_id);",
+        )?;
+    }
+    if from < 8 {
+        transaction.execute_batch(
+            "CREATE TABLE goals(
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               description TEXT,
+               target_date TEXT,
+               target_score REAL,
+               daily_minutes INTEGER NOT NULL DEFAULT 30,
+               scope_json TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               archived_at TEXT
+             );
+             CREATE INDEX goals_archive ON goals(archived_at, target_date);
+             ALTER TABLE sessions ADD COLUMN goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL;",
         )?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;

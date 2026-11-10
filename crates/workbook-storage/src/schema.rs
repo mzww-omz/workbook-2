@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -77,6 +77,20 @@ CREATE TABLE exams(
 );
 CREATE INDEX exams_archive ON exams(archived_at, target_date);
 
+CREATE TABLE goals(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  target_date TEXT,
+  target_score REAL,
+  daily_minutes INTEGER NOT NULL DEFAULT 30,
+  scope_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  archived_at TEXT
+);
+CREATE INDEX goals_archive ON goals(archived_at, target_date);
+
 CREATE TABLE mock_answers(
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -146,6 +160,7 @@ CREATE TABLE sessions(
   assist_json TEXT,
   revision INTEGER NOT NULL DEFAULT 0,
   exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,
+  goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
   time_limit_seconds INTEGER,
   time_budget_seconds INTEGER
 );
@@ -223,6 +238,26 @@ pub const EXPECTED_TABLES: &[&str] = &[
     "assets",
     "attempts",
     "exams",
+    "goals",
+    "meta",
+    "mock_answers",
+    "mock_results",
+    "notes",
+    "question_topics",
+    "questions",
+    "review_states",
+    "session_items",
+    "session_workbooks",
+    "sessions",
+    "settings",
+    "topics",
+    "workbooks",
+];
+
+pub const EXPECTED_TABLES_V7: &[&str] = &[
+    "assets",
+    "attempts",
+    "exams",
     "meta",
     "mock_answers",
     "mock_results",
@@ -276,6 +311,8 @@ pub fn expected_tables(version: i64) -> &'static [&'static str] {
         EXPECTED_TABLES_V3
     } else if version < 7 {
         EXPECTED_TABLES_V6
+    } else if version < 8 {
+        EXPECTED_TABLES_V7
     } else {
         EXPECTED_TABLES
     }

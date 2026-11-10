@@ -5,12 +5,12 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use thiserror::Error;
 use workbook_domain::{
-    Answer, AssistState, CardState, Content, Exam, ExamCatalogQuestion, ExamDraft, ExamScope,
-    GradeResult, GradeStatus, MockOptions, Mode, NearMissReason, NearMissRecord, Phase,
-    PracticeOptions, PracticeStrategy, Question, QuestionType, Rating, RatingSource,
-    SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
-    answer_is_blank, automatic_rating, expand_topic_ids, grade_answer_detailed, parse_workbook,
-    resolve_scope,
+    Answer, AssistState, CardState, Content, Exam, ExamCatalogQuestion, ExamDraft, ExamScope, Goal,
+    GoalDraft, GoalSource, GradeResult, GradeStatus, MockOptions, Mode, NearMissReason,
+    NearMissRecord, Phase, PracticeOptions, PracticeStrategy, Question, QuestionType, Rating,
+    RatingSource, SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting,
+    Workbook, answer_is_blank, automatic_rating, expand_topic_ids, grade_answer_detailed,
+    parse_workbook, resolve_scope,
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{
@@ -96,6 +96,8 @@ pub struct Snapshot {
     pub settings: Settings,
     pub active: Option<StudyView>,
     pub today: TodaySummary,
+    /// Lightweight progress for active goals and exams, used by Today.
+    pub goals: Vec<GoalBrief>,
     pub data_path: String,
     pub timezone: String,
 }
@@ -232,6 +234,8 @@ pub struct StudyView {
     pub overall_result: Option<OverallResultView>,
     pub exam_id: Option<String>,
     pub exam_title: Option<String>,
+    pub goal_id: Option<String>,
+    pub goal_title: Option<String>,
     pub budget: Option<SessionBudgetView>,
     pub mock: Option<MockSessionView>,
     pub mock_result: Option<MockResultView>,
@@ -388,6 +392,56 @@ impl ScopePreview {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct GoalBrief {
+    pub id: String,
+    pub title: String,
+    pub source: GoalSource,
+    pub target_date: Option<chrono::NaiveDate>,
+    pub days_remaining: Option<i64>,
+    pub expired: bool,
+    pub total: usize,
+    pub studied: usize,
+    pub due: usize,
+    pub coverage: Option<f64>,
+}
+
+/// Topic-level measured statistics for a goal. These are counts and observed
+/// answer outcomes, not a knowledge-tracing or mastery score.
+#[derive(Clone, Debug)]
+pub struct GoalTopicStat {
+    pub topic_id: String,
+    pub title: String,
+    pub total: usize,
+    pub studied: usize,
+    pub unstudied: usize,
+    pub due: usize,
+    pub weak: usize,
+    pub attempts: usize,
+    pub first_pass_graded: usize,
+    pub first_pass_correct: usize,
+    pub first_pass_accuracy: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GoalSummary {
+    pub goal: Goal,
+    pub source: GoalSource,
+    pub total: usize,
+    pub studied: usize,
+    pub unstudied: usize,
+    pub due: usize,
+    pub weak: usize,
+    pub days_remaining: Option<i64>,
+    pub expired: bool,
+    pub coverage: Option<f64>,
+    pub plan: ExamPlan,
+    pub topics: Vec<GoalTopicStat>,
+    pub first_pass_graded: usize,
+    pub first_pass_correct: usize,
+    pub first_pass_accuracy: Option<f64>,
+}
+
 pub fn mock_score_percent(correct: u32, incorrect: u32) -> Option<f64> {
     let graded = correct + incorrect;
     if graded == 0 {
@@ -482,6 +536,7 @@ impl WorkbookService {
         let new_remaining_today = (settings.new_limit as usize).saturating_sub(introduced_today);
         let next_due_at = storage.next_due_at(now)?;
         let today_day = calendar.learning_day(now);
+        let goals = goal_briefs(storage, &calendar, now)?;
         let recent = storage.attempts_since(now - Duration::hours(48))?;
         let mut answers = 0;
         let mut correct = 0;
@@ -526,6 +581,7 @@ impl WorkbookService {
             settings,
             active,
             today,
+            goals,
             data_path: storage
                 .path()
                 .map(|path| path.display().to_string())
@@ -680,6 +736,217 @@ impl WorkbookService {
         let mut storage = self.storage()?;
         storage.set_question_topics(workbook_id, question_id, topic_ids)?;
         Ok(())
+    }
+
+    // ---- goals ----------------------------------------------------------
+
+    pub fn goals(&self, include_archived: bool) -> Result<Vec<GoalSummary>> {
+        let storage = self.storage()?;
+        let catalog = exam_catalog(&storage)?;
+        let now = self.clock.now();
+        let context = exam_plan_context(&storage, now)?;
+        let first: FirstAttemptMap = storage
+            .first_attempt_results()?
+            .into_iter()
+            .map(|(workbook_id, question_id, correct)| ((workbook_id, question_id), correct))
+            .collect();
+        let mut output = Vec::new();
+        for goal in storage.goals(include_archived)? {
+            output.push(goal_summary_from(
+                &storage, goal, &catalog, &context, &first, now,
+            )?);
+        }
+        for exam in storage.exams(include_archived)? {
+            output.push(goal_summary_from(
+                &storage,
+                Goal::from_exam(&exam),
+                &catalog,
+                &context,
+                &first,
+                now,
+            )?);
+        }
+        output.sort_by(|a, b| {
+            a.goal
+                .is_archived()
+                .cmp(&b.goal.is_archived())
+                .then(
+                    a.goal
+                        .target_date
+                        .cmp(&b.goal.target_date)
+                        .then(a.goal.title.cmp(&b.goal.title)),
+                )
+                .then(a.goal.id.cmp(&b.goal.id))
+        });
+        Ok(output)
+    }
+
+    pub fn goal(&self, id: &str) -> Result<Goal> {
+        let storage = self.storage()?;
+        goal_from(&storage, id)
+    }
+
+    pub fn goal_summary(&self, id: &str) -> Result<GoalSummary> {
+        let storage = self.storage()?;
+        let catalog = exam_catalog(&storage)?;
+        let now = self.clock.now();
+        let context = exam_plan_context(&storage, now)?;
+        let first: FirstAttemptMap = storage
+            .first_attempt_results()?
+            .into_iter()
+            .map(|(workbook_id, question_id, correct)| ((workbook_id, question_id), correct))
+            .collect();
+        let goal = goal_from(&storage, id)?;
+        goal_summary_from(&storage, goal, &catalog, &context, &first, now)
+    }
+
+    pub fn create_goal(&self, draft: GoalDraft) -> Result<String> {
+        draft.validate()?;
+        let goal = draft.into_goal(self.clock.now());
+        let mut storage = self.storage()?;
+        storage.insert_goal(&goal)?;
+        Ok(goal.id)
+    }
+
+    pub fn update_goal(&self, id: &str, draft: GoalDraft) -> Result<()> {
+        draft.validate()?;
+        let mut storage = self.storage()?;
+        let mut goal = storage.goal(id)?;
+        if goal.exam_id.is_some() {
+            return Err(ServiceError::Invalid(
+                "試験は試験画面から編集してください".to_string(),
+            ));
+        }
+        draft.apply_to(&mut goal, self.clock.now());
+        storage.update_goal(&goal)?;
+        Ok(())
+    }
+
+    pub fn archive_goal(&self, id: &str, archived: bool) -> Result<()> {
+        let mut storage = self.storage()?;
+        match storage.goal(id) {
+            Ok(_) => storage.archive_goal(id, archived, self.clock.now())?,
+            Err(StorageError::NotFound(_)) => {
+                storage.archive_exam(id, archived, self.clock.now())?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub fn delete_goal(&self, id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        match storage.goal(id) {
+            Ok(_) => {
+                self.write_action_backup(&storage, "pre-delete-goal")?;
+                storage.delete_goal(id)?;
+            }
+            Err(StorageError::NotFound(_)) => {
+                self.write_action_backup(&storage, "pre-delete-exam")?;
+                storage.delete_exam(id)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub fn start_goal_plan(&self, id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        let goal = goal_from(&storage, id)?;
+        if let Some(exam_id) = goal.exam_id.clone() {
+            drop(storage);
+            return self.start_exam_plan(&exam_id);
+        }
+        ensure_no_active_session(&storage)?;
+        let now = self.clock.now();
+        let catalog = exam_catalog(&storage)?;
+        let context = exam_plan_context(&storage, now)?;
+        let plan = build_goal_plan(&storage, &goal, &catalog, &context, now)?;
+        let candidates: Vec<SessionCandidate> = plan
+            .selected
+            .iter()
+            .map(|item| SessionCandidate {
+                workbook_id: item.workbook_id.clone(),
+                note_id: item.note_id.clone(),
+                question_id: item.question_id.clone(),
+                due_at: None,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                plan.warnings
+                    .first()
+                    .map(PlanWarning::message)
+                    .unwrap_or_else(|| "この目標で今日の学習を作れませんでした".to_string()),
+            ));
+        }
+        let (mut bundle, _) = build_session_bundle(Mode::Plan, &candidates, now, None, None, None)?;
+        bundle.session.goal_id = Some(goal.id.clone());
+        persist_started_bundle(&mut storage, bundle, now)
+    }
+
+    pub fn start_goal_review(&self, id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        let goal = goal_from(&storage, id)?;
+        if let Some(exam_id) = goal.exam_id.clone() {
+            drop(storage);
+            return self.start_exam_review(&exam_id);
+        }
+        ensure_no_active_session(&storage)?;
+        let now = self.clock.now();
+        let catalog = exam_catalog(&storage)?;
+        let resolved = resolve_scope_for(&storage, &goal.scope, &catalog)?;
+        let context = exam_plan_context(&storage, now)?;
+        let mut candidates = scope_due_candidates(&resolved, &context, now)?;
+        if candidates.is_empty() {
+            candidates = scope_learn_ahead_candidates(&resolved, &context, now)?;
+        }
+        if candidates.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この目標に期限が来た復習はありません".to_string(),
+            ));
+        }
+        let (mut bundle, _) =
+            build_session_bundle(Mode::Review, &candidates, now, None, None, None)?;
+        bundle.session.goal_id = Some(goal.id.clone());
+        persist_started_bundle(&mut storage, bundle, now)
+    }
+
+    pub fn start_goal_practice(&self, id: &str) -> Result<()> {
+        let mut storage = self.storage()?;
+        let goal = goal_from(&storage, id)?;
+        if let Some(exam_id) = goal.exam_id.clone() {
+            drop(storage);
+            return self.start_exam_practice(
+                &exam_id,
+                &PracticeOptions {
+                    strategy: PracticeStrategy::All,
+                    question_limit: None,
+                },
+            );
+        }
+        ensure_no_active_session(&storage)?;
+        let now = self.clock.now();
+        let catalog = exam_catalog(&storage)?;
+        let resolved = resolve_scope_for(&storage, &goal.scope, &catalog)?;
+        if resolved.is_empty() {
+            return Err(ServiceError::Invalid(
+                "この目標に対象の問題がありません".to_string(),
+            ));
+        }
+        let candidates: Vec<SessionCandidate> = resolved
+            .iter()
+            .map(|question| SessionCandidate {
+                workbook_id: question.workbook_id.clone(),
+                note_id: question.note_id.clone(),
+                question_id: question.question_id.clone(),
+                due_at: None,
+            })
+            .collect();
+        let (mut bundle, _) =
+            build_session_bundle(Mode::Practice, &candidates, now, None, None, None)?;
+        bundle.session.goal_id = Some(goal.id.clone());
+        persist_started_bundle(&mut storage, bundle, now)
     }
 
     pub fn scope_preview(&self, scope: &ExamScope) -> Result<ScopePreview> {
@@ -2397,6 +2664,13 @@ impl WorkbookService {
             .as_deref()
             .map(|id| storage.exam(id))
             .transpose()?;
+        let goal = session
+            .goal_id
+            .as_deref()
+            .map(|id| storage.goal(id))
+            .transpose()
+            .ok()
+            .flatten();
         let mock = if session.mode == Mode::Mock {
             let answered = bundle
                 .items
@@ -2459,6 +2733,8 @@ impl WorkbookService {
             overall_result,
             exam_id: session.exam_id.clone(),
             exam_title: exam.map(|exam| exam.title),
+            goal_id: session.goal_id.clone(),
+            goal_title: goal.map(|goal| goal.title),
             budget,
             mock,
             mock_result,
@@ -2738,6 +3014,236 @@ fn resolve_scope_for(
     let topics = storage.topics()?;
     let expanded = scope_with_topic_descendants(scope, &topics);
     Ok(resolve_scope(&expanded, catalog))
+}
+
+type FirstAttemptMap = BTreeMap<(String, String), Option<bool>>;
+
+fn goal_from(storage: &Storage, id: &str) -> Result<Goal> {
+    match storage.goal(id) {
+        Ok(goal) => Ok(goal),
+        Err(StorageError::NotFound(_)) => {
+            let exam = storage.exam(id)?;
+            Ok(Goal::from_exam(&exam))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn goal_briefs(
+    storage: &Storage,
+    calendar: &StudyCalendar,
+    now: DateTime<Utc>,
+) -> Result<Vec<GoalBrief>> {
+    let catalog = exam_catalog(storage)?;
+    let states: BTreeMap<(String, String), workbook_domain::StoredCard> = storage
+        .review_states()?
+        .into_iter()
+        .map(|(workbook_id, question_id, card)| ((workbook_id, question_id), card))
+        .collect();
+    let buried = storage.buried_questions(now)?;
+    let mut goals: Vec<(Goal, GoalSource)> = storage
+        .goals(false)?
+        .into_iter()
+        .map(|goal| (goal, GoalSource::Goal))
+        .collect();
+    goals.extend(
+        storage
+            .exams(false)?
+            .into_iter()
+            .map(|exam| (Goal::from_exam(&exam), GoalSource::Exam)),
+    );
+    let mut output = Vec::new();
+    for (goal, source) in goals {
+        let resolved = resolve_scope_for(storage, &goal.scope, &catalog)?;
+        let mut total = 0usize;
+        let mut studied = 0usize;
+        let mut due = 0usize;
+        for question in &resolved {
+            let key = (question.workbook_id.clone(), question.question_id.clone());
+            let card = states.get(&key);
+            total += 1;
+            studied += usize::from(card.is_some());
+            due += usize::from(
+                card.is_some_and(|card| question_is_due(card, buried.contains(&key), now)),
+            );
+        }
+        let today = calendar.learning_day(now);
+        let days_remaining = goal.target_date.map(|target| (target - today).num_days());
+        output.push(GoalBrief {
+            id: goal.id.clone(),
+            title: goal.title.clone(),
+            source,
+            target_date: goal.target_date,
+            days_remaining,
+            expired: days_remaining.is_some_and(|days| days < 0),
+            total,
+            studied,
+            due,
+            coverage: if total == 0 {
+                None
+            } else {
+                Some(studied as f64 / total as f64)
+            },
+        });
+    }
+    output.sort_by(|a, b| {
+        a.expired
+            .cmp(&b.expired)
+            .then(a.days_remaining.cmp(&b.days_remaining))
+            .then(a.title.cmp(&b.title))
+    });
+    Ok(output)
+}
+
+fn build_goal_plan(
+    storage: &Storage,
+    goal: &Goal,
+    catalog: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    now: DateTime<Utc>,
+) -> Result<ExamPlan> {
+    let deadline = goal
+        .target_date
+        .map(|date| exam_deadline(&context.calendar, date));
+    let today_start = context
+        .calendar
+        .day_start(context.calendar.learning_day(now));
+    let studied_seconds_today =
+        u32::try_from(storage.goal_studied_ms_since(&goal.id, today_start)?.max(0) / 1_000)
+            .unwrap_or(u32::MAX);
+    let questions = plan_questions_for(
+        &resolve_scope_for(storage, &goal.scope, catalog)?,
+        context,
+        deadline,
+        now,
+    );
+    Ok(plan_exam(PlanInput {
+        now,
+        calendar: &context.calendar,
+        target_date: goal.target_date,
+        daily_minutes: goal.daily_minutes,
+        new_limit_remaining: context.new_limit_remaining,
+        studied_seconds_today,
+        questions: &questions,
+    }))
+}
+
+fn first_pass_counts(resolved: &[ExamCatalogQuestion], first: &FirstAttemptMap) -> (usize, usize) {
+    let mut graded = 0usize;
+    let mut correct = 0usize;
+    for question in resolved {
+        let key = (question.workbook_id.clone(), question.question_id.clone());
+        if let Some(Some(is_correct)) = first.get(&key) {
+            graded += 1;
+            correct += usize::from(*is_correct);
+        }
+    }
+    (graded, correct)
+}
+
+fn goal_topic_stats(
+    storage: &Storage,
+    resolved: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    first: &FirstAttemptMap,
+    now: DateTime<Utc>,
+) -> Result<Vec<GoalTopicStat>> {
+    let topics = storage.topics()?;
+    let mut output = Vec::new();
+    for topic in &topics {
+        let effective = expand_topic_ids(&topics, [&topic.id]);
+        let mut stat = GoalTopicStat {
+            topic_id: topic.id.clone(),
+            title: workbook_domain::topic_path(&topics, &topic.id)
+                .map(|path| path.join(" / "))
+                .unwrap_or_else(|| topic.name.clone()),
+            total: 0,
+            studied: 0,
+            unstudied: 0,
+            due: 0,
+            weak: 0,
+            attempts: 0,
+            first_pass_graded: 0,
+            first_pass_correct: 0,
+            first_pass_accuracy: None,
+        };
+        for question in resolved {
+            if !question.topic_ids.iter().any(|id| effective.contains(id)) {
+                continue;
+            }
+            let key = (question.workbook_id.clone(), question.question_id.clone());
+            let card = context.states.get(&key);
+            let attempt = context.stats.get(&key);
+            stat.total += 1;
+            stat.studied += usize::from(card.is_some());
+            stat.due += usize::from(
+                card.is_some_and(|card| question_is_due(card, context.buried.contains(&key), now)),
+            );
+            stat.weak += usize::from(question_is_weak(card, attempt));
+            stat.attempts += attempt.map(|value| value.attempts).unwrap_or(0);
+            if let Some(Some(is_correct)) = first.get(&key) {
+                stat.first_pass_graded += 1;
+                stat.first_pass_correct += usize::from(*is_correct);
+            }
+        }
+        if stat.total == 0 {
+            continue;
+        }
+        stat.unstudied = stat.total.saturating_sub(stat.studied);
+        stat.first_pass_accuracy = if stat.first_pass_graded == 0 {
+            None
+        } else {
+            Some(stat.first_pass_correct as f64 / stat.first_pass_graded as f64)
+        };
+        output.push(stat);
+    }
+    output.sort_by(|a, b| a.title.cmp(&b.title));
+    Ok(output)
+}
+
+fn goal_summary_from(
+    storage: &Storage,
+    goal: Goal,
+    catalog: &[ExamCatalogQuestion],
+    context: &ExamPlanContext,
+    first: &FirstAttemptMap,
+    now: DateTime<Utc>,
+) -> Result<GoalSummary> {
+    let plan = if let Some(exam_id) = goal.exam_id.as_deref() {
+        let exam = storage.exam(exam_id)?;
+        build_exam_plan(storage, &exam, catalog, context, now)?
+    } else {
+        build_goal_plan(storage, &goal, catalog, context, now)?
+    };
+    let resolved = resolve_scope_for(storage, &goal.scope, catalog)?;
+    let topics = goal_topic_stats(storage, &resolved, context, first, now)?;
+    let (first_pass_graded, first_pass_correct) = first_pass_counts(&resolved, first);
+    let coverage = plan.coverage.clone();
+    Ok(GoalSummary {
+        source: goal.source(),
+        total: coverage.total,
+        studied: coverage.studied,
+        unstudied: coverage.unstudied,
+        due: coverage.due,
+        weak: coverage.weak,
+        days_remaining: plan.days_remaining,
+        expired: plan.expired,
+        coverage: if coverage.total == 0 {
+            None
+        } else {
+            Some(coverage.studied as f64 / coverage.total as f64)
+        },
+        first_pass_graded,
+        first_pass_correct,
+        first_pass_accuracy: if first_pass_graded == 0 {
+            None
+        } else {
+            Some(first_pass_correct as f64 / first_pass_graded as f64)
+        },
+        plan,
+        topics,
+        goal,
+    })
 }
 
 fn question_is_due(card: &workbook_domain::StoredCard, buried: bool, now: DateTime<Utc>) -> bool {
@@ -3441,6 +3947,7 @@ fn build_session_bundle(
         assist_json: None,
         revision: 0,
         exam_id,
+        goal_id: None,
         time_limit_seconds,
         time_budget_seconds,
     };

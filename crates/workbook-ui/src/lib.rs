@@ -34,7 +34,7 @@ use workbook_domain::{
 };
 use workbook_import::LegacyPreview;
 use workbook_service::{
-    BookSummary, ExamSummary, Snapshot, StudyView, TodaySummary, WorkbookService,
+    BookSummary, ExamSummary, GoalSummary, Snapshot, StudyView, TodaySummary, WorkbookService,
 };
 
 use crate::image_cache::ImageCache;
@@ -53,6 +53,7 @@ pub(crate) enum Route {
     ExamDetail,
     ExamEditor,
     Scope,
+    GoalDetail,
     Study,
 }
 
@@ -97,6 +98,10 @@ pub(crate) enum Modal {
     DeleteTopic {
         id: String,
         name: String,
+    },
+    DeleteGoal {
+        id: String,
+        title: String,
     },
 }
 
@@ -241,6 +246,8 @@ pub struct WorkbookApp {
     pub(crate) selected_book: Option<String>,
     pub(crate) selected_workbook: Option<Workbook>,
     pub(crate) exams: Vec<ExamSummary>,
+    pub(crate) goals: Vec<GoalSummary>,
+    pub(crate) selected_goal: Option<String>,
     pub(crate) selected_exam: Option<String>,
     pub(crate) exam_editor: Option<ExamEditorState>,
     pub(crate) scope_editor: Option<ScopeState>,
@@ -248,6 +255,9 @@ pub struct WorkbookApp {
     pub(crate) scope_search: Entity<InputState>,
     pub(crate) scope_topic_name: Entity<InputState>,
     pub(crate) scope_subscription: Option<Subscription>,
+    pub(crate) goal_title_input: Entity<InputState>,
+    pub(crate) goal_date_input: Entity<InputState>,
+    pub(crate) goal_minutes_input: Entity<InputState>,
     pub(crate) practice_strategy: PracticeStrategy,
     pub(crate) budget_seconds: Option<u32>,
     pub(crate) practice_limit_input: Entity<InputState>,
@@ -310,6 +320,7 @@ impl WorkbookApp {
                 elapsed_ms: 0,
                 books: Vec::new(),
             },
+            goals: Vec::new(),
             data_path: String::new(),
             timezone: "UTC".to_string(),
         });
@@ -345,6 +356,15 @@ impl WorkbookApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("制限時間（分・空=なし）"));
         let scope_search = cx.new(|cx| InputState::new(window, cx).placeholder("問題文・IDで検索"));
         let scope_topic_name = cx.new(|cx| InputState::new(window, cx).placeholder("Topic名"));
+        let goal_title_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Goal名（例: 一次関数を固める）"));
+        let goal_date_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("期限 YYYY-MM-DD（空=なし）"));
+        let goal_minutes_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("30")
+                .placeholder("1日の学習時間（分）")
+        });
 
         let mut app = Self {
             service,
@@ -355,6 +375,8 @@ impl WorkbookApp {
             selected_book: None,
             selected_workbook: None,
             exams: Vec::new(),
+            goals: Vec::new(),
+            selected_goal: None,
             selected_exam: None,
             exam_editor: None,
             scope_editor: None,
@@ -362,6 +384,9 @@ impl WorkbookApp {
             scope_search,
             scope_topic_name,
             scope_subscription: None,
+            goal_title_input,
+            goal_date_input,
+            goal_minutes_input,
             practice_strategy: PracticeStrategy::All,
             budget_seconds: Some(10 * 60),
             practice_limit_input,
@@ -534,8 +559,12 @@ impl WorkbookApp {
                 if self.route == Route::History {
                     self.history = self.service.history(200).unwrap_or_default();
                 }
-                if matches!(self.route, Route::Exams | Route::ExamDetail) {
+                if matches!(
+                    self.route,
+                    Route::Exams | Route::ExamDetail | Route::GoalDetail
+                ) {
                     self.exams = self.service.exams(true).unwrap_or_default();
+                    self.goals = self.service.goals(true).unwrap_or_default();
                 }
                 if let Some(active) = self.snapshot.active.clone()
                     && active.mode == Mode::Mock
@@ -579,8 +608,9 @@ impl WorkbookApp {
         if route == Route::History {
             self.history = self.service.history(200).unwrap_or_default();
         }
-        if matches!(route, Route::Exams | Route::ExamDetail) {
+        if matches!(route, Route::Exams | Route::ExamDetail | Route::GoalDetail) {
             self.exams = self.service.exams(true).unwrap_or_default();
+            self.goals = self.service.goals(true).unwrap_or_default();
         }
         if route == Route::Settings {
             self.sync_settings_inputs(window, cx);
@@ -899,6 +929,225 @@ impl WorkbookApp {
         self.selected_exam
             .as_ref()
             .and_then(|id| self.exams.iter().find(|summary| &summary.exam.id == id))
+    }
+
+    pub(crate) fn selected_goal_summary(&self) -> Option<&GoalSummary> {
+        self.selected_goal
+            .as_ref()
+            .and_then(|id| self.goals.iter().find(|summary| &summary.goal.id == id))
+    }
+
+    pub(crate) fn open_goal(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.goals = self.service.goals(true).unwrap_or_default();
+        let Some(summary) = self
+            .goals
+            .iter()
+            .find(|summary| summary.goal.id == id)
+            .cloned()
+        else {
+            self.notice_error("目標が見つかりません");
+            cx.notify();
+            return;
+        };
+        self.selected_goal = Some(id);
+        let title = summary.goal.title.clone();
+        let date = summary
+            .goal
+            .target_date
+            .map(|date| date.to_string())
+            .unwrap_or_default();
+        let minutes = summary.goal.daily_minutes.to_string();
+        self.goal_title_input
+            .update(cx, |state, cx| state.set_value(title, window, cx));
+        self.goal_date_input
+            .update(cx, |state, cx| state.set_value(date, window, cx));
+        self.goal_minutes_input
+            .update(cx, |state, cx| state.set_value(minutes, window, cx));
+        self.route = Route::GoalDetail;
+        self.notice = None;
+        cx.notify();
+    }
+
+    pub(crate) fn create_goal_from_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.scope_editor.as_ref() else {
+            self.notice_error("範囲を選択してください");
+            cx.notify();
+            return;
+        };
+        let scope = state.scope();
+        if !scope.has_inclusion_rules() {
+            self.notice_error("Workbook・Topic・個別問題のいずれかを含めてください");
+            cx.notify();
+            return;
+        }
+        let title = self.goal_title_input.read(cx).value().trim().to_string();
+        let date_text = self.goal_date_input.read(cx).value().trim().to_string();
+        let target_date = if date_text.is_empty() {
+            None
+        } else {
+            match chrono::NaiveDate::parse_from_str(&date_text, "%Y-%m-%d") {
+                Ok(date) => Some(date),
+                Err(_) => {
+                    self.notice_error("期限は YYYY-MM-DD で入力してください");
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let daily_minutes = self
+            .goal_minutes_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(30);
+        let draft = workbook_domain::GoalDraft {
+            title,
+            description: None,
+            target_date,
+            target_score: None,
+            daily_minutes,
+            scope,
+        };
+        match self.service.create_goal(draft) {
+            Ok(id) => {
+                self.notice_success("Goalを作成しました");
+                self.goals = self.service.goals(true).unwrap_or_default();
+                self.open_goal(id, window, cx);
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn save_goal_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_goal.clone() else {
+            return;
+        };
+        let Some(summary) = self.selected_goal_summary().cloned() else {
+            return;
+        };
+        let title = self.goal_title_input.read(cx).value().trim().to_string();
+        let date_text = self.goal_date_input.read(cx).value().trim().to_string();
+        let target_date = if date_text.is_empty() {
+            None
+        } else {
+            match chrono::NaiveDate::parse_from_str(&date_text, "%Y-%m-%d") {
+                Ok(date) => Some(date),
+                Err(_) => {
+                    self.notice_error("期限は YYYY-MM-DD で入力してください");
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let daily_minutes = self
+            .goal_minutes_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(30);
+        let draft = workbook_domain::GoalDraft {
+            title,
+            description: summary.goal.description.clone(),
+            target_date,
+            target_score: summary.goal.target_score,
+            daily_minutes,
+            scope: summary.goal.scope.clone(),
+        };
+        match self.service.update_goal(&id, draft) {
+            Ok(()) => {
+                self.notice_success("Goalを更新しました");
+                self.goals = self.service.goals(true).unwrap_or_default();
+                self.open_goal(id, window, cx);
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn set_goal_archive(&mut self, archived: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_goal.clone() else {
+            return;
+        };
+        self.toggle_goal_archive(id, archived, cx);
+    }
+
+    pub(crate) fn toggle_goal_archive(
+        &mut self,
+        id: String,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match self.service.archive_goal(&id, archived) {
+            Ok(()) => {
+                self.notice_success(if archived {
+                    "Goalをアーカイブしました"
+                } else {
+                    "Goalを再開しました"
+                });
+                self.goals = self.service.goals(true).unwrap_or_default();
+                self.exams = self.service.exams(true).unwrap_or_default();
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn confirm_delete_goal(&mut self, id: String, cx: &mut Context<Self>) {
+        match self.service.delete_goal(&id) {
+            Ok(()) => {
+                self.modal = None;
+                self.selected_goal = None;
+                self.goals = self.service.goals(true).unwrap_or_default();
+                self.route = Route::Exams;
+                self.notice_success("Goalを削除しました");
+                cx.notify();
+            }
+            Err(error) => {
+                self.modal = None;
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn start_goal(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_goal.clone() else {
+            return;
+        };
+        let result = match mode {
+            Mode::Plan => self.service.start_goal_plan(&id),
+            Mode::Review => self.service.start_goal_review(&id),
+            Mode::Practice => self.service.start_goal_practice(&id),
+            Mode::New | Mode::Mock => Err(workbook_service::ServiceError::Invalid(
+                "Goalからは計画・復習・練習を開始できます".to_string(),
+            )),
+        };
+        match result {
+            Ok(()) => {
+                self.refresh(cx);
+                if let Some(active) = self.snapshot.active.clone() {
+                    self.study = Some(active);
+                    self.route = Route::Study;
+                    self.notice = None;
+                    self.prepare_question(window, cx);
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+            }
+        }
     }
 
     pub(crate) fn open_exam_editor(
@@ -2010,6 +2259,21 @@ impl WorkbookApp {
                 .is_focused(window)
             || self
                 .scope_topic_name
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .goal_title_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .goal_date_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .goal_minutes_input
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window);

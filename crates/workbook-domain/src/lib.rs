@@ -8,6 +8,7 @@ pub mod answer;
 pub mod calendar;
 pub mod content;
 pub mod exam;
+pub mod goal;
 pub mod grading;
 pub mod question_format;
 pub mod session;
@@ -22,6 +23,7 @@ pub use exam::{
     Exam, ExamCatalogQuestion, ExamDraft, ExamScope, ExamScopeGroup, ExamStudyMode, MockOptions,
     MockOrder, PracticeOptions, PracticeStrategy, QuestionRef, resolve_scope,
 };
+pub use goal::{Goal, GoalDraft, GoalSource};
 
 /// The general name for the same composable selection rules used by exams and
 /// goals. Exam names remain for backward compatibility.
