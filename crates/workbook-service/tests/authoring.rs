@@ -215,6 +215,38 @@ fn export_embeds_assets_as_base64_and_restores_topic_paths() {
 }
 
 #[test]
+fn workbook_reads_and_copies_preserve_database_topic_assignments() {
+    let harness = Harness::new();
+    let book = harness.import(&workbook().to_string());
+    let linear = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .unwrap();
+    harness
+        .service
+        .set_question_topics(&book, "q2", std::slice::from_ref(&linear.id))
+        .unwrap();
+    let model = harness.service.workbook(&book).unwrap();
+    let q2 = model.notes[0]
+        .questions
+        .iter()
+        .find(|question| question.id == "q2")
+        .unwrap();
+    assert_eq!(q2.topics, ["数学/一次関数"]);
+    let copy = harness.service.copy_workbook(&book).unwrap();
+    let copied = harness.service.workbook(&copy).unwrap();
+    let copied_q2 = copied.notes[0]
+        .questions
+        .iter()
+        .find(|question| question.id == "q2")
+        .unwrap();
+    assert_eq!(copied_q2.topics, ["数学/一次関数"]);
+}
+
+#[test]
 fn lint_returns_concrete_paths_and_errors() {
     let harness = Harness::new();
     let issues = harness.service.lint_workbook_json(&workbook().to_string());

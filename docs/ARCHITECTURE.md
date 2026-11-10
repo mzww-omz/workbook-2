@@ -123,22 +123,77 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
   入力は生の LaTeX と理由を表示し、元の LaTeX をアクセシビリティラベルにする。
 - UI は採点しない。採点と Near Miss の判定は `workbook-domain::grading` が持つ。
 
+## 時間予算
+
+`workbook-scheduler/src/budget.rs` は純粋関数で、候補を
+「期限到来Short-term → 期限到来Review → 新規 → Learn Ahead」の順に並べ、
+回答履歴の平均時間（形式別の保守的初期値にフォールバック）で予算内に収まる項目を選ぶ。
+
+- 予算は出題量の目標であり、強制終了タイマーではない
+- 予算0は拒否。最初の1問が推定超過でも、学習不能にしないため選択する
+- 選ばれなかった問題の `due_at` は変更しない
+- `sessions.time_budget_seconds` に保存し、StudyViewは使用時間と残り目安を表示する
+- 予算超過後も回答は通常どおり確定できる
+
+## Topic と Scope
+
+```text
+Topic (stable id, optional parent)
+  └─ question_topics (workbook_id, question_id, topic_id)
+
+Scope (ExamScope/StudyScope JSON)
+  = (group1 OR group2 ... OR includeQuestions)
+    AND NOT (excludeQuestions OR excludeWorkbooks OR excludeTags OR excludeTopics)
+  group = (workbook_ids empty or contains) AND (tags empty or intersects)
+          AND (topics empty or intersects)
+```
+
+- Topicの同一性はID。同じ親の下で正規化名が同じ場合だけ衝突として拒否する
+- 親Topicを選ぶと、解決時に子孫IDへ展開する。保存時に子孫を凍結しない
+- JSON教材の `topics` は `数学/一次関数` のようなパス。Import時にTopicを解決・共有する
+- Scopeは毎回現在の教材一覧から解決し、Session開始時に `session_items` へ固定する
+- 学習中のSessionは変更しない。新教材・新Topicは次の解決から反映する
+
+## Goal と Exam
+
+- `goals` は汎用目標。名前、Scope、任意の期限・目標スコア、1日の学習時間、アーカイブを持つ
+- 既存Examは `Goal::from_exam` で一覧・Planner・統計へ適合表示する。Exam行・模試・Sessionは変更しない
+- Goal Planは既存 `plan_exam` を再利用し、期限・1日の学習時間・今日の学習済み時間・新規上限・
+  想起確率・苦手・未学習から今日の出題を選ぶ
+- Sessionの `goal_id` で今日の学習時間をGoal別に差し引く
+- Topic別統計は保存済み状態とAttemptの実測のみ。習得率・合否予測は作らない
+- 初回正答率は各Questionの最初の記録済みAttemptだけを分母にする
+
+## Authoring
+
+- `WorkbookService::save_workbook` は既存教材の `local_id` を維持し、
+  `update_workbook_content` がNote/QuestionをIDで突合する
+- 変更のないQuestionは `questions` 行と `review_states` を保持する
+- 削除されたQuestionはFKカスケードでFSRS状態を消すが、`attempts` は独立して残す
+- 保存前にDomain Validationと `workbook-lint` を実行し、パス付きエラーを返す
+- 既存教材の保存前に `pre-edit-*.sqlite` を作る。学習中Workbookの編集は拒否する
+- JSON ExportはTopicパスを復元し、画像をbase64で埋め込む
+- AI Provider・APIキー・クラウド呼び出しは実装しない
+
 ## SQLite
 
-`application_id = 1463962418`（`"WBK2"`）、`user_version = 5`。
+`application_id = 1463962418`（`"WBK2"`）、`user_version = 8`。
 
 | Table | 役割 |
 |---|---|
 | `workbooks` | ローカルUUID、教材JSON、import日時、last_used |
 | `notes` | Note、初回学習済み |
 | `questions` | Question、関連問題の延期 |
+| `topics` | 安定ID、名前、正規化名、任意の親、説明 |
+| `question_topics` | QuestionとTopicの多対多 |
 | `assets` | 教材同梱画像（media type、alt、実サイズ、バイト列） |
 | `review_states` | FSRS状態、due、revision |
-| `sessions` | mode/status/cursor/phase/draft/pending/assist/revision、試験ID、模試制限時間 |
+| `sessions` | mode/status/cursor/phase/draft/pending/assist/revision、試験ID、Goal ID、時間予算、模試制限時間 |
 | `session_items` | セッションの初期対象と状態 |
 | `session_workbooks` | 複数WorkbookのResult順序 |
 | `attempts` | 回答ごとの独立UUID、正誤、評価、評価元（automatic/manual）、前後状態、Near Miss履歴、時刻 |
 | `exams` | 試験名、目標日、1日の学習時間、スコープJSON、アーカイブ |
+| `goals` | 汎用目標、スコープJSON、期限、目標スコア、1日の学習時間、アーカイブ |
 | `mock_answers` | 模試の回答（FSRSとは分離） |
 | `mock_results` | 模試の提出集計 |
 | `settings` | JSON設定 |
@@ -150,7 +205,8 @@ Near Miss は `sessions.assist_json` に履歴を残し、`retry_answer` で Que
 スキーマ移行:
 `user_version=1` のDBは起動時に `attempts.rating_source`、`assist_json` 列、`sessions.assist_json`、
 `assets` テーブルを追加する。v4 で `exams`、`mock_answers`、`mock_results` と
-sessions の exam/time-limit 列、v5 で `exams.daily_minutes` を追加する。
+sessions の exam/time-limit 列、v5 で `exams.daily_minutes`、v6 で `sessions.time_budget_seconds`、
+v7 で `topics` / `question_topics`、v8 で `goals` / `sessions.goal_id` を追加する。
 変更前に `backups/pre-migration-v{from}-*.sqlite` をSQLite backup APIで作成する。
 古いバックアップも復元時に同じ前方移行を行う。
 
@@ -177,6 +233,8 @@ sessions の exam/time-limit 列、v5 で `exams.daily_minutes` を追加する�
 - 短期再学習: 20分以内の Learning/Relearning
 - 次の期限: 未来の最小 `due_at`
 - Workbook別の復習/短期/新規
+- Goal / Examの進捗（期限、対象、学習済み、復習、カバレッジ）
+- 主操作「今日の学習を始める」。時間予算（3/5/10/20分/制限なし）を選んで開始する
 
 短期再学習が残っている場合は「完了」と表示せず、バナーと「今すぐ再開」を出す。通常の期限候補がない場合、Reviewセッション開始時に Learn Ahead 対象を候補へ含める。
 
@@ -200,7 +258,7 @@ sessions の exam/time-limit 列、v5 で `exams.daily_minutes` を追加する�
 
 - SQLite backup API で一貫したコピー
 - 日次 `daily-YYYY-MM-DD.sqlite` を7世代
-- pre-import / pre-delete / pre-restore / pre-reset の安全バックアップ
+- pre-import / pre-delete / pre-edit / pre-delete-topic / pre-delete-goal / pre-delete-exam / pre-restore / pre-reset の安全バックアップ
 - 通常の `import_workbook_json` / `import_workbook_file` も、教材と全アセットの
   検証成功後に `pre-import-*.sqlite` を作成する。検証失敗時はバックアップを作らない。
   バックアップ作成に失敗した場合は Import を開始しない。

@@ -182,5 +182,43 @@
 - 実機UI確認は未実施
 - Windows/Linuxは未対応
 
+## 最終監査
+
+### 仕様との対応
+- Phase A: `PRODUCT.md` / `DESIGN.md` 更新、Today主操作、時間予算UI、Goal/Exam進捗、Library/範囲/目標への導線
+- Phase B: 3/5/10/20分/制限なし、優先順位、所要時間推定、予算内選択、回答途中保護、Session再開、schema v6
+- Phase C: Topic ID・親子・多対多・Workbook横断共有・同名衝突防止、Scope包含/除外/AND/OR、動的反映、進行中固定
+- Phase D: Goal CRUD/期限なし/目標スコア/1日時間/アーカイブ、Examの適合表示、Planner再利用、Topic別実測、時間不足の明示
+- Phase E: 手動作成・編集・削除、11形式、Content/画像、Topic、Import/Export、Domain Validation/Linter、具体エラー、ID/履歴保護、バックアップ
+
+### 接続確認
+- 新しいUI操作（Today時間予算、Scope開始/Goal保存、Goal詳細、エディタ保存/検証/Export/画像追加/コピー）はすべて `WorkbookService` を経由する
+- UIからSQLite/FSRSへの直接アクセスは追加していない
+- 未接続のダミーボタンは追加していない
+
+### 回帰
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`（344 tests passed）
+- `cargo check --workspace`
+- 起動スモーク: 一時データディレクトリで `target/debug/workbook2` を起動し、8秒以上クラッシュせず稼働することを確認。ウィンドウ操作・画面遷移・VoiceOver・IMEは未確認
+
+### 監査で修正した問題
+- Workbenchデータ読み込み時のTopic割当欠落（`WorkbookService::workbook` でDBのTopicを復元）
+- コピー時のTopic割当欠落
+- 学習中Workbookの編集を拒否
+- Flashcard切替時に非表示promptが保存される問題
+- 並べ替えの選択肢追加・削除時の正解順更新
+- 複数Workbookの予算なしScope Sessionで進捗が1冊分になる問題
+- Exportが10MBを超える場合の明示エラー
+
+### 残存する既知の問題
+- エディタのContentは1行入力。数式・画像ブロックはContent JSON編集で、WYSIWYGではない
+- 画像アセットのalt/削除UIは未実装（JSON/Contentで編集）
+- 実機での画面操作、VoiceOver、日本語IME、Windows/Linuxは未検証
+- 既存のEnded Sessionが削除済みQuestionを参照する場合、履歴はAttempt集計のみで問題本文は表示しない（元からの設計）
+- 教材Exportの上限はImportと同じ10MB。大容量画像を含む教材は複数ファイルに分ける必要がある
+
+
 
 

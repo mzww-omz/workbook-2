@@ -48,6 +48,17 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 - Learn Ahead is limited to 20 minutes and the same 4 a.m. learning day. Never rewrite saved `due_at`.
 - The daily new limit counts distinct committed New questions. Skip, Practice, and uncommitted evaluation do not count.
 - Store UTC instants; use the configured IANA timezone only for the 4 a.m. day boundary.
+- Time budgets select an item list; they are never a hard timer. Do not auto-finish an in-progress answer or mark unfitted reviews complete. Unselected items stay due.
+- Scope and Goal planning reuse the existing planner and FSRS. Do not create a second memory model.
+- Selecting a parent Topic includes its descendants at resolution time. Never merge Topics by name alone; identity is the stable ID.
+
+## Authoring Invariants
+
+- Saving an existing workbook must preserve `local_id` and every unchanged Note/Question ID so FSRS states and attempts stay attached.
+- Back up with the SQLite backup API before replacing a workbook (`pre-edit-*`). Refuse edits while that workbook has an active session.
+- Removed questions may lose their FSRS state through cascade, but attempt history must remain.
+- Custom AI providers, API keys, and cloud calls are out of scope. Do not add them.
+- Export embeds bundled assets as base64 and restores Topic paths; imported external AI-generated JSON still goes through the same Domain Validation and Linter.
 
 ## Data Safety
 

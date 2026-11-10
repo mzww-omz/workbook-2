@@ -187,3 +187,49 @@
   FSRSを更新しない
 - 計画はキャッシュしない。`ExamSummary` とセッション開始のたびに現在のSQLiteから
   再計算し、日付・範囲・時間・履歴の変更が即座に反映される
+
+## 20. 時間予算は選択目標であり、タイマーではない
+
+- `workbook-scheduler/src/budget.rs` の純粋関数で候補を選ぶ
+- 優先順位は短期再学習 → 復習 → 新規 → Learn Ahead。既存QueueSelectorの意味を変えない
+- 回答履歴の平均時間、履歴がなければ形式別初期値（5〜300秒にクランプ）
+- 予算を超える最初の1問は選択する。3分でも学習を開始できるようにするため
+- 回答途中の強制終了、未消化復習の完了扱い、`due_at` の書き換えはしない
+- `sessions.time_budget_seconds` に保存し、schema v6で追加する
+
+## 21. Topicは安定IDで共有し、名前で同一視しない
+
+- `topics` はID、名前、正規化名、任意の親を持つ
+- 同じ親の下でNFKC・小文字化・空白圧縮した名前が一致する場合だけ衝突として拒否する
+- 別の親の同名Topicは別ID。階層なしも許可する
+- Question JSONの `topics` は `/` 区切りパス。Import時に解決し、Workbook横断でIDを共有する
+- 親Topicの選択は解決時に子孫へ展開する。保存時に子孫を凍結しない
+
+## 22. ScopeはExamの条件モデルを一般化して再利用する
+
+- `ExamScope` を `StudyScope` の実体として維持し、既存JSONとExamを壊さない
+- グループ内はWorkbook/Tag/TopicのAND、グループ間と個別QuestionはOR
+- 除外は包含の後。空Scopeは0問
+- 学習中のSessionは開始時 `session_items` を維持し、新教材は次回解決から反映する
+- Scope統計は実測のみで、習得率を捏造しない
+
+## 23. GoalはExamを移行せず適合表示する
+
+- `goals` テーブルを追加し、`Goal::from_exam` で既存Examを一覧・Planner・統計へ適合する
+- Exam行、模試回答・結果、Sessionは変更しない。模試はExam詳細に残す
+- Goal Planは既存 `plan_exam` とFSRSを使う。第2の記憶モデルを作らない
+- `sessions.goal_id` でGoal別の今日の学習時間を差し引く（schema v8）
+- Topic別統計は対象・学習済み・未学習・期限・苦手・回答数・初回正答率だけ
+- 期限不足は `Insufficient` として表示し、達成可能と偽らない
+
+## 24. AuthoringはIDを維持して前方更新する
+
+- 既存教材の保存は `local_id` を維持し、Note/Questionを行単位で突合する
+- 変更のないQuestionは `review_states` を保持。削除時のみFKカスケードで状態を消す
+- AttemptはQuestionへのFKを持たないため、削除後も履歴として残る
+- 学習中Workbookの編集は拒否する
+- 保存前にDomain ValidationとLinter、既存教材は `pre-edit` バックアップ
+- ContentはMarkdown文字列とContent JSON（数式・画像・コード）の両方を編集できる
+- 11形式のうち構造化編集が複雑なMatching/Hotspot/Labelingは問題JSONで安全に編集する
+- JSON ExportはTopicパスとbase64画像を埋め込み、単体で再Importできる
+- AI Provider・APIキー・クラウド呼び出しはスコープ外

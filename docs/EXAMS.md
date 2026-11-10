@@ -5,6 +5,10 @@
 試験は問題を複製せず、条件だけを保存します。条件はセッション開始時と統計表示時に
 現在の教材一覧から解決されます。
 
+Workbook 2.5では、より一般的な `Goal` が同じScopeとPlannerを使います。既存Examは
+Goal一覧に読み取り専用で適合表示され、模試だけがExam固有の機能として残ります。
+Examの行・模試結果・SessionはGoal追加のために移行・複製されません。
+
 ## 永続化
 
 - `exams` に試験名、任意の説明、任意の目標日、任意の目標スコア、1日の学習可能時間
@@ -14,17 +18,31 @@
 - `mock_answers` に模試の回答を `attempts` やFSRSとは分離して保存する。
 - `mock_results` に提出済み模試の集計をセッションごとに1件保存する。
 
-schema v5 で `exams.daily_minutes` を追加する。更新は前方のみで、変更前に
-`pre-migration-v<from>-*.sqlite` の安全用バックアップを作成する。
+schema v5 で `exams.daily_minutes` を追加する。schema v8 で `goals` と `sessions.goal_id`
+を追加する。更新は前方のみで、変更前に `pre-migration-v<from>-*.sqlite` の安全用
+バックアップを作成する。
+
+## Goal
+
+Goalは試験より一般的な目標で、期限のない個人学習にも使う。
+
+- 名前、Scope、任意の期限、任意の目標スコア、1日の学習時間、アーカイブ状態
+- 今日の計画はExamと同じ `plan_exam` を使う
+- `sessions.goal_id` でGoal別の今日の学習時間を差し引く
+- 既存Examは `Goal::from_exam` でGoal一覧に適合表示する。Examデータは複製しない
+- Goal削除は教材・Attempt・FSRS状態を削除しない。Exam由来の削除はExam削除と同じ
+- Topic別統計は実測のみ: 対象、学習済み、未学習、復習期限、苦手、回答数、初回正答率
+- 習得率・合否予測は表示しない
 
 ## スコープの意味
 
 ```text
 scope =  (グループ1 OR グループ2 OR ... OR 個別問題)
-         AND NOT (除外問題 OR 除外Workbook OR 除外タグ)
+         AND NOT (除外問題 OR 除外Workbook OR 除外タグ OR 除外Topic)
 
 グループ = (workbook_ids に含まれる、または workbook_ids が空)
             AND (tags に含まれる、または tags が空)
+            AND (topics に含まれる、または topics が空)
 ```
 
 - 同じ条件内の複数の値は OR。
@@ -34,9 +52,9 @@ scope =  (グループ1 OR グループ2 OR ... OR 個別問題)
 - 重複は `(workbook_id, question_id)` で除去し、決定的な順序に並べる。
 - 空のスコープは「すべて」ではなく「0問」を意味する。保存には少なくとも1つの
   包含条件が必要。
-- タグは現時点ではWorkbook JSONのWorkbook単位 `tags` を指す。問題単位のタグは
-  このフェーズでは導入しない。
-- 存在しないWorkbook・問題への参照は無視する。
+- タグはWorkbook JSONのWorkbook単位 `tags` を指す。
+- Topicは `topics` / `question_topics` の安定ID。親Topicを選ぶと子孫も解決対象になる。
+- 存在しないWorkbook・問題・Topicへの参照は無視する。
 - 新しくインポートされた問題が条件に一致すれば、次回のセッション開始時から対象に
   なる。進行中のセッションは開始時に固定した `session_items` を維持する。
 

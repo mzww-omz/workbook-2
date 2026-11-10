@@ -1,6 +1,8 @@
-# Workbook 2
+# Workbook 2.5
 
-既存の Electron 製 **Workbook 0.1.0** を、**Rust + GPUI + SQLite** で作り直した macOS ネイティブアプリです。WebView、Electron、クラウド、アカウントはありません。既存アプリのデータディレクトリ・アプリID・DBを書き換えません。
+**「好きな範囲を、好きな時間で。復習だけは賢く。」**
+
+既存の Electron 製 Workbook 0.1.0 の資産を生かし、**Rust + GPUI + SQLite** で作り直した macOS ネイティブの個人学習アプリです。WebView、Electron、クラウド、アカウント、AIサービスへの依存はありません。既存アプリのデータディレクトリ・アプリID・DBを書き換えません。
 
 > 最初は教えてくれる。次からは思い出させる。
 
@@ -15,6 +17,7 @@
 | M2 GPUI 学習フロー（Today / Study / Feedback / Result / History） | 完了 |
 | M3 Library / Settings / Legacy v1 移行 / Backup / Restore | 完了 |
 | M4 macOS `.app`、Light/Dark、スクリーンショット、ドキュメント | 完了（署名・公証・VoiceOver全画面監査は未実施） |
+| Workbook 2.5（時間予算 / Topic・Scope / Goal / Authoring） | 完了（実機UI確認は未実施） |
 
 ### 実装済み
 
@@ -43,11 +46,20 @@
 - 旧 Electron v1 DB の読み取り専用ステージング検査と移行
 - 完全バックアップ、7世代の日次バックアップ、復元前/削除前/移行前/リセット前の安全バックアップ
 - Light / Dark / System、Cyanアクセント、キーボード操作、GPUI Kit の IME対応 Input
+- 時間予算学習: 3 / 5 / 10 / 20分 / 制限なし。回答履歴の平均時間を優先し、形式別の保守的初期値へフォールバック。予算は出題量の目標で、回答途中を強制終了しない
+- Topic: 安定ID・任意の親・階層なし利用。Questionとの多対多、Workbook横断で共有。同一親の下だけ同名を防止
+- Scope: Workbook / Topic / 個別Questionの包含・除外・AND/OR。親Topicは子孫を含み、新教材は次回解決から反映。進行中Sessionは固定
+- Goal: 期限の有無・目標スコア・1日の学習時間・Scope・アーカイブ。既存ExamはGoal一覧に適合表示し、Evidence（模試）はExam側に維持
+- Topic別の実測統計: 対象/学習済み/未学習/復習期限/苦手/回答数/初回正答率。習得率・合否予測は表示しない
+- Authoring: Workbook / Note / Questionの作成・編集・削除。11形式の切替、構造化フィールド、Content JSON（数式・画像）、画像追加、プレビュー
+- 保存前のDomain ValidationとLinter、パス付きエラー、編集前バックアップ、Topicパスと画像base64を含むJSON Export、Importプレビュー
+- schema v8（`topics`, `question_topics`, `goals`, `sessions.goal_id`, `sessions.time_budget_seconds`）への前方マイグレーション
 
 ### 意図的な制約
 
 - 外部画像は取得しません。教材に同梱した PNG/JPEG/静的SVG だけを SQLite に取り込み、Content・Hotspot・Labeling で表示します。既存の HTTPS 画像ブロックは代替テキストとURLを表示します（オフライン優先）
-- Markdown は GPUI の rich text で表示します。KaTeX 相当の数式組版は行わず、math ブロックは等幅テキストで表示します
+- Markdown は GPUI の rich text で表示します。数式はアプリ内のLaTeXサブセット組版で表示し、解析不能時は生LaTeXと理由を表示します。WebViewは使いません
+- 教材エディタのContentは1行入力で編集します。複数行のMarkdownや数式・画像ブロックはContent JSONを貼り付けて編集し、プレビューで確認できます。ブロック単位のWYSIWYGではありません
 - VoiceOver を使った全画面手動監査、日本語IMEの実機手動確認、Developer ID署名・公証は未実施です。実装は GPUI Kit の AccessKit / IME 対応に依存しています
 - Windows / Linux は設計上分離していますが、ビルド・実機検証はしていません
 - 旧DBは実在する **schema v1 のみ**対応です。監査で v2 は確認されませんでした
@@ -82,7 +94,7 @@ open "dist/Workbook 2.app"
 
 | キー | 動作 |
 |---|---|
-| `⌘1` / `⌘2` / `⌘3` / `⌘4` | Today / Library / History / Exams |
+| `⌘1` / `⌘2` / `⌘3` / `⌘4` / `⌘5` | Today / Library / History / Goals / Scope |
 | `⌘,` | Settings |
 | `⌘O` | JSON教材を読み込む |
 | `⌘F` | Library の検索へ |
@@ -91,6 +103,15 @@ open "dist/Workbook 2.app"
 | `Esc` | 終了確認（進行を勝手に破棄しません） |
 
 すべての操作はマウスからも実行できます。テキスト入力中は数字キーを評価に使いません。
+
+### 時間予算・範囲・Goal・教材編集
+
+- Todayの主操作で 3 / 5 / 10 / 20分 / 制限なしを選ぶ。予算は出題量の目標で、回答途中を強制終了しません
+- 「範囲」でWorkbook・Topic・個別Questionを包含/除外し、対象数・未学習・復習期限・苦手を確認して復習/計画/練習を開始します
+- 同じ画面でTopicの作成・改名・削除、親Topicの指定、選択範囲のGoal保存ができます
+- 「目標」はGoalと既存Examの統一一覧です。Examの模試は「試験詳細・模試」から開きます
+- Libraryの「新規作成」または教材詳細の「編集」でエディタを開きます。11形式の切替、Content JSON（数式・画像）、画像追加、プレビュー、保存前検証ができます
+- 教材詳細の「コピー」は学習履歴が独立したローカルコピーを作ります
 
 ### 新しい問題形式の操作
 

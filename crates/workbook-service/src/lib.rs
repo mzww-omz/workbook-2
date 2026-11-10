@@ -6,7 +6,7 @@ use serde_json::Value;
 use thiserror::Error;
 use workbook_domain::{
     Answer, AssetContent, AssetRef, AssistState, CardState, Content, Exam, ExamCatalogQuestion,
-    ExamDraft, ExamScope, Goal, GoalDraft, GoalSource, GradeResult, GradeStatus,
+    ExamDraft, ExamScope, Goal, GoalDraft, GoalSource, GradeResult, GradeStatus, MAX_JSON_BYTES,
     MAX_TOTAL_ASSET_BYTES, MockOptions, Mode, NearMissReason, NearMissRecord, Phase,
     PracticeOptions, PracticeStrategy, Question, QuestionType, Rating, RatingSource,
     SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
@@ -651,7 +651,10 @@ impl WorkbookService {
     }
 
     pub fn workbook(&self, local_id: &str) -> Result<Workbook> {
-        Ok(self.storage()?.workbook(local_id)?)
+        let storage = self.storage()?;
+        let mut workbook = storage.workbook(local_id)?;
+        hydrate_workbook_topics(&storage, local_id, &mut workbook)?;
+        Ok(workbook)
     }
 
     pub fn preview_workbook(&self, raw: &str) -> Result<Workbook> {
@@ -741,6 +744,7 @@ impl WorkbookService {
     pub fn copy_workbook(&self, local_id: &str) -> Result<String> {
         let mut storage = self.storage()?;
         let mut workbook = storage.workbook(local_id)?;
+        hydrate_workbook_topics(&storage, local_id, &mut workbook)?;
         let assets = storage.assets_for_workbook(local_id)?;
         workbook.title = format!("{}（コピー）", workbook.title);
         workbook.revision = 1;
@@ -754,29 +758,7 @@ impl WorkbookService {
     pub fn export_workbook_json(&self, local_id: &str) -> Result<String> {
         let storage = self.storage()?;
         let mut workbook = storage.workbook(local_id)?;
-        let topics = storage.topics()?;
-        let mut assignments: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-        for (workbook_id, question_id, topic_id) in storage.question_topics()? {
-            if workbook_id != local_id {
-                continue;
-            }
-            if let Some(path) = workbook_domain::topic_path(&topics, &topic_id) {
-                assignments
-                    .entry((workbook_id, question_id))
-                    .or_default()
-                    .push(path.join("/"));
-            }
-        }
-        for note in &mut workbook.notes {
-            for question in &mut note.questions {
-                question.topics = assignments
-                    .get(&(local_id.to_string(), question.id.clone()))
-                    .cloned()
-                    .unwrap_or_default();
-                question.topics.sort();
-                question.topics.dedup();
-            }
-        }
+        hydrate_workbook_topics(&storage, local_id, &mut workbook)?;
         let stored_assets = storage.assets_for_workbook(local_id)?;
         workbook.assets = stored_assets
             .into_iter()
@@ -788,7 +770,14 @@ impl WorkbookService {
                 data: Some(encode_base64(&asset.bytes)),
             })
             .collect();
-        Ok(serde_json::to_string_pretty(&workbook)?)
+        let raw = serde_json::to_string_pretty(&workbook)?;
+        if raw.len() > MAX_JSON_BYTES {
+            return Err(ServiceError::Invalid(format!(
+                "書き出すJSONが{}MBを超えます。画像アセットを減らすか、小さい画像にしてください",
+                MAX_JSON_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(raw)
     }
 
     pub fn workbook_assets(&self, local_id: &str) -> Result<Vec<AssetView>> {
@@ -2778,7 +2767,10 @@ impl WorkbookService {
             None
         };
         let mut progress = StudyProgress::default();
-        if session.exam_id.is_some() || session.time_budget_seconds.is_some() {
+        if session.exam_id.is_some()
+            || session.time_budget_seconds.is_some()
+            || bundle.workbooks.len() > 1
+        {
             progress = progress_for_exam(bundle, item);
         } else if let Some(workbook_id) = workbook_id.as_deref() {
             progress = progress_for(bundle, workbook_id, item);
@@ -3965,6 +3957,37 @@ fn shuffle_candidates(candidates: &mut [SessionCandidate], seed: u64) {
         let swap = (state % (index as u64 + 1)) as usize;
         candidates.swap(index, swap);
     }
+}
+
+fn hydrate_workbook_topics(
+    storage: &Storage,
+    local_id: &str,
+    workbook: &mut Workbook,
+) -> Result<()> {
+    let topics = storage.topics()?;
+    let mut assignments: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for (workbook_id, question_id, topic_id) in storage.question_topics()? {
+        if workbook_id != local_id {
+            continue;
+        }
+        if let Some(path) = workbook_domain::topic_path(&topics, &topic_id) {
+            assignments
+                .entry((workbook_id, question_id))
+                .or_default()
+                .push(path.join("/"));
+        }
+    }
+    for note in &mut workbook.notes {
+        for question in &mut note.questions {
+            question.topics = assignments
+                .get(&(local_id.to_string(), question.id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            question.topics.sort();
+            question.topics.dedup();
+        }
+    }
+    Ok(())
 }
 
 fn resolve_assets_for_save(
