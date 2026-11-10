@@ -440,6 +440,87 @@ impl WorkbookApp {
             );
         }
 
+        // The single primary action of Today. It deliberately prefers resuming
+        // (handled above), then due reviews and short-term repeats, then new
+        // content. Everything else in the screen is secondary information.
+        let new_book = if today.new_remaining_today > 0 {
+            self.snapshot
+                .books
+                .iter()
+                .find(|book| book.new_available > 0)
+                .map(|book| book.local_id.clone())
+        } else {
+            None
+        };
+        let (primary_label, primary_caption, primary_action): (
+            &'static str,
+            String,
+            Option<(Mode, Option<String>)>,
+        ) = if today.due > 0 || today.short_term_pending > 0 {
+            (
+                "今日の学習を始める",
+                if today.short_term_pending > 0 {
+                    format!(
+                        "復習 {} 問と短期再学習 {} 問が待っています",
+                        today.due, today.short_term_pending
+                    )
+                } else {
+                    format!("期限が来た復習は {} 問です", today.due)
+                },
+                Some((Mode::Review, None)),
+            )
+        } else if let Some(book) = new_book.clone() {
+            (
+                "今日の学習を始める",
+                format!(
+                    "今日の復習は完了しています。新規を {} 問まで学習できます",
+                    today.new_remaining_today
+                ),
+                Some((Mode::New, Some(book))),
+            )
+        } else {
+            (
+                "今日の学習を始める",
+                "今日の復習は完了しています。範囲を選んで練習できます".to_string(),
+                Some((Mode::Practice, None)),
+            )
+        };
+        page = page.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .py(px(18.0))
+                .border_t_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div().flex().flex_col().gap_1().child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.muted_foreground)
+                            .child(primary_caption),
+                    ),
+                )
+                .child(
+                    Button::new("today-start-primary")
+                        .label(primary_label)
+                        .primary()
+                        .disabled(primary_action.is_none())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Some((mode, book)) = primary_action.clone() else {
+                                return;
+                            };
+                            if mode == Mode::Practice && book.is_none() {
+                                this.go(Route::Library, window, cx);
+                                return;
+                            }
+                            this.start(mode, book, window, cx);
+                        })),
+                ),
+        );
+
         page = page.child(
             div()
                 .flex()
