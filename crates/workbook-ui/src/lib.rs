@@ -1678,6 +1678,14 @@ impl WorkbookApp {
 
     pub(crate) fn validate_editor(&mut self, cx: &mut Context<Self>) {
         self.apply_editor_fields(cx);
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.error.is_some())
+        {
+            cx.notify();
+            return;
+        }
         let Some(editor) = self.editor.as_ref() else {
             return;
         };
@@ -1700,6 +1708,14 @@ impl WorkbookApp {
 
     pub(crate) fn save_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.apply_editor_fields(cx);
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.error.is_some())
+        {
+            cx.notify();
+            return false;
+        }
         let Some(editor) = self.editor.as_ref() else {
             return false;
         };
