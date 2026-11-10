@@ -78,9 +78,20 @@ impl WorkbookApp {
                 workbook,
                 path,
                 source,
+                issues,
             } => {
                 let note_count = workbook.notes.len();
                 let question_count = workbook.question_count();
+                let schema = workbook.schema_version;
+                let mut issue_list = div().flex().flex_col().gap_1();
+                for issue in issues.iter().take(6) {
+                    issue_list = issue_list.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(issue.clone()),
+                    );
+                }
                 (
                     "教材をインポート".to_string(),
                     div()
@@ -103,7 +114,7 @@ impl WorkbookApp {
                                 .text_size(px(12.0))
                                 .text_color(theme.muted_foreground)
                                 .child(format!(
-                                    "Note {note_count} · Question {question_count} · schemaVersion 1"
+                                    "Note {note_count} · Question {question_count} · schemaVersion {schema}"
                                 )),
                         )
                         .child(
@@ -113,6 +124,17 @@ impl WorkbookApp {
                                 .child(source.clone()),
                         )
                         .child("独立したローカルコピーとして追加します。既存教材は上書きしません。")
+                        .child("確定前に安全用バックアップを自動作成します。")
+                        .when(!issues.is_empty(), |column| {
+                            column
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child("Linter"),
+                                )
+                                .child(issue_list)
+                        })
                         .into_any_element(),
                     div()
                         .flex()

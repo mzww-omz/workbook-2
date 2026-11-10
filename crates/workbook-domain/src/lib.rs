@@ -32,6 +32,7 @@ pub use grading::{
     AssistState, GradeDiagnostic, GradeResult, GradeStatus, NearMissReason, NearMissRecord,
     grade_answer_detailed,
 };
+pub use question_format::encode_base64;
 pub use question_format::{
     AssetContent, AssetRef, HotspotAnswerSpec, HotspotRegion, HotspotShape, HotspotSpec,
     LabelOption, LabelTarget, LabelingAnswerSpec, LabelingSpec, MAX_ASSET_BYTES, MAX_ASSETS,

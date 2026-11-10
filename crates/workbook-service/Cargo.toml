@@ -13,6 +13,7 @@ thiserror.workspace = true
 uuid.workspace = true
 workbook-domain = { path = "../workbook-domain" }
 workbook-import = { path = "../workbook-import" }
+workbook-lint = { path = "../workbook-lint" }
 workbook-scheduler = { path = "../workbook-scheduler" }
 workbook-storage = { path = "../workbook-storage" }
 

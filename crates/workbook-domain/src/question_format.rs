@@ -627,6 +627,31 @@ fn svg_dimension(node: roxmltree::Node<'_, '_>, name: &str) -> Option<f64> {
         .ok()
 }
 
+/// Standard base64 with padding. Used by JSON export so a workbook becomes a
+/// single portable file again instead of referring to local asset paths.
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let first = group[0];
+        let second = group.get(1).copied().unwrap_or(0);
+        let third = group.get(2).copied().unwrap_or(0);
+        output.push(TABLE[(first >> 2) as usize] as char);
+        output.push(TABLE[(((first & 0b11) << 4) | (second >> 4)) as usize] as char);
+        if group.len() > 1 {
+            output.push(TABLE[(((second & 0b1111) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if group.len() > 2 {
+            output.push(TABLE[(third & 0b11_1111) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
     let cleaned: Vec<u8> = value
         .bytes()
@@ -1845,6 +1870,20 @@ mod tests {
         deep.push_str("</svg>");
         let error = inspect(&deep).unwrap_err();
         assert!(error.message.contains("ネスト"), "{error}");
+    }
+
+    #[test]
+    fn base64_encoding_round_trips_arbitrary_bytes() {
+        for bytes in [
+            Vec::new(),
+            vec![0u8],
+            vec![0, 1],
+            vec![0, 1, 2],
+            (0..=255u8).collect::<Vec<_>>(),
+        ] {
+            let encoded = encode_base64(&bytes);
+            assert_eq!(decode_base64(&encoded).unwrap(), bytes);
+        }
     }
 
     #[test]

@@ -8244,6 +8244,7 @@ dependencies = [
  "uuid",
  "workbook-domain",
  "workbook-import",
+ "workbook-lint",
  "workbook-scheduler",
  "workbook-storage",
 ]
@@ -8274,6 +8275,7 @@ dependencies = [
  "chrono-tz",
  "gpui-kit",
  "rfd",
+ "serde_json",
  "uuid",
  "workbook-domain",
  "workbook-import",

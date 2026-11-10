@@ -303,6 +303,25 @@ impl WorkbookApp {
         crate::content::ContentImages::new(assets, &self.image_cache, workbook_id)
     }
 
+    fn editor_images(&self) -> crate::content::ContentImages<'_> {
+        let assets = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.assets.as_slice())
+            .unwrap_or(&[]);
+        let workbook_id = self
+            .editor
+            .as_ref()
+            .map(|editor| {
+                editor
+                    .local_id
+                    .as_deref()
+                    .unwrap_or(editor.workbook.id.as_str())
+            })
+            .unwrap_or("");
+        crate::content::ContentImages::new(assets, &self.image_cache, workbook_id)
+    }
+
     pub(crate) fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut container = div()
             .flex()
@@ -329,6 +348,7 @@ impl WorkbookApp {
             Route::ExamDetail => self.render_exam_detail(cx),
             Route::ExamEditor => self.render_exam_editor(cx),
             Route::GoalDetail => self.render_goal_detail(cx),
+            Route::Editor => self.render_editor(cx),
             Route::Study => self.render_study(cx),
         };
         container.child(page).into_any_element()
@@ -1010,6 +1030,14 @@ impl WorkbookApp {
                         .flex()
                         .gap_2()
                         .child(
+                            Button::new("library-new-workbook")
+                                .label("新規作成")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_editor_new(window, cx);
+                                })),
+                        )
+                        .child(
                             Button::new("library-scope")
                                 .label("範囲学習")
                                 .secondary()
@@ -1199,6 +1227,7 @@ impl WorkbookApp {
         let id_review = summary.local_id.clone();
         let id_practice = summary.local_id.clone();
         let id_delete = summary.local_id.clone();
+        let id_edit = summary.local_id.clone();
         let title = summary.title.clone();
 
         let mut page = div().flex().flex_col().gap_6();
@@ -1246,6 +1275,19 @@ impl WorkbookApp {
                                 this.start(Mode::Practice, Some(id_practice.clone()), window, cx);
                             })),
                     )
+                    .child(
+                        Button::new("detail-edit")
+                            .label("編集")
+                            .secondary()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_editor_existing(id_edit.clone(), window, cx);
+                            })),
+                    )
+                    .child(Button::new("detail-copy").label("コピー").ghost().on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.copy_selected_workbook(cx);
+                        }),
+                    ))
                     .child(div().flex_1())
                     .child(
                         Button::new("detail-delete")
@@ -2675,6 +2717,742 @@ impl WorkbookApp {
             page = page.child(rows);
         }
 
+        page.into_any_element()
+    }
+
+    fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(editor) = self.editor.as_ref() else {
+            return self.empty_state(
+                "エディタが開かれていません",
+                "教材一覧から新しい教材を作成するか、既存教材を編集してください。",
+                cx,
+            );
+        };
+        let mut page = div().flex().flex_col().gap_5();
+        page = page.child(
+            div()
+                .flex()
+                .items_end()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            Button::new("editor-back")
+                                .label("← 教材一覧")
+                                .text()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.go(Route::Library, window, cx);
+                                })),
+                        )
+                        .child(self.page_header(
+                            if editor.local_id.is_some() {
+                                "教材を編集"
+                            } else {
+                                "新しい教材"
+                            },
+                            "Markdownはそのまま、数式・画像ブロックはContent JSONで編集できます。保存前にDomain ValidationとLinterが検証します。",
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("editor-validate")
+                                .label("検証")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.validate_editor(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("editor-export")
+                                .label("JSONを書き出す")
+                                .secondary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.export_editor(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("editor-save")
+                                .label("保存")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_editor(window, cx);
+                                })),
+                        ),
+                ),
+        );
+
+        if let Some(error) = editor.error.as_ref() {
+            page = page.child(
+                div()
+                    .p_3()
+                    .border_l_3()
+                    .border_color(theme.danger)
+                    .bg(theme.danger.opacity(0.08))
+                    .text_size(px(13.0))
+                    .child(error.clone()),
+            );
+        }
+        if !editor.issues.is_empty() {
+            let mut issues = div().flex().flex_col().gap_1();
+            for issue in editor.issues.iter().take(8) {
+                issues = issues.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(if issue.is_error() {
+                            theme.danger
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(format!(
+                            "{} {} · {}: {}",
+                            issue.severity, issue.code, issue.path, issue.message
+                        )),
+                );
+            }
+            page = page.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child("Linter"),
+                    )
+                    .child(issues),
+            );
+        }
+
+        let notes = editor.workbook.notes.clone();
+        let note_index = editor.note_index;
+        let question_index = editor.question_index;
+        let current_note = notes.get(note_index);
+        let question = current_note.and_then(|note| note.questions.get(question_index));
+
+        page = page.child(
+            div()
+                .flex()
+                .items_start()
+                .gap_6()
+                // ---- structure -------------------------------------------
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .w(px(320.0))
+                        .flex_none()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(editor_label("教材名", cx))
+                                .child(Input::new(&editor.title).id("editor-title"))
+                                .child(editor_label("説明", cx))
+                                .child(Input::new(&editor.description).id("editor-description"))
+                                .child(editor_label("タグ（カンマ区切り）", cx))
+                                .child(Input::new(&editor.tags).id("editor-tags"))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(editor_label("画像アセット", cx))
+                                        .child(
+                                            Button::new("editor-add-asset")
+                                                .label("画像を追加")
+                                                .ghost()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.add_editor_asset(cx);
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(if editor.assets.is_empty() {
+                                            "なし".to_string()
+                                        } else {
+                                            editor
+                                                .assets
+                                                .iter()
+                                                .map(|asset| asset.id.clone())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().text_size(px(13.0)).child("Note"))
+                                .child(
+                                    Button::new("editor-add-note")
+                                        .label("Noteを追加")
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.add_editor_note(window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div().flex().flex_col().children(
+                                notes.iter().enumerate().map(|(index, note)| {
+                                    let selected = index == note_index;
+                                    let remove_id = index;
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .py(px(6.0))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            Button::new(format!("editor-note-{index}"))
+                                                .label(note.title.clone())
+                                                .when(selected, |button| button.primary())
+                                                .when(!selected, |button| button.ghost())
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.select_editor_note(index, window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(format!("editor-remove-note-{index}"))
+                                                .label("削除")
+                                                .ghost()
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.remove_editor_note(remove_id, window, cx);
+                                                })),
+                                        )
+                                        .into_any_element()
+                                }),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().text_size(px(13.0)).child("Question"))
+                                .child(
+                                    Button::new("editor-add-question")
+                                        .label("Questionを追加")
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.add_editor_question(window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div().flex().flex_col().children(
+                                current_note
+                                    .map(|note| note.questions.clone())
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, question)| {
+                                        let selected = index == question_index;
+                                        let remove_id = index;
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .py(px(6.0))
+                                            .border_b_1()
+                                            .border_color(theme.border)
+                                            .child(
+                                                Button::new(format!("editor-question-{index}"))
+                                                    .label(format!(
+                                                        "{:02} {}",
+                                                        index + 1,
+                                                        type_label(question.kind)
+                                                    ))
+                                                    .when(selected, |button| button.primary())
+                                                    .when(!selected, |button| button.ghost())
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.select_editor_question(
+                                                                index, window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(format!(
+                                                    "editor-remove-question-{index}"
+                                                ))
+                                                .label("削除")
+                                                .ghost()
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.remove_editor_question(
+                                                            remove_id, window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                            )
+                                            .into_any_element()
+                                    }),
+                            ),
+                        ),
+                )
+                // ---- form -------------------------------------------------
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .flex_1()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(editor_label("Noteタイトル", cx))
+                                .child(Input::new(&editor.note_title).id("editor-note-title"))
+                                .child(editor_label("知識カード（Markdown / Content JSON）", cx))
+                                .child(Input::new(&editor.note_card).id("editor-note-card")),
+                        )
+                        .when_some(question.cloned(), |column, question| {
+                            let kind = question.kind;
+                            let mut type_row = div().flex().flex_wrap().gap_2().child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child("形式"),
+                            );
+                            for (value, label) in [
+                                (QuestionType::SingleChoice, "単一選択"),
+                                (QuestionType::TrueFalse, "○×"),
+                                (QuestionType::MultipleChoice, "複数選択"),
+                                (QuestionType::ShortText, "短答"),
+                                (QuestionType::Cloze, "穴埋め"),
+                                (QuestionType::Flashcard, "カード"),
+                                (QuestionType::Numeric, "数値"),
+                                (QuestionType::Ordering, "並べ替え"),
+                                (QuestionType::Matching, "対応付け"),
+                                (QuestionType::Hotspot, "画像領域"),
+                                (QuestionType::Labeling, "ラベル"),
+                            ] {
+                                let selected = kind == value;
+                                type_row = type_row.child(
+                                    Button::new(format!("editor-type-{label}"))
+                                        .label(label)
+                                        .when(selected, |button| button.primary())
+                                        .when(!selected, |button| button.ghost())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.set_editor_kind(value, window, cx);
+                                        })),
+                                );
+                            }
+                            column
+                                .child(type_row)
+                                .when(kind != QuestionType::Flashcard, |column| {
+                                    column
+                                        .child(editor_label("問題文（Markdown / Content JSON）", cx))
+                                        .child(Input::new(&editor.prompt).id("editor-prompt"))
+                                })
+                                .when(kind == QuestionType::Flashcard, |column| {
+                                    column
+                                        .child(editor_label("表面", cx))
+                                        .child(Input::new(&editor.front).id("editor-front"))
+                                        .child(editor_label("裏面", cx))
+                                        .child(Input::new(&editor.back).id("editor-back"))
+                                })
+                                .child(editor_label("ヒント（任意）", cx))
+                                .child(Input::new(&editor.hint).id("editor-hint"))
+                                .child(editor_label("解説（Markdown / Content JSON）", cx))
+                                .child(Input::new(&editor.explanation).id("editor-explanation"))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child("内容は通常のMarkdown文字列。数式・画像はContent JSONで指定します。")
+                                        .child(
+                                            r#"数式: [{"type":"math","text":"\frac{1}{2}"}]"#,
+                                        )
+                                        .child(
+                                            r#"画像: [{"type":"image","source":{"asset":"asset-id"},"alt":"説明","fit":"contain"}]"#,
+                                        ),
+                                )
+                                .child(editor_label("Topic（カンマ区切り、例: 数学/一次関数）", cx))
+                                .child(Input::new(&editor.topics).id("editor-topics"))
+                                .when(
+                                    matches!(
+                                        kind,
+                                        QuestionType::SingleChoice
+                                            | QuestionType::MultipleChoice
+                                            | QuestionType::Ordering
+                                    ),
+                                    |column| {
+                                        let mut options = div().flex().flex_col().gap_2();
+                                        let option_count = question
+                                            .options
+                                            .as_ref()
+                                            .map(Vec::len)
+                                            .unwrap_or(0);
+                                        for index in 0..option_count {
+                                            let option = question
+                                                .options
+                                                .as_ref()
+                                                .and_then(|options| options.get(index));
+                                            let Some(option) = option else {
+                                                continue;
+                                            };
+                                            let answer_id = option.id.clone();
+                                            let selected_answer = if kind
+                                                == QuestionType::MultipleChoice
+                                            {
+                                                question
+                                                    .multiple_choice_answers()
+                                                    .contains(&option.id)
+                                            } else {
+                                                question.single_choice_answer()
+                                                    == Some(option.id.as_str())
+                                            };
+                                            let multiple =
+                                                kind == QuestionType::MultipleChoice;
+                                            let remove_index = index;
+                                            let up_index = index;
+                                            let down_index = index;
+                                            options = options.child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .when(
+                                                        index < editor.option_inputs.len(),
+                                                        |row| {
+                                                            row.child(
+                                                                div().flex_1().child(
+                                                                    Input::new(
+                                                                        &editor.option_inputs[index],
+                                                                    )
+                                                                    .id(format!(
+                                                                        "editor-option-{index}"
+                                                                    )),
+                                                                ),
+                                                            )
+                                                        },
+                                                    )
+                                                    .when(
+                                                        matches!(
+                                                            kind,
+                                                            QuestionType::SingleChoice
+                                                                | QuestionType::MultipleChoice
+                                                        ),
+                                                        |row| {
+                                                            row.child(
+                                                                Button::new(format!(
+                                                                    "editor-answer-{index}"
+                                                                ))
+                                                                .label(if selected_answer {
+                                                                    "正解"
+                                                                } else {
+                                                                    "正解にする"
+                                                                })
+                                                                .when(selected_answer, |button| {
+                                                                    button.primary()
+                                                                })
+                                                                .when(!selected_answer, |button| {
+                                                                    button.secondary()
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, window, cx| {
+                                                                        this.set_editor_option_answer(
+                                                                            answer_id.clone(),
+                                                                            multiple,
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                )),
+                                                            )
+                                                        },
+                                                    )
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "editor-option-up-{index}"
+                                                        ))
+                                                        .label("↑")
+                                                        .ghost()
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.move_editor_option(
+                                                                    up_index, -1, window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    )
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "editor-option-down-{index}"
+                                                        ))
+                                                        .label("↓")
+                                                        .ghost()
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.move_editor_option(
+                                                                    down_index, 1, window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    )
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "editor-option-remove-{index}"
+                                                        ))
+                                                        .label("削除")
+                                                        .ghost()
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.remove_editor_option(
+                                                                    remove_index, window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    ),
+                                            );
+                                        }
+                                        column
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(editor_label(
+                                                        if kind == QuestionType::Ordering {
+                                                            "項目（この順が正解）"
+                                                        } else {
+                                                            "選択肢"
+                                                        },
+                                                        cx,
+                                                    ))
+                                                    .child(
+                                                        Button::new("editor-add-option")
+                                                            .label("選択肢を追加")
+                                                            .ghost()
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.add_editor_option(
+                                                                        window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(options)
+                                    },
+                                )
+                                .when(kind == QuestionType::TrueFalse, |column| {
+                                    column
+                                        .child(editor_label("正解", cx))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap_2()
+                                                .child(
+                                                    Button::new("editor-true")
+                                                        .label("○ 正しい")
+                                                        .when(
+                                                            question.answer
+                                                                == Some(serde_json::Value::Bool(
+                                                                    true,
+                                                                )),
+                                                            |button| button.primary(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.set_editor_true_false(
+                                                                    true, window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("editor-false")
+                                                        .label("× まちがい")
+                                                        .when(
+                                                            question.answer
+                                                                == Some(serde_json::Value::Bool(
+                                                                    false,
+                                                                )),
+                                                            |button| button.primary(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.set_editor_true_false(
+                                                                    false, window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                })
+                                .when(
+                                    matches!(
+                                        kind,
+                                        QuestionType::ShortText
+                                            | QuestionType::Cloze
+                                            | QuestionType::Numeric
+                                    ),
+                                    |column| {
+                                        column
+                                            .child(editor_label(
+                                                match kind {
+                                                    QuestionType::ShortText => {
+                                                        "正解候補（| 区切り）"
+                                                    }
+                                                    QuestionType::Cloze => {
+                                                        "正解（1: 答え | 別解; 2: 答え）"
+                                                    }
+                                                    _ => "正解（値|単位|有効数字）",
+                                                },
+                                                cx,
+                                            ))
+                                            .child(Input::new(&editor.answer).id("editor-answer"))
+                                    },
+                                )
+                                .when(
+                                    matches!(
+                                        kind,
+                                        QuestionType::Matching
+                                            | QuestionType::Hotspot
+                                            | QuestionType::Labeling
+                                    ),
+                                    |column| {
+                                        let mut assets = String::new();
+                                        for asset in &editor.assets {
+                                            assets.push_str(&format!(
+                                                "{} ({}) ",
+                                                asset.id, asset.media_type
+                                            ));
+                                        }
+                                        column.child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .p_3()
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.0))
+                                                        .child("この形式の詳細は下の「問題JSON」で編集します。"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(theme.muted_foreground)
+                                                        .child(format!(
+                                                            "利用可能な画像アセット: {}",
+                                                            if assets.is_empty() {
+                                                                "なし（Importで画像を追加してください）"
+                                                            } else {
+                                                                &assets
+                                                            }
+                                                        )),
+                                                ),
+                                        )
+                                    },
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_end()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .flex_1()
+                                                .child(editor_label("問題JSON（高度な編集・全形式）", cx))
+                                                .child(Input::new(&editor.advanced).id("editor-advanced")),
+                                        )
+                                        .child(
+                                            Button::new("editor-apply-json")
+                                                .label("JSONを適用")
+                                                .secondary()
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.apply_editor_advanced(window, cx);
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .mt(px(8.0))
+                                        .pt(px(12.0))
+                                        .border_t_1()
+                                        .border_color(theme.border)
+                                        .child(div().text_size(px(11.0)).text_color(theme.muted_foreground).child("プレビュー"))
+                                        .child(crate::content::render_content(
+                                            "editor-prompt-preview",
+                                            question.prompt.as_ref().unwrap_or(&Content::Text(String::new())),
+                                            &theme,
+                                            &self.editor_images(),
+                                        ))
+                                        .when_some(question.options.clone(), |column, options| {
+                                            column.child(div().flex().flex_col().gap_1().children(
+                                                options.iter().map(|option| {
+                                                    div()
+                                                        .p_2()
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .child(crate::content::render_content(
+                                                            &format!("editor-option-preview-{}", option.id),
+                                                            &option.content,
+                                                            &theme,
+                                                            &self.editor_images(),
+                                                        ))
+                                                        .into_any_element()
+                                                }),
+                                            ))
+                                        })
+                                        .child(
+                                            div()
+                                                .text_size(px(12.0))
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!(
+                                                    "正解: {}",
+                                                    question.answer_summary()
+                                                )),
+                                        )
+                                        .child(crate::content::render_content(
+                                            "editor-explanation-preview",
+                                            &question.explanation,
+                                            &theme,
+                                            &self.editor_images(),
+                                        ))
+                                )
+                        }),
+                ),
+        );
         page.into_any_element()
     }
 
@@ -6003,6 +6781,15 @@ fn truncate_text(text: &str, limit: usize) -> String {
         truncated.push('…');
         truncated
     }
+}
+
+fn editor_label(text: &'static str, cx: &Context<WorkbookApp>) -> AnyElement {
+    let theme = cx.theme();
+    div()
+        .text_size(px(11.0))
+        .text_color(theme.muted_foreground)
+        .child(text)
+        .into_any_element()
 }
 
 fn type_label(kind: QuestionType) -> &'static str {

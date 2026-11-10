@@ -137,4 +137,50 @@
 - 実機UI確認は未実施
 - GoalのScope編集は範囲画面から作り直す（詳細画面では名前・期限・時間のみ編集）
 
+## Phase E — Authoring & Content Management
+
+### 実装済み
+- AI教材生成・LLM Provider・APIキー設定は実装しない（仕様変更どおり）
+- Workbook / Note / Questionの作成・編集・削除（アプリ内エディタ）
+- 11種類すべての問題形式を切り替え可能。選択肢・正解・ヒント・解説・問題文を編集
+- 単一選択・複数選択・○×・短答・穴埋め・カード・数値・並べ替えは構造化フィールドで編集
+- 対応付け・画像領域・ラベルは共通の問題JSON（高度な編集）で `matching` / `hotspot` / `labeling` と `answer` を編集。形式を失わない安全な経路
+- Contentは通常のMarkdown文字列、またはContent JSON（数式・画像・コードブロック）で編集。プレビューは既存のContentレンダラーと数式組版を使用
+- 画像アセットをファイルから追加（PNG/JPEG/SVGをDomain Validationで完全検証）。Content JSONの `asset` から参照
+- Topicのカンマ区切り編集。Scope画面のTopic作成・改名・削除・親指定
+- 既存教材の保存は `local_id` と変更のないNote/Question IDを維持。FSRS状態・Attempt・Session履歴を保持
+- Note/Question削除時は該当FSRS状態のみFKで削除し、Attempt履歴は保持
+- 学習中（active session）の教材編集は拒否
+- 保存前にDomain ValidationとLinterを実行。パス付きの具体的エラーと警告を表示
+- 編集前の `pre-edit-*.sqlite` バックアップ
+- JSON Export: Topicパスを復元し、画像をbase64で埋め込んだ可搬JSONを書き出し
+- JSON Import: プレビューにLinter警告・エラーとschemaVersionを表示。確定前バックアップは既存どおり
+- Workbookの独立コピー
+- `workbook-lint` をServiceから再利用（CLIと同じ検証）
+
+### 主要ファイル
+- `crates/workbook-ui/src/lib.rs`, `views.rs`, `modal.rs`
+- `crates/workbook-service/src/lib.rs`, `Cargo.toml`
+- `crates/workbook-storage/src/lib.rs`
+- `crates/workbook-domain/src/question_format.rs`, `lib.rs`
+- `crates/workbook-service/tests/authoring.rs`（新規）
+- `crates/workbook-storage/tests/storage.rs`
+
+### テスト
+- 編集後もQuestion ID・FSRS状態・Attempt件数が保持されること
+- Question削除でFSRS状態のみ消え、Attempt履歴が残ること
+- 新規Workbook作成、独立コピー
+- Topicパス付きExportと再Import、画像base64埋め込み
+- Linterのエラー/警告とパス
+- 不正な回答のDomain Validation
+- 学習中の編集拒否
+- schema v7→v8（Goal追加）と既存マイグレーション
+
+### 既知の制約
+- Contentの複数行編集は1行Inputで行う（JSONを貼り付け可能）。リッチなブロック単位WYSIWYGではない
+- 画像アセットのalt編集は問題JSON/教材JSONで行う
+- 実機UI確認は未実施
+- Windows/Linuxは未対応
+
+
 

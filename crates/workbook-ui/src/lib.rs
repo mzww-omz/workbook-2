@@ -28,13 +28,14 @@ use gpui_kit::{
     WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use workbook_domain::{
-    Answer, ExamDraft, ExamScope, ExamScopeGroup, MockOptions, MockOrder, Mode, Phase,
-    PracticeOptions, PracticeStrategy, Question, QuestionRef, QuestionType, Rating, Settings,
-    ThemeSetting, Workbook, answer_is_blank,
+    Answer, ChoiceOption, Content, ExamDraft, ExamScope, ExamScopeGroup, MockOptions, MockOrder,
+    Mode, Note, Phase, PracticeOptions, PracticeStrategy, Question, QuestionRef, QuestionType,
+    Rating, Settings, ThemeSetting, Workbook, answer_is_blank,
 };
 use workbook_import::LegacyPreview;
 use workbook_service::{
-    BookSummary, ExamSummary, GoalSummary, Snapshot, StudyView, TodaySummary, WorkbookService,
+    BookSummary, ExamSummary, GoalSummary, Snapshot, StudyView, TodaySummary, WorkbookIssue,
+    WorkbookService,
 };
 
 use crate::image_cache::ImageCache;
@@ -54,6 +55,7 @@ pub(crate) enum Route {
     ExamEditor,
     Scope,
     GoalDetail,
+    Editor,
     Study,
 }
 
@@ -81,6 +83,7 @@ pub(crate) enum Modal {
         workbook: Workbook,
         path: PathBuf,
         source: String,
+        issues: Vec<String>,
     },
     Restore {
         path: PathBuf,
@@ -237,6 +240,32 @@ impl ScopeState {
     }
 }
 
+pub(crate) struct WorkbookEditorState {
+    pub local_id: Option<String>,
+    pub workbook: Workbook,
+    pub note_index: usize,
+    pub question_index: usize,
+    pub assets: Vec<workbook_service::AssetView>,
+    pub syncing: bool,
+    pub error: Option<String>,
+    pub issues: Vec<WorkbookIssue>,
+    pub title: Entity<InputState>,
+    pub description: Entity<InputState>,
+    pub tags: Entity<InputState>,
+    pub note_title: Entity<InputState>,
+    pub note_card: Entity<InputState>,
+    pub prompt: Entity<InputState>,
+    pub hint: Entity<InputState>,
+    pub explanation: Entity<InputState>,
+    pub front: Entity<InputState>,
+    pub back: Entity<InputState>,
+    pub answer: Entity<InputState>,
+    pub topics: Entity<InputState>,
+    pub advanced: Entity<InputState>,
+    pub option_inputs: Vec<Entity<InputState>>,
+    pub _subscriptions: Vec<Subscription>,
+}
+
 pub struct WorkbookApp {
     pub(crate) service: Arc<WorkbookService>,
     pub(crate) route: Route,
@@ -251,6 +280,7 @@ pub struct WorkbookApp {
     pub(crate) selected_exam: Option<String>,
     pub(crate) exam_editor: Option<ExamEditorState>,
     pub(crate) scope_editor: Option<ScopeState>,
+    pub(crate) editor: Option<WorkbookEditorState>,
     pub(crate) scope_search_text: String,
     pub(crate) scope_search: Entity<InputState>,
     pub(crate) scope_topic_name: Entity<InputState>,
@@ -380,6 +410,7 @@ impl WorkbookApp {
             selected_exam: None,
             exam_editor: None,
             scope_editor: None,
+            editor: None,
             scope_search_text: String::new(),
             scope_search,
             scope_topic_name,
@@ -891,6 +922,901 @@ impl WorkbookApp {
                 cx.notify();
             }
         }
+    }
+
+    pub(crate) fn open_editor_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workbook = new_editor_workbook();
+        self.open_editor_model(None, workbook, Vec::new(), window, cx);
+    }
+
+    pub(crate) fn open_editor_existing(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workbook = match self.service.workbook(&id) {
+            Ok(workbook) => workbook,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let assets = self.service.workbook_assets(&id).unwrap_or_default();
+        self.open_editor_model(Some(id), workbook, assets, window, cx);
+    }
+
+    fn open_editor_model(
+        &mut self,
+        local_id: Option<String>,
+        workbook: Workbook,
+        assets: Vec<workbook_service::AssetView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title_value = workbook.title.clone();
+        let description_value = workbook.description.clone();
+        let tags_value = workbook.tags.join(", ");
+        let note_title_value = workbook
+            .notes
+            .first()
+            .map(|note| note.title.clone())
+            .unwrap_or_default();
+        let note_card_value = workbook
+            .notes
+            .first()
+            .map(|note| content_editor_text(&note.knowledge_card))
+            .unwrap_or_default();
+        let question = workbook
+            .notes
+            .first()
+            .and_then(|note| note.questions.first());
+        let prompt_value = question
+            .and_then(|question| question.prompt.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let hint_value = question
+            .and_then(|question| question.hint.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let explanation_value = question
+            .map(|question| content_editor_text(&question.explanation))
+            .unwrap_or_default();
+        let front_value = question
+            .and_then(|question| question.front.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let back_value = question
+            .and_then(|question| question.back.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let answer_value = question.map(editor_answer_text).unwrap_or_default();
+        let topics_value = question
+            .map(|question| question.topics.join(", "))
+            .unwrap_or_default();
+        let advanced_value = question
+            .map(|question| serde_json::to_string_pretty(question).unwrap_or_default())
+            .unwrap_or_default();
+        let option_values: Vec<String> = (0..6)
+            .map(|index| {
+                question
+                    .and_then(|question| question.options.as_ref()?.get(index))
+                    .map(|option| content_editor_text(&option.content))
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        let title = cx.new(|cx| InputState::new(window, cx).default_value(title_value));
+        let description = cx.new(|cx| InputState::new(window, cx).default_value(description_value));
+        let tags = cx.new(|cx| InputState::new(window, cx).default_value(tags_value));
+        let note_title = cx.new(|cx| InputState::new(window, cx).default_value(note_title_value));
+        let note_card = cx.new(|cx| InputState::new(window, cx).default_value(note_card_value));
+        let prompt = cx.new(|cx| InputState::new(window, cx).default_value(prompt_value));
+        let hint = cx.new(|cx| InputState::new(window, cx).default_value(hint_value));
+        let explanation = cx.new(|cx| InputState::new(window, cx).default_value(explanation_value));
+        let front = cx.new(|cx| InputState::new(window, cx).default_value(front_value));
+        let back = cx.new(|cx| InputState::new(window, cx).default_value(back_value));
+        let answer = cx.new(|cx| InputState::new(window, cx).default_value(answer_value));
+        let topics = cx.new(|cx| InputState::new(window, cx).default_value(topics_value));
+        let advanced = cx.new(|cx| InputState::new(window, cx).default_value(advanced_value));
+        let option_inputs = option_values
+            .into_iter()
+            .map(|value| cx.new(|cx| InputState::new(window, cx).default_value(value)))
+            .collect::<Vec<_>>();
+
+        let mut state = WorkbookEditorState {
+            local_id,
+            workbook,
+            note_index: 0,
+            question_index: 0,
+            assets,
+            syncing: false,
+            error: None,
+            issues: Vec::new(),
+            title,
+            description,
+            tags,
+            note_title,
+            note_card,
+            prompt,
+            hint,
+            explanation,
+            front,
+            back,
+            answer,
+            topics,
+            advanced,
+            option_inputs,
+            _subscriptions: Vec::new(),
+        };
+        let mut subscriptions = Vec::new();
+        let inputs: Vec<Entity<InputState>> = vec![
+            state.title.clone(),
+            state.description.clone(),
+            state.tags.clone(),
+            state.note_title.clone(),
+            state.note_card.clone(),
+            state.prompt.clone(),
+            state.hint.clone(),
+            state.explanation.clone(),
+            state.front.clone(),
+            state.back.clone(),
+            state.answer.clone(),
+            state.topics.clone(),
+        ];
+        for input in inputs
+            .into_iter()
+            .chain(state.option_inputs.iter().cloned())
+        {
+            subscriptions.push(cx.subscribe_in(&input, window, |this, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.apply_editor_fields(cx);
+                }
+            }));
+        }
+        state._subscriptions = subscriptions;
+        self.editor = Some(state);
+        self.route = Route::Editor;
+        self.notice = None;
+        self.sync_editor_inputs(window, cx);
+        window.focus(&self.root_focus, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn sync_editor_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        editor.syncing = true;
+        let workbook_title = editor.workbook.title.clone();
+        let workbook_description = editor.workbook.description.clone();
+        let workbook_tags = editor.workbook.tags.join(", ");
+        let note = editor.workbook.notes.get(editor.note_index);
+        let note_title = note.map(|note| note.title.clone()).unwrap_or_default();
+        let note_card = note
+            .map(|note| content_editor_text(&note.knowledge_card))
+            .unwrap_or_default();
+        let question = note.and_then(|note| note.questions.get(editor.question_index));
+        let prompt = question
+            .and_then(|question| question.prompt.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let hint = question
+            .and_then(|question| question.hint.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let explanation = question
+            .map(|question| content_editor_text(&question.explanation))
+            .unwrap_or_default();
+        let front = question
+            .and_then(|question| question.front.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let back = question
+            .and_then(|question| question.back.as_ref())
+            .map(content_editor_text)
+            .unwrap_or_default();
+        let answer = question.map(editor_answer_text).unwrap_or_default();
+        let topics = question
+            .map(|question| question.topics.join(", "))
+            .unwrap_or_default();
+        let advanced = question
+            .map(|question| serde_json::to_string_pretty(question).unwrap_or_default())
+            .unwrap_or_default();
+        let option_values: Vec<String> = (0..6)
+            .map(|index| {
+                question
+                    .and_then(|question| question.options.as_ref()?.get(index))
+                    .map(|option| content_editor_text(&option.content))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let handles = vec![
+            (editor.title.clone(), workbook_title),
+            (editor.description.clone(), workbook_description),
+            (editor.tags.clone(), workbook_tags),
+            (editor.note_title.clone(), note_title),
+            (editor.note_card.clone(), note_card),
+            (editor.prompt.clone(), prompt),
+            (editor.hint.clone(), hint),
+            (editor.explanation.clone(), explanation),
+            (editor.front.clone(), front),
+            (editor.back.clone(), back),
+            (editor.answer.clone(), answer),
+            (editor.topics.clone(), topics),
+            (editor.advanced.clone(), advanced),
+        ];
+        for (input, value) in handles {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        for (input, value) in editor.option_inputs.iter().cloned().zip(option_values) {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        editor.syncing = false;
+    }
+
+    pub(crate) fn apply_editor_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if editor.syncing {
+            return;
+        }
+        let title = editor.title.read(cx).value().to_string();
+        let description = editor.description.read(cx).value().to_string();
+        let tags = editor.tags.read(cx).value().to_string();
+        let note_title = editor.note_title.read(cx).value().to_string();
+        let note_card = editor.note_card.read(cx).value().to_string();
+        let prompt = editor.prompt.read(cx).value().to_string();
+        let hint = editor.hint.read(cx).value().to_string();
+        let explanation = editor.explanation.read(cx).value().to_string();
+        let front = editor.front.read(cx).value().to_string();
+        let back = editor.back.read(cx).value().to_string();
+        let answer = editor.answer.read(cx).value().to_string();
+        let topics = editor.topics.read(cx).value().to_string();
+        let option_values: Vec<String> = editor
+            .option_inputs
+            .iter()
+            .map(|input| input.read(cx).value().to_string())
+            .collect();
+
+        editor.workbook.title = title;
+        editor.workbook.description = description;
+        editor.workbook.tags = tags
+            .split([',', '、'])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        let note_index = editor.note_index;
+        let question_index = editor.question_index;
+        let Some(note) = editor.workbook.notes.get_mut(note_index) else {
+            return;
+        };
+        note.title = note_title;
+        if let Err(error) = set_editor_content(&mut note.knowledge_card, &note_card) {
+            editor.error = Some(error);
+            return;
+        }
+        let Some(question) = note.questions.get_mut(question_index) else {
+            return;
+        };
+        // Required contents keep an empty Text so Domain validation can point
+        // at the exact field instead of silently accepting an absent value.
+        if question.kind == QuestionType::Flashcard {
+            question.prompt = None;
+            if let Err(error) = set_editor_optional_content(&mut question.front, &front, true) {
+                editor.error = Some(error);
+                return;
+            }
+            if let Err(error) = set_editor_optional_content(&mut question.back, &back, true) {
+                editor.error = Some(error);
+                return;
+            }
+        } else {
+            if let Err(error) = set_editor_optional_content(&mut question.prompt, &prompt, true) {
+                editor.error = Some(error);
+                return;
+            }
+            question.front = None;
+            question.back = None;
+        }
+        if let Err(error) = set_editor_optional_content(&mut question.hint, &hint, false) {
+            editor.error = Some(error);
+            return;
+        }
+        if let Err(error) = set_editor_content(&mut question.explanation, &explanation) {
+            editor.error = Some(error);
+            return;
+        }
+        if let Some(options) = question.options.as_mut() {
+            let count = options.len();
+            for (index, value) in option_values.iter().take(count).enumerate() {
+                if let Some(option) = options.get_mut(index)
+                    && let Err(error) = set_editor_content(&mut option.content, value)
+                {
+                    editor.error = Some(error);
+                    return;
+                }
+            }
+        }
+        question.topics = topics
+            .split([',', '、'])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if let Err(error) = set_editor_answer(question, &answer) {
+            editor.error = Some(error);
+            return;
+        }
+        editor.error = None;
+    }
+
+    pub(crate) fn select_editor_note(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.note_index = index;
+            editor.question_index = 0;
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn select_editor_question(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.question_index = index;
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_editor_kind(
+        &mut self,
+        kind: QuestionType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_editor_fields(cx);
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        let note_index = editor.note_index;
+        let question_index = editor.question_index;
+        let first_asset = editor.assets.first().map(|asset| asset.id.clone());
+        if let Some(question) = editor
+            .workbook
+            .notes
+            .get_mut(note_index)
+            .and_then(|note| note.questions.get_mut(question_index))
+        {
+            switch_editor_question_kind(question, kind, first_asset.as_deref());
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn add_editor_asset(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("画像", &["png", "jpg", "jpeg", "svg"])
+            .pick_file()
+        else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.notice_error(format!("画像を読み込めません: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let media_type = match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "svg" => "image/svg+xml",
+            _ => {
+                self.notice_error("PNG / JPEG / SVG のみ追加できます");
+                cx.notify();
+                return;
+            }
+        };
+        let (width, height) = match workbook_domain::inspect_image(&bytes, media_type, "assets") {
+            Ok(size) => size,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let id = format!("asset-{}", uuid::Uuid::new_v4().simple());
+        let alt = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("画像")
+            .to_string();
+        let data = workbook_domain::encode_base64(&bytes);
+        let fingerprint = workbook_service::asset_fingerprint(media_type, width, height, &bytes);
+        if let Some(editor) = self.editor.as_mut() {
+            editor.workbook.assets.push(workbook_domain::AssetRef {
+                id: id.clone(),
+                alt: alt.clone(),
+                media_type: media_type.to_string(),
+                file: None,
+                data: Some(data),
+            });
+            editor.assets.push(workbook_service::AssetView {
+                id,
+                media_type: media_type.to_string(),
+                alt,
+                width,
+                height,
+                fingerprint,
+                bytes: Arc::new(bytes),
+            });
+        }
+        self.notice_success("画像を追加しました。Content JSON の asset で参照できます");
+        cx.notify();
+    }
+
+    pub(crate) fn add_editor_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editor_fields(cx);
+        let workbook_id = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.workbook.id.clone())
+            .unwrap_or_default();
+        if let Some(editor) = self.editor.as_mut() {
+            let index = editor.workbook.notes.len();
+            let question = new_editor_question(
+                "single_choice",
+                &format!("{workbook_id}-q-{}", uuid::Uuid::new_v4().simple()),
+                editor.assets.first().map(|asset| asset.id.as_str()),
+            );
+            editor.workbook.notes.push(Note {
+                id: format!("note-{}", uuid::Uuid::new_v4().simple()),
+                title: format!("ノート{}", index + 1),
+                knowledge_card: Content::Text("この単元の知識カード".to_string()),
+                questions: vec![question],
+            });
+            editor.note_index = index;
+            editor.question_index = 0;
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn add_editor_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editor_fields(cx);
+        let workbook_id = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.workbook.id.clone())
+            .unwrap_or_default();
+        if let Some(editor) = self.editor.as_mut() {
+            let note_index = editor.note_index;
+            let first_asset = editor.assets.first().map(|asset| asset.id.clone());
+            if let Some(note) = editor.workbook.notes.get_mut(note_index) {
+                let index = note.questions.len();
+                note.questions.push(new_editor_question(
+                    "single_choice",
+                    &format!("{workbook_id}-q-{}", uuid::Uuid::new_v4().simple()),
+                    first_asset.as_deref(),
+                ));
+                editor.question_index = index;
+            }
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_editor_note(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_editor_fields(cx);
+        if let Some(editor) = self.editor.as_mut() {
+            if editor.workbook.notes.len() <= 1 || index >= editor.workbook.notes.len() {
+                editor.error = Some("Noteは1つ以上必要です".to_string());
+                cx.notify();
+                return;
+            }
+            editor.workbook.notes.remove(index);
+            editor.note_index = editor.note_index.min(editor.workbook.notes.len() - 1);
+            editor.question_index = 0;
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_editor_question(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_editor_fields(cx);
+        if let Some(editor) = self.editor.as_mut() {
+            let note_index = editor.note_index;
+            if let Some(note) = editor.workbook.notes.get_mut(note_index) {
+                if note.questions.len() <= 1 || index >= note.questions.len() {
+                    editor.error = Some("NoteにはQuestionが1つ以上必要です".to_string());
+                    cx.notify();
+                    return;
+                }
+                note.questions.remove(index);
+                editor.question_index = editor.question_index.min(note.questions.len() - 1);
+            }
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn add_editor_option(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editor_fields(cx);
+        if let Some(editor) = self.editor.as_mut() {
+            let note_index = editor.note_index;
+            let question_index = editor.question_index;
+            if let Some(question) = editor
+                .workbook
+                .notes
+                .get_mut(note_index)
+                .and_then(|note| note.questions.get_mut(question_index))
+            {
+                let options = question.options.get_or_insert_with(Vec::new);
+                if options.len() >= 6 {
+                    editor.error = Some("選択肢は6個までです".to_string());
+                } else {
+                    let id = option_id(options.len());
+                    options.push(ChoiceOption {
+                        id,
+                        content: Content::Text(format!("選択肢 {}", options.len() + 1)),
+                    });
+                    refresh_ordering_answer(question);
+                }
+            }
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_editor_option(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_editor_fields(cx);
+        if let Some(editor) = self.editor.as_mut() {
+            let note_index = editor.note_index;
+            let question_index = editor.question_index;
+            if let Some(question) = editor
+                .workbook
+                .notes
+                .get_mut(note_index)
+                .and_then(|note| note.questions.get_mut(question_index))
+            {
+                let current_single = question.single_choice_answer().map(ToOwned::to_owned);
+                if let Some(options) = question.options.as_mut() {
+                    if options.len() <= 2 {
+                        editor.error = Some("選択肢は2個以上必要です".to_string());
+                    } else {
+                        let removed = options.remove(index);
+                        if current_single.as_deref() == Some(removed.id.as_str()) {
+                            question.answer = options
+                                .first()
+                                .map(|option| serde_json::json!({"optionId": option.id}));
+                        }
+                        if let Some(values) = question
+                            .answer
+                            .as_mut()
+                            .and_then(|answer| answer.get_mut("optionIds"))
+                            .and_then(|value| value.as_array_mut())
+                        {
+                            values.retain(|value| value.as_str() != Some(removed.id.as_str()));
+                            if values.is_empty()
+                                && let Some(first) = options.first()
+                            {
+                                values.push(serde_json::Value::String(first.id.clone()));
+                            }
+                        }
+                        refresh_ordering_answer(question);
+                    }
+                }
+            }
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn move_editor_option(
+        &mut self,
+        index: usize,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_editor_fields(cx);
+        if let Some(editor) = self.editor.as_mut() {
+            let note_index = editor.note_index;
+            let question_index = editor.question_index;
+            if let Some(question) = editor
+                .workbook
+                .notes
+                .get_mut(note_index)
+                .and_then(|note| note.questions.get_mut(question_index))
+                && let Some(options) = question.options.as_mut()
+            {
+                let target = index as isize + delta;
+                if target >= 0 && (target as usize) < options.len() {
+                    options.swap(index, target as usize);
+                    refresh_ordering_answer(question);
+                }
+            }
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_editor_option_answer(
+        &mut self,
+        id: String,
+        multiple: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.editor.as_mut() {
+            let note_index = editor.note_index;
+            let question_index = editor.question_index;
+            if let Some(question) = editor
+                .workbook
+                .notes
+                .get_mut(note_index)
+                .and_then(|note| note.questions.get_mut(question_index))
+            {
+                if multiple {
+                    let mut values = question.multiple_choice_answers();
+                    if let Some(position) = values.iter().position(|value| value == &id) {
+                        if values.len() > 1 {
+                            values.remove(position);
+                        }
+                    } else {
+                        values.push(id);
+                    }
+                    question.answer = Some(serde_json::json!({"optionIds": values}));
+                } else {
+                    question.answer = Some(serde_json::json!({"optionId": id}));
+                }
+            }
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_editor_true_false(
+        &mut self,
+        value: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.editor.as_mut() {
+            let note_index = editor.note_index;
+            let question_index = editor.question_index;
+            if let Some(question) = editor
+                .workbook
+                .notes
+                .get_mut(note_index)
+                .and_then(|note| note.questions.get_mut(question_index))
+            {
+                question.answer = Some(serde_json::Value::Bool(value));
+            }
+        }
+        self.sync_editor_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn apply_editor_advanced(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editor_fields(cx);
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let raw = editor.advanced.read(cx).value().to_string();
+        let question: Question = match serde_json::from_str(&raw) {
+            Ok(question) => question,
+            Err(error) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.error = Some(format!("問題JSONが不正です: {error}"));
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let mut model = editor.workbook.clone();
+        let note_index = editor.note_index;
+        let question_index = editor.question_index;
+        if let Some(slot) = model
+            .notes
+            .get_mut(note_index)
+            .and_then(|note| note.questions.get_mut(question_index))
+        {
+            *slot = question;
+        }
+        match self.service.validate_workbook_model(&model) {
+            Ok(()) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.workbook = model;
+                    editor.error = None;
+                }
+                self.sync_editor_inputs(window, cx);
+                self.notice_success("問題JSONを適用しました");
+            }
+            Err(error) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.error = Some(error.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn validate_editor(&mut self, cx: &mut Context<Self>) {
+        self.apply_editor_fields(cx);
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let workbook = editor.workbook.clone();
+        let domain = self.service.validate_workbook_model(&workbook).err();
+        let issues = self.service.lint_workbook_json(&workbook.to_json());
+        if let Some(editor) = self.editor.as_mut() {
+            editor.error = domain.map(|error| error.to_string());
+            editor.issues = issues;
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.error.is_none())
+        {
+            self.notice_success("検証に成功しました");
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn save_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.apply_editor_fields(cx);
+        let Some(editor) = self.editor.as_ref() else {
+            return false;
+        };
+        let workbook = editor.workbook.clone();
+        let local_id = editor.local_id.clone();
+        if let Err(error) = self.service.validate_workbook_model(&workbook) {
+            if let Some(editor) = self.editor.as_mut() {
+                editor.error = Some(error.to_string());
+                editor.issues = Vec::new();
+            }
+            cx.notify();
+            return false;
+        }
+        let issues = self.service.lint_workbook_json(&workbook.to_json());
+        let blocking = issues.iter().any(WorkbookIssue::is_error);
+        if let Some(editor) = self.editor.as_mut() {
+            editor.issues = issues;
+        }
+        if blocking {
+            if let Some(editor) = self.editor.as_mut() {
+                editor.error =
+                    Some("Linterがエラーを検出しました。項目を修正してください".to_string());
+            }
+            cx.notify();
+            return false;
+        }
+        match self.service.save_workbook(local_id.as_deref(), &workbook) {
+            Ok(saved) => {
+                let changed = local_id.as_deref() != Some(saved.local_id.as_str());
+                let assets = self
+                    .service
+                    .workbook_assets(&saved.local_id)
+                    .unwrap_or_default();
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.local_id = Some(saved.local_id.clone());
+                    editor.workbook = saved.workbook;
+                    editor.assets = assets;
+                    editor.error = None;
+                }
+                self.selected_book = Some(saved.local_id.clone());
+                self.selected_workbook = self.service.workbook(&saved.local_id).ok();
+                if changed {
+                    self.clear_image_cache(cx);
+                } else {
+                    self.invalidate_workbook_images(&saved.local_id, cx);
+                }
+                self.refresh(cx);
+                self.notice_success("教材を保存しました");
+                self.sync_editor_inputs(window, cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.error = Some(error.to_string());
+                }
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    pub(crate) fn export_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.save_editor(window, cx) {
+            return;
+        }
+        let Some(local_id) = self
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.local_id.clone())
+        else {
+            return;
+        };
+        let raw = match self.service.export_workbook_json(&local_id) {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.notice_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let title = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.workbook.title.clone())
+            .unwrap_or_else(|| "workbook".to_string());
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{title}.workbook.json"))
+            .add_filter("Workbook JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, raw) {
+            Ok(()) => self.notice_success(format!("書き出しました: {}", path.display())),
+            Err(error) => self.notice_error(format!("書き出しに失敗しました: {error}")),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn copy_selected_workbook(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_book.clone() else {
+            return;
+        };
+        match self.service.copy_workbook(&id) {
+            Ok(copy) => {
+                self.selected_book = Some(copy);
+                self.selected_workbook = self
+                    .service
+                    .workbook(&self.selected_book.clone().unwrap())
+                    .ok();
+                self.refresh(cx);
+                self.notice_success("教材をコピーしました");
+            }
+            Err(error) => self.notice_error(error.to_string()),
+        }
+        cx.notify();
     }
 
     pub(crate) fn open_book(&mut self, id: String, cx: &mut Context<Self>) {
@@ -2556,10 +3482,26 @@ impl WorkbookApp {
         };
         match self.service.preview_workbook_file(&path) {
             Ok(workbook) => {
+                let issues = std::fs::read_to_string(&path)
+                    .map(|raw| {
+                        self.service
+                            .lint_workbook_json(&raw)
+                            .into_iter()
+                            .filter(|issue| issue.severity != "info")
+                            .map(|issue| {
+                                format!(
+                                    "{} {} · {}: {}",
+                                    issue.severity, issue.code, issue.path, issue.message
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 self.modal = Some(Modal::ImportJson {
                     workbook,
                     path: path.clone(),
                     source: path.display().to_string(),
+                    issues,
                 });
             }
             Err(error) => self.notice_error(error.to_string()),
@@ -2857,6 +3799,361 @@ impl Render for WorkbookApp {
         }
         root
     }
+}
+
+fn new_editor_workbook() -> Workbook {
+    let workbook_id = uuid::Uuid::new_v4().to_string();
+    Workbook {
+        format: "workbook".to_string(),
+        schema_version: 2,
+        id: workbook_id.clone(),
+        revision: 1,
+        title: "新しい教材".to_string(),
+        description: String::new(),
+        language: "ja".to_string(),
+        tags: Vec::new(),
+        assets: Vec::new(),
+        notes: vec![Note {
+            id: format!("note-{}", uuid::Uuid::new_v4().simple()),
+            title: "ノート1".to_string(),
+            knowledge_card: Content::Text("この単元で説明する内容".to_string()),
+            questions: vec![new_editor_question(
+                "single_choice",
+                &format!("{workbook_id}-q-{}", uuid::Uuid::new_v4().simple()),
+                None,
+            )],
+        }],
+    }
+}
+
+fn new_editor_question(kind: &str, id: &str, _first_asset: Option<&str>) -> Question {
+    let kind = kind
+        .parse::<QuestionType>()
+        .unwrap_or(QuestionType::SingleChoice);
+    Question {
+        id: id.to_string(),
+        revision: 1,
+        kind,
+        prompt: Some(Content::Text("問題文".to_string())),
+        hint: None,
+        explanation: Content::Text("解説".to_string()),
+        options: None,
+        answer: None,
+        front: None,
+        back: None,
+        initial_order: None,
+        matching: None,
+        hotspot: None,
+        labeling: None,
+        topics: Vec::new(),
+    }
+}
+
+fn option_content(index: usize) -> Content {
+    Content::Text(format!("選択肢 {}", index + 1))
+}
+
+fn option_id(index: usize) -> String {
+    ["a", "b", "c", "d", "e", "f"]
+        .get(index)
+        .map(|value| (*value).to_string())
+        .unwrap_or_else(|| format!("o{index}"))
+}
+
+fn switch_editor_question_kind(question: &mut Question, kind: QuestionType, asset: Option<&str>) {
+    let prompt = question.prompt.clone();
+    let hint = question.hint.clone();
+    let explanation = question.explanation.clone();
+    let topics = question.topics.clone();
+    let front = question.front.clone();
+    let back = question.back.clone();
+    question.kind = kind;
+    question.options = None;
+    question.answer = None;
+    question.initial_order = None;
+    question.matching = None;
+    question.hotspot = None;
+    question.labeling = None;
+    question.front = None;
+    question.back = None;
+    if prompt.is_some() {
+        question.prompt = prompt;
+    }
+    question.hint = hint;
+    question.explanation = explanation;
+    question.topics = topics;
+    if kind != QuestionType::Flashcard && question.prompt.is_none() {
+        question.prompt = Some(Content::Text("問題文".to_string()));
+    }
+    match kind {
+        QuestionType::SingleChoice => {
+            let options: Vec<ChoiceOption> = (0..2)
+                .map(|index| ChoiceOption {
+                    id: option_id(index),
+                    content: option_content(index),
+                })
+                .collect();
+            question.answer = Some(serde_json::json!({"optionId": options[0].id.clone()}));
+            question.options = Some(options);
+        }
+        QuestionType::TrueFalse => {
+            question.answer = Some(serde_json::Value::Bool(true));
+            question.prompt = question
+                .prompt
+                .clone()
+                .or_else(|| Some(Content::Text("正しいか、まちがいか".to_string())));
+        }
+        QuestionType::MultipleChoice => {
+            let options: Vec<ChoiceOption> = (0..2)
+                .map(|index| ChoiceOption {
+                    id: option_id(index),
+                    content: option_content(index),
+                })
+                .collect();
+            question.answer = Some(serde_json::json!({"optionIds": [options[0].id.clone()]}));
+            question.options = Some(options);
+        }
+        QuestionType::ShortText => {
+            question.answer = Some(serde_json::json!({"accepted": ["正解"]}));
+        }
+        QuestionType::Cloze => {
+            question.prompt = Some(Content::Text("空欄は {{blank:1}} です".to_string()));
+            question.answer = Some(serde_json::json!({"blanks": {"1": ["正解"]}}));
+        }
+        QuestionType::Flashcard => {
+            question.front = front.or_else(|| Some(Content::Text("表面".to_string())));
+            question.back = back.or_else(|| Some(Content::Text("裏面".to_string())));
+            question.prompt = None;
+        }
+        QuestionType::Numeric => {
+            question.answer = Some(serde_json::json!({"value": 0}));
+        }
+        QuestionType::Ordering => {
+            let options: Vec<ChoiceOption> = (0..3)
+                .map(|index| ChoiceOption {
+                    id: option_id(index),
+                    content: option_content(index),
+                })
+                .collect();
+            question.answer = Some(serde_json::json!({
+                "orders": [options.iter().map(|option| option.id.clone()).collect::<Vec<_>>()]
+            }));
+            question.options = Some(options);
+        }
+        QuestionType::Matching => {
+            question.matching = Some(
+                serde_json::from_value(serde_json::json!({
+                    "left": [
+                        {"id":"l1","content":"左1"},
+                        {"id":"l2","content":"左2"}
+                    ],
+                    "right": [
+                        {"id":"r1","content":"右1"},
+                        {"id":"r2","content":"右2"}
+                    ]
+                }))
+                .expect("matching template"),
+            );
+            question.answer = Some(serde_json::json!({
+                "pairs": [{"left":"l1","right":"r1"},{"left":"l2","right":"r2"}],
+                "alternatives": []
+            }));
+        }
+        QuestionType::Hotspot => {
+            let asset = asset.unwrap_or("").to_string();
+            question.hotspot = Some(
+                serde_json::from_value(serde_json::json!({
+                    "asset": asset,
+                    "regions": [
+                        {"id":"r1","alt":"領域1","shape":{"type":"rect","x":0.1,"y":0.1,"w":0.3,"h":0.3}},
+                        {"id":"r2","alt":"領域2","shape":{"type":"rect","x":0.5,"y":0.5,"w":0.2,"h":0.2}}
+                    ]
+                }))
+                .expect("hotspot template"),
+            );
+            question.answer = Some(serde_json::json!({"regionIds": ["r1"]}));
+        }
+        QuestionType::Labeling => {
+            let asset = asset.unwrap_or("").to_string();
+            question.labeling = Some(
+                serde_json::from_value(serde_json::json!({
+                    "asset": asset,
+                    "targets": [
+                        {"id":"t1","x":0.25,"y":0.25,"alt":"配置先1"},
+                        {"id":"t2","x":0.75,"y":0.75,"alt":"配置先2"}
+                    ],
+                    "labels": [
+                        {"id":"lab1","content":"ラベル1"},
+                        {"id":"lab2","content":"ラベル2"}
+                    ]
+                }))
+                .expect("labeling template"),
+            );
+            question.answer = Some(serde_json::json!({
+                "pairs": {"t1":"lab1","t2":"lab2"},
+                "alternatives": []
+            }));
+        }
+    }
+}
+
+fn content_editor_text(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    }
+}
+
+fn parse_editor_content(raw: &str) -> std::result::Result<Content, String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str::<Content>(trimmed)
+            .map_err(|error| format!("ContentのJSONが不正です: {error}"))
+    } else {
+        Ok(Content::Text(raw.to_string()))
+    }
+}
+
+fn set_editor_content(slot: &mut Content, raw: &str) -> std::result::Result<(), String> {
+    let content = parse_editor_content(raw)?;
+    *slot = content;
+    Ok(())
+}
+
+fn set_editor_optional_content(
+    slot: &mut Option<Content>,
+    raw: &str,
+    required: bool,
+) -> std::result::Result<(), String> {
+    if raw.trim().is_empty() {
+        if required {
+            *slot = Some(Content::Text(String::new()));
+        } else {
+            *slot = None;
+        }
+        return Ok(());
+    }
+    *slot = Some(parse_editor_content(raw)?);
+    Ok(())
+}
+
+fn editor_answer_text(question: &Question) -> String {
+    match question.kind {
+        QuestionType::ShortText => question.short_text_answers().join(" | "),
+        QuestionType::Cloze => question
+            .cloze_blanks()
+            .into_iter()
+            .map(|(id, values)| format!("{id}: {}", values.join(" | ")))
+            .collect::<Vec<_>>()
+            .join("; "),
+        QuestionType::Numeric => match question.numeric_spec() {
+            Some(spec) => {
+                let value = match &spec.value {
+                    workbook_domain::NumericLiteral::Number(value) => {
+                        if (value - value.round()).abs() < 1e-9 {
+                            format!("{}", value.round() as i64)
+                        } else {
+                            value.to_string()
+                        }
+                    }
+                    workbook_domain::NumericLiteral::Fraction(text) => text.clone(),
+                };
+                let unit = spec.unit.unwrap_or_default();
+                let sig = spec
+                    .significant_figures
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                format!("{value}|{unit}|{sig}")
+            }
+            None => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn set_editor_answer(question: &mut Question, raw: &str) -> std::result::Result<(), String> {
+    match question.kind {
+        QuestionType::ShortText => {
+            let accepted: Vec<String> = raw
+                .split('|')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            question.answer = Some(serde_json::json!({"accepted": accepted}));
+        }
+        QuestionType::Cloze => {
+            let mut blanks = serde_json::Map::new();
+            for part in raw
+                .split(';')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let Some((id, values)) = part.split_once(':') else {
+                    return Err(
+                        "穴埋めの正解は「1: 答え | 別解」の形式で入力してください".to_string()
+                    );
+                };
+                let values: Vec<String> = values
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                blanks.insert(
+                    id.trim().to_string(),
+                    serde_json::Value::Array(
+                        values.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+            question.answer = Some(serde_json::json!({"blanks": blanks}));
+        }
+        QuestionType::Numeric => {
+            let parts: Vec<&str> = raw.split('|').map(str::trim).collect();
+            let value_text = parts.first().copied().unwrap_or("");
+            if value_text.is_empty() {
+                question.answer = Some(serde_json::json!({"value": 0}));
+                return Ok(());
+            }
+            let value = if let Ok(number) = value_text.parse::<f64>() {
+                serde_json::Value::from(number)
+            } else {
+                serde_json::Value::String(value_text.to_string())
+            };
+            let unit = parts.get(1).copied().unwrap_or("");
+            let sig = parts.get(2).copied().unwrap_or("");
+            let mut spec = serde_json::Map::new();
+            spec.insert("value".to_string(), value);
+            if !unit.is_empty() {
+                spec.insert(
+                    "unit".to_string(),
+                    serde_json::Value::String(unit.to_string()),
+                );
+            }
+            if let Ok(sig) = sig.parse::<u32>() {
+                spec.insert(
+                    "significantFigures".to_string(),
+                    serde_json::Value::from(sig),
+                );
+            }
+            question.answer = Some(serde_json::Value::Object(spec));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn refresh_ordering_answer(question: &mut Question) {
+    if question.kind != QuestionType::Ordering {
+        return;
+    }
+    let ids: Vec<String> = question
+        .options
+        .as_ref()
+        .map(|options| options.iter().map(|option| option.id.clone()).collect())
+        .unwrap_or_default();
+    question.answer = Some(serde_json::json!({"orders": [ids]}));
 }
 
 fn parse_optional_u32(value: &str) -> std::result::Result<Option<u32>, ()> {

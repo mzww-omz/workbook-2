@@ -5,12 +5,13 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use thiserror::Error;
 use workbook_domain::{
-    Answer, AssistState, CardState, Content, Exam, ExamCatalogQuestion, ExamDraft, ExamScope, Goal,
-    GoalDraft, GoalSource, GradeResult, GradeStatus, MockOptions, Mode, NearMissReason,
-    NearMissRecord, Phase, PracticeOptions, PracticeStrategy, Question, QuestionType, Rating,
-    RatingSource, SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting,
-    Workbook, answer_is_blank, automatic_rating, expand_topic_ids, grade_answer_detailed,
-    parse_workbook, resolve_scope,
+    Answer, AssetContent, AssetRef, AssistState, CardState, Content, Exam, ExamCatalogQuestion,
+    ExamDraft, ExamScope, Goal, GoalDraft, GoalSource, GradeResult, GradeStatus,
+    MAX_TOTAL_ASSET_BYTES, MockOptions, Mode, NearMissReason, NearMissRecord, Phase,
+    PracticeOptions, PracticeStrategy, Question, QuestionType, Rating, RatingSource,
+    SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
+    answer_is_blank, automatic_rating, encode_base64, expand_topic_ids, grade_answer_detailed,
+    inspect_image, parse_workbook, resolve_scope,
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{
@@ -168,7 +169,7 @@ pub struct AssetView {
 /// Stable, allocation-free fingerprint of an embedded asset. FNV-1a is enough
 /// for cache identity: a collision would only mean reusing an image whose
 /// bytes and metadata are already effectively identical.
-fn asset_fingerprint(media_type: &str, width: u32, height: u32, bytes: &[u8]) -> u64 {
+pub fn asset_fingerprint(media_type: &str, width: u32, height: u32, bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -424,6 +425,27 @@ pub struct GoalTopicStat {
 }
 
 #[derive(Clone, Debug)]
+pub struct SavedWorkbook {
+    pub local_id: String,
+    pub workbook: Workbook,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkbookIssue {
+    pub code: String,
+    pub severity: String,
+    pub path: String,
+    pub message: String,
+    pub suggestion: Option<String>,
+}
+
+impl WorkbookIssue {
+    pub fn is_error(&self) -> bool {
+        self.severity == "error"
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct GoalSummary {
     pub goal: Goal,
     pub source: GoalSource,
@@ -673,6 +695,146 @@ impl WorkbookService {
         self.write_action_backup(&storage, "pre-delete")?;
         storage.delete_workbook(local_id)?;
         Ok(())
+    }
+
+    // ---- authoring ------------------------------------------------------
+
+    /// Saves a manually authored workbook. Existing workbooks keep their
+    /// `local_id` and every unchanged Note/Question ID, so FSRS states and
+    /// attempts survive asset, text, and topic edits. A safety backup is made
+    /// before replacing an existing workbook.
+    pub fn save_workbook(
+        &self,
+        local_id: Option<&str>,
+        workbook: &Workbook,
+    ) -> Result<SavedWorkbook> {
+        workbook.validate()?;
+        let mut storage = self.storage()?;
+        let mut workbook = workbook.clone();
+        let assets = resolve_assets_for_save(&storage, local_id, &workbook)?;
+        let now = self.clock.now();
+        if let Some(local_id) = local_id {
+            if storage.has_active_session_for_workbook(local_id)? {
+                return Err(ServiceError::Conflict(
+                    "この教材の学習中は編集できません。先にSessionを終了してください".to_string(),
+                ));
+            }
+            let stored = storage.workbook(local_id)?;
+            workbook.revision = stored.revision.saturating_add(1).max(workbook.revision);
+            self.write_action_backup(&storage, "pre-edit")?;
+            storage.update_workbook_content(local_id, &workbook, &assets, now)?;
+            Ok(SavedWorkbook {
+                local_id: local_id.to_string(),
+                workbook,
+            })
+        } else {
+            let new_id = storage.import_workbook(&workbook, &assets, now)?;
+            Ok(SavedWorkbook {
+                local_id: new_id,
+                workbook,
+            })
+        }
+    }
+
+    /// Creates an independent copy. Question IDs inside the copy are unchanged,
+    /// but the new local workbook ID means FSRS state and attempts are separate.
+    pub fn copy_workbook(&self, local_id: &str) -> Result<String> {
+        let mut storage = self.storage()?;
+        let mut workbook = storage.workbook(local_id)?;
+        let assets = storage.assets_for_workbook(local_id)?;
+        workbook.title = format!("{}（コピー）", workbook.title);
+        workbook.revision = 1;
+        let now = self.clock.now();
+        Ok(storage.import_workbook(&workbook, &assets, now)?)
+    }
+
+    /// Exports a portable workbook JSON: topic paths are restored and every
+    /// image asset is embedded as base64, so the file does not depend on this
+    /// machine's asset paths.
+    pub fn export_workbook_json(&self, local_id: &str) -> Result<String> {
+        let storage = self.storage()?;
+        let mut workbook = storage.workbook(local_id)?;
+        let topics = storage.topics()?;
+        let mut assignments: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for (workbook_id, question_id, topic_id) in storage.question_topics()? {
+            if workbook_id != local_id {
+                continue;
+            }
+            if let Some(path) = workbook_domain::topic_path(&topics, &topic_id) {
+                assignments
+                    .entry((workbook_id, question_id))
+                    .or_default()
+                    .push(path.join("/"));
+            }
+        }
+        for note in &mut workbook.notes {
+            for question in &mut note.questions {
+                question.topics = assignments
+                    .get(&(local_id.to_string(), question.id.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                question.topics.sort();
+                question.topics.dedup();
+            }
+        }
+        let stored_assets = storage.assets_for_workbook(local_id)?;
+        workbook.assets = stored_assets
+            .into_iter()
+            .map(|asset| AssetRef {
+                id: asset.id,
+                alt: asset.alt,
+                media_type: asset.media_type,
+                file: None,
+                data: Some(encode_base64(&asset.bytes)),
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&workbook)?)
+    }
+
+    pub fn workbook_assets(&self, local_id: &str) -> Result<Vec<AssetView>> {
+        let storage = self.storage()?;
+        Ok(storage
+            .assets_for_workbook(local_id)?
+            .into_iter()
+            .map(|asset| {
+                let fingerprint =
+                    asset_fingerprint(&asset.media_type, asset.width, asset.height, &asset.bytes);
+                AssetView {
+                    id: asset.id,
+                    media_type: asset.media_type,
+                    alt: asset.alt,
+                    width: asset.width,
+                    height: asset.height,
+                    fingerprint,
+                    bytes: Arc::new(asset.bytes),
+                }
+            })
+            .collect())
+    }
+
+    pub fn validate_workbook_model(&self, workbook: &Workbook) -> Result<()> {
+        workbook.validate()?;
+        Ok(())
+    }
+
+    pub fn lint_workbook_json(&self, raw: &str) -> Vec<WorkbookIssue> {
+        let report = workbook_lint::lint_raw(raw, "workbook.json", None);
+        report
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| WorkbookIssue {
+                code: diagnostic.code.to_string(),
+                severity: match diagnostic.severity {
+                    workbook_lint::Severity::Error => "error",
+                    workbook_lint::Severity::Warning => "warning",
+                    workbook_lint::Severity::Info => "info",
+                }
+                .to_string(),
+                path: diagnostic.path,
+                message: diagnostic.message,
+                suggestion: diagnostic.suggestion,
+            })
+            .collect()
     }
 
     // ---- topics and scope -----------------------------------------------
@@ -3803,6 +3965,56 @@ fn shuffle_candidates(candidates: &mut [SessionCandidate], seed: u64) {
         let swap = (state % (index as u64 + 1)) as usize;
         candidates.swap(index, swap);
     }
+}
+
+fn resolve_assets_for_save(
+    storage: &Storage,
+    local_id: Option<&str>,
+    workbook: &Workbook,
+) -> Result<Vec<AssetContent>> {
+    let mut output = Vec::new();
+    let mut total_bytes = 0usize;
+    for asset in &workbook.assets {
+        let (bytes, width, height) = if let Some(bytes) = asset.embedded_bytes()? {
+            let (width, height) =
+                inspect_image(&bytes, &asset.media_type, &format!("assets.{}", asset.id))?;
+            (bytes, width, height)
+        } else if let Some(local_id) = local_id {
+            let stored = storage.asset(local_id, &asset.id)?.ok_or_else(|| {
+                ServiceError::Invalid(format!(
+                    "assets.{}: 既存の画像を読み込めません。画像を再指定してください",
+                    asset.id
+                ))
+            })?;
+            if stored.media_type != asset.media_type {
+                return Err(ServiceError::Invalid(format!(
+                    "assets.{}.mediaType: 既存画像の形式と一致しません",
+                    asset.id
+                )));
+            }
+            (stored.bytes, stored.width, stored.height)
+        } else {
+            return Err(ServiceError::Invalid(format!(
+                "assets.{}: file 参照の画像は教材ファイルからインポートしてください",
+                asset.id
+            )));
+        };
+        total_bytes += bytes.len();
+        if total_bytes > MAX_TOTAL_ASSET_BYTES {
+            return Err(ServiceError::Invalid(
+                "画像アセットの合計サイズが上限を超えています".to_string(),
+            ));
+        }
+        output.push(AssetContent {
+            id: asset.id.clone(),
+            alt: asset.alt.clone(),
+            media_type: asset.media_type.clone(),
+            width,
+            height,
+            bytes,
+        });
+    }
+    Ok(output)
 }
 
 struct BudgetEstimates {

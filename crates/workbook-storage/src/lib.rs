@@ -513,6 +513,169 @@ impl Storage {
         Ok(())
     }
 
+    /// Replaces an existing workbook's content in place. `local_id` and all
+    /// unchanged Note/Question IDs are preserved, so FSRS states, attempts, and
+    /// session history keep pointing at the same identity. Removed questions
+    /// and notes lose their review states through foreign-key cascade; attempt
+    /// history remains.
+    pub fn update_workbook_content(
+        &mut self,
+        local_id: &str,
+        workbook: &Workbook,
+        assets: &[AssetContent],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        workbook.validate()?;
+        let connection = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| StorageError::Conflict("データベースが閉じています".to_string()))?;
+        let transaction = connection.transaction()?;
+        let exists: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM workbooks WHERE local_id=?1",
+            [local_id],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Err(StorageError::NotFound(format!("Workbook {local_id}")));
+        }
+        transaction.execute(
+            "UPDATE workbooks SET source_id=?2,source_revision=?3,title=?4,content_json=?5
+             WHERE local_id=?1",
+            params![
+                local_id,
+                workbook.id,
+                workbook.revision,
+                workbook.title,
+                workbook.to_json()
+            ],
+        )?;
+
+        let new_notes: BTreeSet<&str> =
+            workbook.notes.iter().map(|note| note.id.as_str()).collect();
+        let mut existing_notes = Vec::new();
+        {
+            let mut statement =
+                transaction.prepare("SELECT note_id FROM notes WHERE workbook_id=?1")?;
+            let rows = statement.query_map([local_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                existing_notes.push(row?);
+            }
+        }
+        for note_id in existing_notes {
+            if !new_notes.contains(note_id.as_str()) {
+                transaction.execute(
+                    "DELETE FROM notes WHERE workbook_id=?1 AND note_id=?2",
+                    params![local_id, note_id],
+                )?;
+            }
+        }
+
+        let new_questions: BTreeSet<&str> = workbook
+            .all_questions()
+            .map(|(_, question)| question.id.as_str())
+            .collect();
+        let mut existing_questions = Vec::new();
+        {
+            let mut statement =
+                transaction.prepare("SELECT question_id FROM questions WHERE workbook_id=?1")?;
+            let rows = statement.query_map([local_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                existing_questions.push(row?);
+            }
+        }
+        for question_id in existing_questions {
+            if !new_questions.contains(question_id.as_str()) {
+                transaction.execute(
+                    "DELETE FROM questions WHERE workbook_id=?1 AND question_id=?2",
+                    params![local_id, question_id],
+                )?;
+            }
+        }
+
+        for note in &workbook.notes {
+            transaction.execute(
+                "INSERT INTO notes(workbook_id,note_id,introduced,introduced_at)
+                 VALUES(?1,?2,0,NULL)
+                 ON CONFLICT(workbook_id,note_id) DO NOTHING",
+                params![local_id, note.id],
+            )?;
+            for question in &note.questions {
+                transaction.execute(
+                    "INSERT INTO questions(workbook_id,question_id,note_id,buried_until)
+                     VALUES(?1,?2,?3,NULL)
+                     ON CONFLICT(workbook_id,question_id) DO UPDATE SET note_id=excluded.note_id",
+                    params![local_id, question.id, note.id],
+                )?;
+            }
+        }
+
+        transaction.execute("DELETE FROM assets WHERE workbook_id=?1", [local_id])?;
+        for asset in assets {
+            transaction.execute(
+                "INSERT INTO assets(workbook_id,asset_id,media_type,alt,width,height,bytes)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    local_id,
+                    asset.id,
+                    asset.media_type,
+                    asset.alt,
+                    asset.width,
+                    asset.height,
+                    asset.bytes
+                ],
+            )?;
+        }
+
+        transaction.execute(
+            "DELETE FROM question_topics WHERE workbook_id=?1",
+            [local_id],
+        )?;
+        for note in &workbook.notes {
+            for question in &note.questions {
+                for path in &question.topics {
+                    let mut parent: Option<String> = None;
+                    for name in parse_topic_path(path)? {
+                        let topic_id = ensure_topic(&transaction, &name, parent.as_deref(), now)?;
+                        parent = Some(topic_id);
+                    }
+                    if let Some(topic_id) = parent {
+                        transaction.execute(
+                            "INSERT OR IGNORE INTO question_topics(workbook_id,question_id,topic_id)
+                             VALUES(?1,?2,?3)",
+                            params![local_id, question.id, topic_id],
+                        )?;
+                    }
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn assets_for_workbook(&self, workbook_id: &str) -> Result<Vec<AssetContent>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT asset_id,media_type,alt,width,height,bytes
+             FROM assets WHERE workbook_id=?1 ORDER BY asset_id",
+        )?;
+        let rows = statement.query_map([workbook_id], |row| {
+            Ok(AssetContent {
+                id: row.get(0)?,
+                media_type: row.get(1)?,
+                alt: row.get(2)?,
+                width: row.get::<_, i64>(3)? as u32,
+                height: row.get::<_, i64>(4)? as u32,
+                bytes: row.get(5)?,
+            })
+        })?;
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row?);
+        }
+        Ok(output)
+    }
+
     pub fn asset(&self, workbook_id: &str, asset_id: &str) -> Result<Option<AssetData>> {
         let row = self
             .connection()?
@@ -545,6 +708,23 @@ impl Storage {
             output.push(row?);
         }
         Ok(output)
+    }
+
+    /// An active session pins workbook content. Editing that workbook while a
+    /// session is running could delete a question the session is about to show,
+    /// so authoring refuses until the session ends.
+    pub fn has_active_session_for_workbook(&self, local_id: &str) -> Result<bool> {
+        let active: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT s.id FROM sessions s
+                 JOIN session_items i ON i.session_id=s.id
+                 WHERE s.status='active' AND i.workbook_id=?1 LIMIT 1",
+                [local_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(active.is_some())
     }
 
     pub fn delete_workbook(&mut self, local_id: &str) -> Result<()> {
