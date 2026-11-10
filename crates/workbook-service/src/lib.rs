@@ -13,13 +13,14 @@ use workbook_domain::{
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{
-    Clock, ExamPlan, PlanCard, PlanInput, PlanQuestion, QueueChoice, QueueInput, QueueKind,
-    Scheduler, SchedulerSettings, estimated_seconds, exam_deadline, plan_exam, select_next,
+    BudgetCategory, BudgetQuestion, Clock, ExamPlan, PlanCard, PlanInput, PlanQuestion,
+    QueueChoice, QueueInput, QueueKind, Scheduler, SchedulerSettings, estimated_seconds,
+    exam_deadline, plan_exam, select_next, select_within_budget,
 };
 use workbook_storage::{
-    AttemptRow, CommitWrite, CorrectionWrite, ExamPracticeStats, MockAnswerRow, MockResultRow,
-    SessionBundle, SessionCandidate, SessionCounts, SessionItemRow, SessionRow, SessionWorkbookRow,
-    Storage, StorageError, counts_for_workbook,
+    AttemptRow, BudgetPool, CommitWrite, CorrectionWrite, ExamPracticeStats, MockAnswerRow,
+    MockResultRow, SessionBundle, SessionCandidate, SessionCounts, SessionItemRow, SessionRow,
+    SessionWorkbookRow, Storage, StorageError, counts_for_workbook,
 };
 
 #[derive(Debug, Error)]
@@ -104,6 +105,17 @@ pub struct StudyProgress {
     pub total: usize,
     pub answered: usize,
     pub skipped: usize,
+}
+
+/// A time budget is a target, not a countdown. `reached` only tells the UI
+/// that the selected amount of study is done; the current question is never
+/// discarded and nothing is force-submitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionBudgetView {
+    pub target_seconds: u32,
+    pub used_ms: i64,
+    pub remaining_ms: i64,
+    pub reached: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +231,7 @@ pub struct StudyView {
     pub overall_result: Option<OverallResultView>,
     pub exam_id: Option<String>,
     pub exam_title: Option<String>,
+    pub budget: Option<SessionBudgetView>,
     pub mock: Option<MockSessionView>,
     pub mock_result: Option<MockResultView>,
 }
@@ -822,6 +835,7 @@ impl WorkbookService {
             now,
             Some(exam_id.to_string()),
             time_limit_seconds,
+            None,
         )?;
         let first_item = bundle
             .items
@@ -980,6 +994,26 @@ impl WorkbookService {
     // ---- study session --------------------------------------------------
 
     pub fn start_session(&self, mode: Mode, workbook_id: Option<&str>) -> Result<()> {
+        self.start_session_with_budget(mode, workbook_id, None)
+    }
+
+    /// Starts a session whose item list is chosen to fit `budget_seconds`.
+    ///
+    /// The budget is a selection target only. FSRS `due_at` values are read
+    /// and never rewritten; unselected questions stay due. The returned
+    /// session exposes its target so Study can show progress, but it never
+    /// force-finishes an answer.
+    pub fn start_session_with_budget(
+        &self,
+        mode: Mode,
+        workbook_id: Option<&str>,
+        budget_seconds: Option<u32>,
+    ) -> Result<()> {
+        if budget_seconds == Some(0) {
+            return Err(ServiceError::Invalid(
+                "学習時間は1分以上を指定してください".to_string(),
+            ));
+        }
         let mut storage = self.storage()?;
         if storage.active_session()?.is_some() {
             return Err(ServiceError::Conflict(
@@ -990,31 +1024,113 @@ impl WorkbookService {
         let calendar =
             StudyCalendar::new(&settings.effective_timezone()).map_err(ServiceError::Invalid)?;
         let now = self.clock.now();
-        let candidates = match mode {
+        let introduced = storage.new_questions_introduced_today(&calendar, now)?;
+        let new_remaining = (settings.new_limit as usize).saturating_sub(introduced);
+        let estimates = if budget_seconds.is_some() {
+            Some(BudgetEstimates::load(&storage)?)
+        } else {
+            None
+        };
+        let mut effective_mode = mode;
+        let mut candidates = match mode {
             Mode::New => {
                 let workbook_id = workbook_id
                     .ok_or_else(|| ServiceError::Invalid("Workbookを選んでください".to_string()))?;
-                let introduced = storage.new_questions_introduced_today(&calendar, now)?;
-                let remaining = (settings.new_limit as usize).saturating_sub(introduced);
-                if remaining == 0 {
+                if new_remaining == 0 {
                     return Err(ServiceError::Invalid(
                         "本日の新規問題の上限に達しました".to_string(),
                     ));
                 }
-                storage.new_candidates(workbook_id, remaining)?
+                storage.new_candidates(workbook_id, new_remaining)?
             }
             Mode::Review => {
-                let due = storage.review_candidates(workbook_id, now)?;
-                if due.is_empty() {
-                    storage.upcoming_short_term(workbook_id, now, now + Duration::minutes(20))?
+                if budget_seconds.is_some() {
+                    // A time-budgeted review deliberately mixes due reviews
+                    // with new content up to the daily limit, matching the
+                    // Today priority: short-term, review, then new.
+                    let budget_candidates =
+                        storage.budget_candidates(workbook_id, now, new_remaining)?;
+                    let has_normal = budget_candidates
+                        .iter()
+                        .any(|candidate| candidate.pool != BudgetPool::LearnAhead);
+                    let mut questions = Vec::new();
+                    for candidate in budget_candidates {
+                        if candidate.pool == BudgetPool::LearnAhead
+                            && (has_normal
+                                || !candidate
+                                    .due_at
+                                    .is_some_and(|due| calendar.learn_ahead_allowed(now, due)))
+                        {
+                            continue;
+                        }
+                        questions.push(budget_question(
+                            estimates.as_ref().expect("budget estimates exist"),
+                            candidate.workbook_id,
+                            candidate.note_id,
+                            candidate.question_id,
+                            candidate.pool,
+                            candidate.due_at,
+                            questions.len() as u32,
+                        ));
+                    }
+                    let selection = select_within_budget(&questions, budget_seconds.unwrap_or(0));
+                    if !selection.is_empty() {
+                        effective_mode = if selection
+                            .selected
+                            .iter()
+                            .any(|question| question.category == BudgetCategory::New)
+                        {
+                            Mode::Plan
+                        } else {
+                            Mode::Review
+                        };
+                    }
+                    selection
+                        .selected
+                        .into_iter()
+                        .map(session_candidate)
+                        .collect()
                 } else {
-                    due
+                    let due = storage.review_candidates(workbook_id, now)?;
+                    if due.is_empty() {
+                        storage.upcoming_short_term(
+                            workbook_id,
+                            now,
+                            now + Duration::minutes(20),
+                        )?
+                    } else {
+                        due
+                    }
                 }
             }
             Mode::Practice => {
                 let workbook_id = workbook_id
                     .ok_or_else(|| ServiceError::Invalid("Workbookを選んでください".to_string()))?;
-                storage.practice_candidates(workbook_id)?
+                let candidates = storage.practice_candidates(workbook_id)?;
+                if budget_seconds.is_some() {
+                    let questions: Vec<BudgetQuestion> = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(index, candidate)| {
+                            budget_question(
+                                estimates.as_ref().expect("budget estimates exist"),
+                                candidate.workbook_id.clone(),
+                                candidate.note_id.clone(),
+                                candidate.question_id.clone(),
+                                BudgetPool::DueReview,
+                                candidate.due_at,
+                                index as u32,
+                            )
+                        })
+                        .collect();
+                    select_within_budget(&questions, budget_seconds.unwrap_or(0))
+                        .selected
+                        .into_iter()
+                        .map(session_candidate)
+                        .collect()
+                } else {
+                    candidates
+                }
             }
             Mode::Plan => {
                 return Err(ServiceError::Invalid(
@@ -1027,13 +1143,36 @@ impl WorkbookService {
                 ));
             }
         };
+        if budget_seconds.is_some() && mode == Mode::New {
+            let questions: Vec<BudgetQuestion> = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    budget_question(
+                        estimates.as_ref().expect("budget estimates exist"),
+                        candidate.workbook_id.clone(),
+                        candidate.note_id.clone(),
+                        candidate.question_id.clone(),
+                        BudgetPool::New,
+                        candidate.due_at,
+                        index as u32,
+                    )
+                })
+                .collect();
+            candidates = select_within_budget(&questions, budget_seconds.unwrap_or(0))
+                .selected
+                .into_iter()
+                .map(session_candidate)
+                .collect();
+        }
         if candidates.is_empty() {
             return Err(ServiceError::Invalid(
                 "対象の問題はありません（関連問題は翌学習日まで延期される場合があります）"
                     .to_string(),
             ));
         }
-        let (bundle, first_note) = build_session_bundle(mode, &candidates, now, None, None)?;
+        let (bundle, first_note) =
+            build_session_bundle(effective_mode, &candidates, now, None, None, budget_seconds)?;
         let first_item = bundle
             .items
             .first()
@@ -1043,7 +1182,7 @@ impl WorkbookService {
         session.current_workbook_id = Some(first_item.workbook_id.clone());
         session.current_item_id = Some(first_item.id.clone());
         session.cursor_kind = "initial".to_string();
-        session.phase = if matches!(mode, Mode::New | Mode::Plan)
+        session.phase = if matches!(effective_mode, Mode::New | Mode::Plan)
             && !storage.note_introduced(&first_item.workbook_id, &first_note)?
         {
             Phase::Intro
@@ -1913,7 +2052,7 @@ impl WorkbookService {
             None
         };
         let mut progress = StudyProgress::default();
-        if session.exam_id.is_some() {
+        if session.exam_id.is_some() || session.time_budget_seconds.is_some() {
             progress = progress_for_exam(bundle, item);
         } else if let Some(workbook_id) = workbook_id.as_deref() {
             progress = progress_for(bundle, workbook_id, item);
@@ -1986,6 +2125,20 @@ impl WorkbookService {
         } else {
             None
         };
+        let budget = session.time_budget_seconds.map(|target_seconds| {
+            let target_ms = i64::from(target_seconds) * 1_000;
+            let used_ms = bundle
+                .attempts
+                .iter()
+                .map(|attempt| attempt.elapsed_ms.max(0))
+                .sum::<i64>();
+            SessionBudgetView {
+                target_seconds,
+                used_ms,
+                remaining_ms: target_ms - used_ms,
+                reached: used_ms >= target_ms,
+            }
+        });
         Ok(StudyView {
             session_id: session.id.clone(),
             mode: session.mode,
@@ -2009,6 +2162,7 @@ impl WorkbookService {
             overall_result,
             exam_id: session.exam_id.clone(),
             exam_title: exam.map(|exam| exam.title),
+            budget,
             mock,
             mock_result,
         })
@@ -2529,12 +2683,97 @@ fn shuffle_candidates(candidates: &mut [SessionCandidate], seed: u64) {
     }
 }
 
+struct BudgetEstimates {
+    kinds: BTreeMap<(String, String), String>,
+    stats: BTreeMap<(String, String), (u32, i64)>,
+}
+
+impl BudgetEstimates {
+    fn load(storage: &Storage) -> Result<Self> {
+        let mut kinds = BTreeMap::new();
+        for question in exam_catalog(storage)? {
+            kinds.insert(
+                (question.workbook_id, question.question_id),
+                question.question_kind,
+            );
+        }
+        let mut stats = BTreeMap::new();
+        for (workbook_id, question_id, stat) in storage.question_attempt_stats()? {
+            stats.insert(
+                (workbook_id, question_id),
+                (stat.attempts as u32, stat.elapsed_ms),
+            );
+        }
+        Ok(Self { kinds, stats })
+    }
+
+    fn estimate(&self, workbook_id: &str, question_id: &str) -> f64 {
+        let kind = self
+            .kinds
+            .get(&(workbook_id.to_string(), question_id.to_string()))
+            .map(String::as_str)
+            .unwrap_or("single_choice");
+        let (attempts, elapsed_ms) = self
+            .stats
+            .get(&(workbook_id.to_string(), question_id.to_string()))
+            .copied()
+            .unwrap_or((0, 0));
+        estimated_seconds(kind, attempts, elapsed_ms)
+    }
+}
+
+fn budget_category(pool: BudgetPool) -> BudgetCategory {
+    match pool {
+        BudgetPool::ShortTermDue => BudgetCategory::ShortTermDue,
+        BudgetPool::DueReview => BudgetCategory::DueReview,
+        BudgetPool::New => BudgetCategory::New,
+        BudgetPool::LearnAhead => BudgetCategory::LearnAhead,
+    }
+}
+
+fn budget_question(
+    estimates: &BudgetEstimates,
+    workbook_id: String,
+    note_id: String,
+    question_id: String,
+    pool: BudgetPool,
+    due_at: Option<DateTime<Utc>>,
+    ordinal: u32,
+) -> BudgetQuestion {
+    let estimated_seconds = estimates.estimate(&workbook_id, &question_id);
+    let kind = estimates
+        .kinds
+        .get(&(workbook_id.clone(), question_id.clone()))
+        .cloned()
+        .unwrap_or_else(|| "single_choice".to_string());
+    BudgetQuestion {
+        workbook_id,
+        note_id,
+        question_id,
+        kind,
+        category: budget_category(pool),
+        due_at,
+        ordinal,
+        estimated_seconds,
+    }
+}
+
+fn session_candidate(question: BudgetQuestion) -> SessionCandidate {
+    SessionCandidate {
+        workbook_id: question.workbook_id,
+        note_id: question.note_id,
+        question_id: question.question_id,
+        due_at: question.due_at,
+    }
+}
+
 fn build_session_bundle(
     mode: Mode,
     candidates: &[SessionCandidate],
     now: DateTime<Utc>,
     exam_id: Option<String>,
     time_limit_seconds: Option<u32>,
+    time_budget_seconds: Option<u32>,
 ) -> Result<(SessionBundle, String)> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let started_at = now;
@@ -2587,6 +2826,7 @@ fn build_session_bundle(
         revision: 0,
         exam_id,
         time_limit_seconds,
+        time_budget_seconds,
     };
     Ok((
         SessionBundle {

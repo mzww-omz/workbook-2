@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -124,7 +124,8 @@ CREATE TABLE sessions(
   assist_json TEXT,
   revision INTEGER NOT NULL DEFAULT 0,
   exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,
-  time_limit_seconds INTEGER
+  time_limit_seconds INTEGER,
+  time_budget_seconds INTEGER
 );
 CREATE UNIQUE INDEX one_active_session ON sessions(status) WHERE status = 'active';
 

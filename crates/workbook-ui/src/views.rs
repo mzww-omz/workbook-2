@@ -504,20 +504,54 @@ impl WorkbookApp {
                     ),
                 )
                 .child(
-                    Button::new("today-start-primary")
-                        .label(primary_label)
-                        .primary()
-                        .disabled(primary_action.is_none())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let Some((mode, book)) = primary_action.clone() else {
-                                return;
-                            };
-                            if mode == Mode::Practice && book.is_none() {
-                                this.go(Route::Library, window, cx);
-                                return;
-                            }
-                            this.start(mode, book, window, cx);
-                        })),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child("時間"),
+                        )
+                        .children(
+                            [
+                                ("3分", Some(3 * 60)),
+                                ("5分", Some(5 * 60)),
+                                ("10分", Some(10 * 60)),
+                                ("20分", Some(20 * 60)),
+                                ("制限なし", None),
+                            ]
+                            .into_iter()
+                            .map(|(label, value)| {
+                                let selected = self.budget_seconds == value;
+                                Button::new(format!("today-budget-{label}"))
+                                    .label(label)
+                                    .when(selected, |button| button.primary())
+                                    .when(!selected, |button| button.ghost())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.budget_seconds = value;
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            }),
+                        )
+                        .child(
+                            Button::new("today-start-primary")
+                                .label(primary_label)
+                                .primary()
+                                .disabled(primary_action.is_none())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let Some((mode, book)) = primary_action.clone() else {
+                                        return;
+                                    };
+                                    if mode == Mode::Practice && book.is_none() {
+                                        this.go(Route::Library, window, cx);
+                                        return;
+                                    }
+                                    this.start_with_budget(mode, book, window, cx);
+                                })),
+                        ),
                 ),
         );
 
@@ -2867,6 +2901,30 @@ impl WorkbookApp {
                             .text_color(theme.muted_foreground)
                             .child(progress),
                     )
+                    .when_some(view.budget, |row, budget| {
+                        row.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(if budget.reached {
+                                    theme.accent
+                                } else {
+                                    theme.muted_foreground
+                                })
+                                .child(if budget.reached {
+                                    format!(
+                                        "目標 {}分・回答 {}（目安に到達）",
+                                        budget.target_seconds / 60,
+                                        format_duration(budget.used_ms)
+                                    )
+                                } else {
+                                    format!(
+                                        "目標 {}分・残り目安 {}",
+                                        budget.target_seconds / 60,
+                                        format_duration(budget.remaining_ms.max(0))
+                                    )
+                                }),
+                        )
+                    })
                     .when_some(
                         view.mock
                             .as_ref()

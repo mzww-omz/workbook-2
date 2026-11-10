@@ -76,6 +76,25 @@ pub struct SessionCandidate {
     pub due_at: Option<DateTime<Utc>>,
 }
 
+/// Pool a time-budget candidate came from. The service maps these to the
+/// scheduler's priority order; storage does not rank them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetPool {
+    ShortTermDue,
+    DueReview,
+    New,
+    LearnAhead,
+}
+
+#[derive(Clone, Debug)]
+pub struct BudgetCandidate {
+    pub workbook_id: String,
+    pub note_id: String,
+    pub question_id: String,
+    pub due_at: Option<DateTime<Utc>>,
+    pub pool: BudgetPool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionRow {
     pub id: String,
@@ -99,6 +118,9 @@ pub struct SessionRow {
     pub revision: u64,
     pub exam_id: Option<String>,
     pub time_limit_seconds: Option<u32>,
+    /// Selection target for time-budgeted sessions. `None` means no target.
+    /// It is never a hard deadline.
+    pub time_budget_seconds: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -1059,6 +1081,184 @@ impl Storage {
         Ok(output)
     }
 
+    /// Candidates for a time-budgeted session. Unlike `review_candidates`,
+    /// this also exposes whether a card is a due short-term repeat, a due
+    /// review, new content, or a Learn Ahead repeat, so the scheduler can keep
+    /// the documented priority. `new_limit` is the remaining daily allowance.
+    pub fn budget_candidates(
+        &self,
+        workbook_id: Option<&str>,
+        now: DateTime<Utc>,
+        new_limit: usize,
+    ) -> Result<Vec<BudgetCandidate>> {
+        let connection = self.connection()?;
+        let now_text = format_ts(now);
+        let learn_ahead_until = format_ts(now + chrono::Duration::minutes(20));
+        let mut output = Vec::new();
+        let mut seen_questions = BTreeSet::new();
+        let mut seen_notes = BTreeSet::new();
+
+        let short_sql = if workbook_id.is_some() {
+            "SELECT q.workbook_id,q.note_id,q.question_id,rs.due_at
+             FROM questions q JOIN review_states rs
+               ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+             WHERE q.workbook_id=?1 AND rs.state IN (1,3) AND rs.due_at<=?2
+             ORDER BY rs.due_at,q.rowid"
+        } else {
+            "SELECT q.workbook_id,q.note_id,q.question_id,rs.due_at
+             FROM questions q JOIN review_states rs
+               ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+             WHERE rs.state IN (1,3) AND rs.due_at<=?1
+             ORDER BY rs.due_at,q.rowid"
+        };
+        {
+            let mut statement = connection.prepare(short_sql)?;
+            let rows = if let Some(workbook_id) = workbook_id {
+                statement.query_map(params![workbook_id, now_text], map_budget_candidate)?
+            } else {
+                statement.query_map([now_text.clone()], map_budget_candidate)?
+            };
+            for row in rows {
+                let (workbook_id, note_id, question_id, due_at) = row?;
+                let due_at = due_at.as_deref().map(parse_ts).transpose()?;
+                let key = (workbook_id.clone(), question_id.clone());
+                let note_key = (workbook_id.clone(), note_id.clone());
+                if !seen_questions.insert(key) || !seen_notes.insert(note_key) {
+                    continue;
+                }
+                output.push(BudgetCandidate {
+                    workbook_id,
+                    note_id,
+                    question_id,
+                    due_at,
+                    pool: BudgetPool::ShortTermDue,
+                });
+            }
+        }
+
+        let review_sql = if workbook_id.is_some() {
+            "SELECT q.workbook_id,q.note_id,q.question_id,rs.due_at
+             FROM questions q JOIN review_states rs
+               ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+             WHERE q.workbook_id=?1 AND rs.state=2 AND rs.due_at<=?2
+               AND (q.buried_until IS NULL OR q.buried_until<=?2)
+             ORDER BY rs.due_at,q.rowid"
+        } else {
+            "SELECT q.workbook_id,q.note_id,q.question_id,rs.due_at
+             FROM questions q JOIN review_states rs
+               ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+             WHERE rs.state=2 AND rs.due_at<=?1
+               AND (q.buried_until IS NULL OR q.buried_until<=?1)
+             ORDER BY rs.due_at,q.rowid"
+        };
+        {
+            let mut statement = connection.prepare(review_sql)?;
+            let rows = if let Some(workbook_id) = workbook_id {
+                statement.query_map(params![workbook_id, now_text], map_budget_candidate)?
+            } else {
+                statement.query_map([now_text.clone()], map_budget_candidate)?
+            };
+            for row in rows {
+                let (workbook_id, note_id, question_id, due_at) = row?;
+                let due_at = due_at.as_deref().map(parse_ts).transpose()?;
+                let key = (workbook_id.clone(), question_id.clone());
+                let note_key = (workbook_id.clone(), note_id.clone());
+                if seen_questions.contains(&key) || !seen_notes.insert(note_key) {
+                    continue;
+                }
+                seen_questions.insert(key);
+                output.push(BudgetCandidate {
+                    workbook_id,
+                    note_id,
+                    question_id,
+                    due_at,
+                    pool: BudgetPool::DueReview,
+                });
+            }
+        }
+
+        if new_limit > 0 {
+            let new_sql = if workbook_id.is_some() {
+                "SELECT q.workbook_id,q.note_id,q.question_id,NULL
+                 FROM questions q LEFT JOIN review_states rs
+                   ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+                 WHERE q.workbook_id=?1 AND rs.question_id IS NULL
+                 ORDER BY q.rowid LIMIT ?2"
+            } else {
+                "SELECT q.workbook_id,q.note_id,q.question_id,NULL
+                 FROM questions q LEFT JOIN review_states rs
+                   ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+                 WHERE rs.question_id IS NULL
+                 ORDER BY q.rowid LIMIT ?1"
+            };
+            let mut statement = connection.prepare(new_sql)?;
+            let rows = if let Some(workbook_id) = workbook_id {
+                statement.query_map(params![workbook_id, new_limit as i64], map_budget_candidate)?
+            } else {
+                statement.query_map([new_limit as i64], map_budget_candidate)?
+            };
+            for row in rows {
+                let (workbook_id, note_id, question_id, _) = row?;
+                if !seen_questions.insert((workbook_id.clone(), question_id.clone())) {
+                    continue;
+                }
+                output.push(BudgetCandidate {
+                    workbook_id,
+                    note_id,
+                    question_id,
+                    due_at: None,
+                    pool: BudgetPool::New,
+                });
+            }
+        }
+
+        let ahead_sql = if workbook_id.is_some() {
+            "SELECT q.workbook_id,q.note_id,q.question_id,rs.due_at
+             FROM questions q JOIN review_states rs
+               ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+             WHERE q.workbook_id=?1 AND rs.state IN (1,3)
+               AND rs.due_at>?2 AND rs.due_at<=?3
+             ORDER BY rs.due_at,q.rowid"
+        } else {
+            "SELECT q.workbook_id,q.note_id,q.question_id,rs.due_at
+             FROM questions q JOIN review_states rs
+               ON rs.workbook_id=q.workbook_id AND rs.question_id=q.question_id
+             WHERE rs.state IN (1,3)
+               AND rs.due_at>?1 AND rs.due_at<=?2
+             ORDER BY rs.due_at,q.rowid"
+        };
+        {
+            let mut statement = connection.prepare(ahead_sql)?;
+            let rows = if let Some(workbook_id) = workbook_id {
+                statement.query_map(
+                    params![workbook_id, now_text, learn_ahead_until],
+                    map_budget_candidate,
+                )?
+            } else {
+                statement.query_map(params![now_text, learn_ahead_until], map_budget_candidate)?
+            };
+            for row in rows {
+                let (workbook_id, note_id, question_id, due_at) = row?;
+                let due_at = due_at.as_deref().map(parse_ts).transpose()?;
+                let key = (workbook_id.clone(), question_id.clone());
+                let note_key = (workbook_id.clone(), note_id.clone());
+                if seen_questions.contains(&key) || !seen_notes.insert(note_key) {
+                    continue;
+                }
+                seen_questions.insert(key);
+                output.push(BudgetCandidate {
+                    workbook_id,
+                    note_id,
+                    question_id,
+                    due_at,
+                    pool: BudgetPool::LearnAhead,
+                });
+            }
+        }
+
+        Ok(output)
+    }
+
     /// Short-term cards whose due time is later than `after` but within
     /// `before`. Used by Today to avoid claiming completion while a 1m/10m
     /// repeat is still pending, and by Review session start when there are no
@@ -1185,7 +1385,7 @@ impl Storage {
                 "SELECT id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,phase,
                         draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
                         question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision,
-                        exam_id,time_limit_seconds
+                        exam_id,time_limit_seconds,time_budget_seconds
                  FROM sessions WHERE id=?1",
                 [session_id],
                 map_session,
@@ -1990,6 +2190,7 @@ fn insert_legacy_session(
         revision: session.revision,
         exam_id: None,
         time_limit_seconds: None,
+        time_budget_seconds: None,
     };
     insert_session(transaction, &row)?;
     for item in &session.items {
@@ -2054,8 +2255,8 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
         "INSERT INTO sessions(id,mode,status,started_at,ended_at,current_workbook_id,current_item_id,
                 phase,draft_json,hint,revealed,pending_correct,pending_unknown,pending_at,
                 question_started_at,question_elapsed_ms,cursor_kind,assist_json,revision,
-                exam_id,time_limit_seconds)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                exam_id,time_limit_seconds,time_budget_seconds)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         params![
             session.id,
             session.mode.as_str(),
@@ -2080,7 +2281,8 @@ fn insert_session(transaction: &rusqlite::Transaction<'_>, session: &SessionRow)
             session.assist_json,
             session.revision as i64,
             session.exam_id,
-            session.time_limit_seconds.map(i64::from)
+            session.time_limit_seconds.map(i64::from),
+            session.time_budget_seconds.map(i64::from)
         ],
     )?;
     Ok(())
@@ -2091,8 +2293,9 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
         "UPDATE sessions SET mode=?1,status=?2,started_at=?3,ended_at=?4,current_workbook_id=?5,
                 current_item_id=?6,phase=?7,draft_json=?8,hint=?9,revealed=?10,pending_correct=?11,
                 pending_unknown=?12,pending_at=?13,question_started_at=?14,question_elapsed_ms=?15,
-                cursor_kind=?16,assist_json=?17,revision=?18,exam_id=?19,time_limit_seconds=?20
-                WHERE id=?21",
+                cursor_kind=?16,assist_json=?17,revision=?18,exam_id=?19,time_limit_seconds=?20,
+                time_budget_seconds=?21
+                WHERE id=?22",
         params![
             session.mode.as_str(),
             match session.status {
@@ -2117,6 +2320,7 @@ fn update_session_row(connection: &Connection, session: &SessionRow) -> Result<(
             session.revision as i64,
             session.exam_id,
             session.time_limit_seconds.map(i64::from),
+            session.time_budget_seconds.map(i64::from),
             session.id
         ],
     )?;
@@ -2308,6 +2512,12 @@ fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionCandidate> 
     })
 }
 
+type BudgetCandidateColumns = (String, String, String, Option<String>);
+
+fn map_budget_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<BudgetCandidateColumns> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
 type CardColumns = (
     i64,
     f64,
@@ -2410,6 +2620,9 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         exam_id: row.get(19)?,
         time_limit_seconds: row
             .get::<_, Option<i64>>(20)?
+            .and_then(|value| u32::try_from(value).ok()),
+        time_budget_seconds: row
+            .get::<_, Option<i64>>(21)?
             .and_then(|value| u32::try_from(value).ok()),
     })
 }
@@ -2631,6 +2844,10 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
         transaction.execute_batch(
             "ALTER TABLE exams ADD COLUMN daily_minutes INTEGER NOT NULL DEFAULT 30;",
         )?;
+    }
+    if from < 6 {
+        transaction
+            .execute_batch("ALTER TABLE sessions ADD COLUMN time_budget_seconds INTEGER;")?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;

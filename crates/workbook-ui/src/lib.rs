@@ -146,6 +146,7 @@ pub struct WorkbookApp {
     pub(crate) selected_exam: Option<String>,
     pub(crate) exam_editor: Option<ExamEditorState>,
     pub(crate) practice_strategy: PracticeStrategy,
+    pub(crate) budget_seconds: Option<u32>,
     pub(crate) practice_limit_input: Entity<InputState>,
     pub(crate) mock_limit_input: Entity<InputState>,
     pub(crate) mock_minutes_input: Entity<InputState>,
@@ -252,6 +253,7 @@ impl WorkbookApp {
             selected_exam: None,
             exam_editor: None,
             practice_strategy: PracticeStrategy::All,
+            budget_seconds: Some(10 * 60),
             practice_limit_input,
             mock_limit_input,
             mock_minutes_input,
@@ -509,7 +511,35 @@ impl WorkbookApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.service.start_session(mode, book.as_deref()) {
+        self.start_session_with_budget(mode, book, None, window, cx);
+    }
+
+    /// Starts a session using the learner's selected time budget. `None` means
+    /// no limit. The budget only shapes the item list; it never interrupts an
+    /// answer.
+    pub(crate) fn start_with_budget(
+        &mut self,
+        mode: Mode,
+        book: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let budget = self.budget_seconds;
+        self.start_session_with_budget(mode, book, budget, window, cx);
+    }
+
+    fn start_session_with_budget(
+        &mut self,
+        mode: Mode,
+        book: Option<String>,
+        budget: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .service
+            .start_session_with_budget(mode, book.as_deref(), budget)
+        {
             Ok(()) => {
                 self.refresh(cx);
                 if let Some(active) = self.snapshot.active.clone() {

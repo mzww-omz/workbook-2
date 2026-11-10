@@ -62,7 +62,7 @@ fn version_one_data_survives_the_v4_migration() {
 fn v3_schema_sql() -> String {
     workbook_storage::schema::SCHEMA_SQL
         .replace(
-            "  revision INTEGER NOT NULL DEFAULT 0,\n  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,\n  time_limit_seconds INTEGER\n",
+            "  revision INTEGER NOT NULL DEFAULT 0,\n  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,\n  time_limit_seconds INTEGER,\n  time_budget_seconds INTEGER\n",
             "  revision INTEGER NOT NULL DEFAULT 0\n",
         )
         .replace(
@@ -184,6 +184,44 @@ fn version_three_data_survives_the_v4_migration() {
 }
 
 #[test]
+fn version_five_database_gains_time_budget_without_losing_sessions() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(workbook_storage::schema::SCHEMA_SQL)
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN time_budget_seconds;
+                 PRAGMA application_id=1463962418;
+                 PRAGMA user_version=5;
+                 INSERT INTO meta(key,value) VALUES('app','workbook-2');
+                 INSERT INTO sessions(id,mode,status,started_at,phase)
+                   VALUES('s1','review','ended','2026-01-01T00:00:00.000Z','overall_result');",
+            )
+            .unwrap();
+    }
+    let storage = Storage::open(dir.path()).unwrap();
+    assert_eq!(storage.session_bundle("s1").unwrap().session.id, "s1");
+    drop(storage);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    let column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='time_budget_seconds'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(column, 1);
+}
+
+#[test]
 fn daily_backups_keep_seven_generations_and_private_permissions() {
     let dir = tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
@@ -210,7 +248,7 @@ fn v1_schema_sql() -> String {
         .replace("  rating_source TEXT NOT NULL DEFAULT 'manual',\n", "")
         .replace("  assist_json TEXT,\n", "")
         .replace(
-            "  revision INTEGER NOT NULL DEFAULT 0,\n  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,\n  time_limit_seconds INTEGER\n",
+            "  revision INTEGER NOT NULL DEFAULT 0,\n  exam_id TEXT REFERENCES exams(id) ON DELETE SET NULL,\n  time_limit_seconds INTEGER,\n  time_budget_seconds INTEGER\n",
             "  revision INTEGER NOT NULL DEFAULT 0\n",
         )
         .replace(
@@ -379,6 +417,7 @@ fn version_four_backup_without_daily_minutes_is_validated_and_upgraded() {
         connection
             .execute_batch(
                 "ALTER TABLE exams DROP COLUMN daily_minutes;
+                 ALTER TABLE sessions DROP COLUMN time_budget_seconds;
                  PRAGMA application_id=1463962418;
                  PRAGMA user_version=4;
                  INSERT INTO meta(key,value) VALUES('app','workbook-2');",

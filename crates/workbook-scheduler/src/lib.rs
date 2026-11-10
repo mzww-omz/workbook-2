@@ -1,11 +1,13 @@
 //! FSRS-7 adapter, Anki-style short-term steps, Learn Ahead, and queue
 //! selection. This crate knows nothing about GPUI or SQLite.
 
+pub mod budget;
 pub mod clock;
 pub mod planner;
 pub mod queue;
 pub mod step_policy;
 
+pub use budget::{BudgetCategory, BudgetQuestion, BudgetSelection, select_within_budget};
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use planner::{
     ExamPlan, FieldAllocation, PlanCard, PlanCoverage, PlanFeasibility, PlanInput, PlanQuestion,

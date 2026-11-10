@@ -1,0 +1,57 @@
+# Workbook 2.5 実装進捗
+
+作業ブランチ: `feat/workbook-2-5`
+
+## Phase A — Product / UI Redesign
+
+### 実装済み
+- `PRODUCT.md` / `DESIGN.md` をWorkbook 2.5のコンセプトへ全面更新
+- Todayに「今日の学習を始める」主操作を追加。復習 → 短期 → 新規の順で自動選択
+- 中断Sessionの再開導線は従来どおり最上位
+- Todayの学習時間選択（3/5/10/20分/制限なし）を追加（Phase Bで接続）
+
+### 主要ファイル
+- `PRODUCT.md`, `DESIGN.md`
+- `crates/workbook-ui/src/views.rs`
+- `crates/workbook-ui/src/lib.rs`
+
+### テスト
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+- コミット: `c1644bc`
+
+### 未完了 / 次
+- Goal / Exam進捗のToday表示はPhase Dで追加
+- LibraryのAuthoring/Export導線はPhase Eで追加
+
+## Phase B — Time-Budgeted Study
+
+### 実装済み
+- `workbook-scheduler::budget` を追加。短期再学習 → 復習 → 新規 → Learn Ahead の優先で予算内の項目を選択
+- 回答履歴の平均時間を使い、履歴がない場合は問題形式別の保守的初期値
+- 予算0は拒否。予算超過しそうな最初の1問は選択し、学習不能にしない
+- `sessions.time_budget_seconds` を schema v6 で追加（前方マイグレーション + バックアップ）
+- `WorkbookService::start_session_with_budget` を追加。Review予算はPlan経路で新規も混合
+- Practiceの予算はFSRSを書き換えない
+- StudyViewに予算目標・使用時間・残り目安・到達フラグを追加
+- Study上バーに目標時間と残り目安を表示。到達しても強制終了しない
+- Todayの時間選択を主操作へ接続
+
+### 主要ファイル
+- `crates/workbook-scheduler/src/budget.rs`（新規）
+- `crates/workbook-scheduler/src/lib.rs`
+- `crates/workbook-storage/src/schema.rs`
+- `crates/workbook-storage/src/lib.rs`
+- `crates/workbook-service/src/lib.rs`
+- `crates/workbook-ui/src/views.rs`, `lib.rs`
+- `crates/workbook-service/tests/budget.rs`（新規）
+- `crates/workbook-storage/tests/storage.rs`
+
+### テスト
+- 予算境界（179/180/181/200秒）、優先順位、重複、非有限推定、20分
+- 3分/20分Session、予算0拒否、回答途中で45分経過後も確定できること
+- Review予算のPlan混合、PracticeのFSRS非更新、再起動後の予算保持
+- v5→v6マイグレーションでSessionが保持されること
+
+### 既知の制約
+- 予算は選択目標であり、経過時間による自動終了は行わない（意図どおり）
+- 実機UIでの3分/20分表示確認は未実施（Phase A〜E完了後にまとめて確認）
