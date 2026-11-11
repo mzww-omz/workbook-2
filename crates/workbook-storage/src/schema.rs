@@ -1,5 +1,5 @@
 pub const APPLICATION_ID: i64 = 1_463_962_418; // "WBK2"
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE workbooks(
@@ -25,6 +25,7 @@ CREATE TABLE questions(
   question_id TEXT NOT NULL,
   note_id TEXT NOT NULL,
   buried_until TEXT,
+  revision INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(workbook_id, question_id),
   FOREIGN KEY(workbook_id, note_id) REFERENCES notes(workbook_id, note_id) ON DELETE CASCADE
 );
@@ -199,6 +200,7 @@ CREATE TABLE attempts(
   elapsed_ms INTEGER NOT NULL,
   rating INTEGER NOT NULL,
   rating_source TEXT NOT NULL DEFAULT 'manual',
+  question_revision INTEGER NOT NULL DEFAULT 1,
   answer_json TEXT NOT NULL,
   before_state_json TEXT,
   after_state_json TEXT,
@@ -314,6 +316,7 @@ pub fn expected_tables(version: i64) -> &'static [&'static str] {
     } else if version < 8 {
         EXPECTED_TABLES_V7
     } else {
+        // v8 and v9 add columns only; the table set is unchanged.
         EXPECTED_TABLES
     }
 }

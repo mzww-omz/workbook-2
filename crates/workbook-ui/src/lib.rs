@@ -106,6 +106,9 @@ pub(crate) enum Modal {
         id: String,
         title: String,
     },
+    ResetFsrs {
+        questions: Vec<workbook_service::QuestionRevisionPlan>,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -324,6 +327,9 @@ pub struct WorkbookApp {
     pub(crate) rating_picker_open: bool,
     pub(crate) notice: Option<Notice>,
     pub(crate) modal: Option<Modal>,
+    /// Set only by the reset-confirmation dialog. It lets `save_editor` retry
+    /// the same save after the user has seen which questions lose FSRS state.
+    pub(crate) fsrs_reset_confirmed: bool,
     pub(crate) settings_retention: Entity<InputState>,
     pub(crate) settings_new_limit: Entity<InputState>,
     pub(crate) appearance_subscription: Option<Subscription>,
@@ -448,6 +454,7 @@ impl WorkbookApp {
             rating_picker_open: false,
             notice: None,
             modal: None,
+            fsrs_reset_confirmed: false,
             settings_retention,
             settings_new_limit,
             appearance_subscription: None,
@@ -1708,6 +1715,10 @@ impl WorkbookApp {
 
     pub(crate) fn save_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.apply_editor_fields(cx);
+        // Consume the confirmation at the start. An early validation return
+        // must not leave the next unrelated save silently confirmed.
+        let confirm_reset = self.fsrs_reset_confirmed;
+        self.fsrs_reset_confirmed = false;
         if self
             .editor
             .as_ref()
@@ -1742,7 +1753,29 @@ impl WorkbookApp {
             cx.notify();
             return false;
         }
-        match self.service.save_workbook(local_id.as_deref(), &workbook) {
+        if let Some(id) = local_id.as_deref()
+            && !confirm_reset
+        {
+            match self.service.preview_workbook_save(id, &workbook) {
+                Ok(resets) if !resets.is_empty() => {
+                    self.modal = Some(Modal::ResetFsrs { questions: resets });
+                    cx.notify();
+                    return false;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.error = Some(error.to_string());
+                    }
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
+        match self
+            .service
+            .save_workbook(local_id.as_deref(), &workbook, confirm_reset)
+        {
             Ok(saved) => {
                 let changed = local_id.as_deref() != Some(saved.local_id.as_str());
                 let assets = self
@@ -1776,6 +1809,15 @@ impl WorkbookApp {
                 false
             }
         }
+    }
+
+    pub(crate) fn confirm_fsrs_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fsrs_reset_confirmed = true;
+        self.modal = None;
+        if !self.save_editor(window, cx) {
+            self.fsrs_reset_confirmed = false;
+        }
+        cx.notify();
     }
 
     pub(crate) fn export_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3829,6 +3871,7 @@ fn new_editor_workbook() -> Workbook {
         language: "ja".to_string(),
         tags: Vec::new(),
         assets: Vec::new(),
+        topic_catalog: Vec::new(),
         notes: vec![Note {
             id: format!("note-{}", uuid::Uuid::new_v4().simple()),
             title: "ノート1".to_string(),

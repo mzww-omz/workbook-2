@@ -151,6 +151,9 @@ Scope (ExamScope/StudyScope JSON)
 - Topicの同一性はID。同じ親の下で正規化名が同じ場合だけ衝突として拒否する
 - 親Topicを選ぶと、解決時に子孫IDへ展開する。保存時に子孫を凍結しない
 - JSON教材の `topics` は `数学/一次関数` のようなパス。Import時にTopicを解決・共有する
+- Exportは `topicCatalog`（ID・表示名・親ID）を併記する。再Import時はIDを優先し、
+  改名後でも同じTopicへ割り当てる。catalogのない旧JSONはパスだけで解決し、推測で統合しない
+- Goal/ExamのScopeから参照中のTopicは削除を拒否する
 - Scopeは毎回現在の教材一覧から解決し、Session開始時に `session_items` へ固定する
 - 学習中のSessionは変更しない。新教材・新Topicは次の解決から反映する
 
@@ -206,7 +209,8 @@ Scope (ExamScope/StudyScope JSON)
 `user_version=1` のDBは起動時に `attempts.rating_source`、`assist_json` 列、`sessions.assist_json`、
 `assets` テーブルを追加する。v4 で `exams`、`mock_answers`、`mock_results` と
 sessions の exam/time-limit 列、v5 で `exams.daily_minutes`、v6 で `sessions.time_budget_seconds`、
-v7 で `topics` / `question_topics`、v8 で `goals` / `sessions.goal_id` を追加する。
+v7 で `topics` / `question_topics`、v8 で `goals` / `sessions.goal_id`、
+v9 で `questions.revision` と `attempts.question_revision` を追加する。
 変更前に `backups/pre-migration-v{from}-*.sqlite` をSQLite backup APIで作成する。
 古いバックアップも復元時に同じ前方移行を行う。
 

@@ -10,7 +10,7 @@ use uuid::Uuid;
 use workbook_domain::{
     AssetContent, AssistState, CardState, Exam, ExamScope, Goal, Mode, Phase, RatingSource,
     SessionItemStatus, SessionStatus, Settings, StoredCard, StudyCalendar, ThemeSetting, Topic,
-    Workbook, normalize_topic_name, parse_topic_path, parse_workbook,
+    TopicCatalogEntry, Workbook, normalize_topic_name, parse_topic_path, parse_workbook,
 };
 use workbook_import::{
     LegacyAttempt, LegacyPlan, LegacySession, LegacySessionItem, LegacySessionWorkbook,
@@ -199,6 +199,9 @@ pub struct AttemptRow {
     pub elapsed_ms: i64,
     pub rating: u8,
     pub rating_source: RatingSource,
+    /// Authored question revision that was on screen. Kept with the attempt so
+    /// an old answer is never read as an answer to a rewritten question.
+    pub question_revision: i64,
     pub answer_json: String,
     pub before_state_json: Option<String>,
     pub after_state_json: Option<String>,
@@ -475,16 +478,14 @@ impl Storage {
             )?;
             for question in &note.questions {
                 transaction.execute(
-                    "INSERT INTO questions(workbook_id,question_id,note_id,buried_until) VALUES(?1,?2,?3,NULL)",
-                    params![local_id, question.id, note.id],
+                    "INSERT INTO questions(workbook_id,question_id,note_id,buried_until,revision)
+                     VALUES(?1,?2,?3,NULL,?4)",
+                    params![local_id, question.id, note.id, question.revision],
                 )?;
                 for path in &question.topics {
-                    let mut parent: Option<String> = None;
-                    for name in parse_topic_path(path)? {
-                        let topic_id = ensure_topic(&transaction, &name, parent.as_deref(), now)?;
-                        parent = Some(topic_id);
-                    }
-                    if let Some(topic_id) = parent {
+                    if let Some(topic_id) =
+                        ensure_topic_path(&transaction, path, &workbook.topic_catalog, now)?
+                    {
                         transaction.execute(
                             "INSERT OR IGNORE INTO question_topics(workbook_id,question_id,topic_id)
                              VALUES(?1,?2,?3)",
@@ -518,11 +519,21 @@ impl Storage {
     /// session history keep pointing at the same identity. Removed questions
     /// and notes lose their review states through foreign-key cascade; attempt
     /// history remains.
+    ///
+    /// The order matters. Notes are created/reused first, questions are moved
+    /// with an upsert, and only then are removed questions and notes deleted.
+    /// Deleting a note before moving its questions would cascade through
+    /// `notes -> questions -> review_states` and silently drop learning state
+    /// for a question that merely changed notes.
+    ///
+    /// `reset_questions` names questions whose study content changed. Their
+    /// FSRS state is deleted in the same transaction; attempts stay.
     pub fn update_workbook_content(
         &mut self,
         local_id: &str,
         workbook: &Workbook,
         assets: &[AssetContent],
+        reset_questions: &BTreeSet<String>,
         now: DateTime<Utc>,
     ) -> Result<()> {
         workbook.validate()?;
@@ -553,28 +564,36 @@ impl Storage {
 
         let new_notes: BTreeSet<&str> =
             workbook.notes.iter().map(|note| note.id.as_str()).collect();
-        let mut existing_notes = Vec::new();
-        {
-            let mut statement =
-                transaction.prepare("SELECT note_id FROM notes WHERE workbook_id=?1")?;
-            let rows = statement.query_map([local_id], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                existing_notes.push(row?);
-            }
-        }
-        for note_id in existing_notes {
-            if !new_notes.contains(note_id.as_str()) {
-                transaction.execute(
-                    "DELETE FROM notes WHERE workbook_id=?1 AND note_id=?2",
-                    params![local_id, note_id],
-                )?;
-            }
+
+        // 1. Create or reuse every note first so a moved question always has a
+        //    valid target row. `introduced` is intentionally untouched.
+        for note in &workbook.notes {
+            transaction.execute(
+                "INSERT INTO notes(workbook_id,note_id,introduced,introduced_at)
+                 VALUES(?1,?2,0,NULL)
+                 ON CONFLICT(workbook_id,note_id) DO NOTHING",
+                params![local_id, note.id],
+            )?;
         }
 
+        // 2. Move/upsert questions while both the old and new notes exist.
         let new_questions: BTreeSet<&str> = workbook
             .all_questions()
             .map(|(_, question)| question.id.as_str())
             .collect();
+        for note in &workbook.notes {
+            for question in &note.questions {
+                transaction.execute(
+                    "INSERT INTO questions(workbook_id,question_id,note_id,buried_until,revision)
+                     VALUES(?1,?2,?3,NULL,?4)
+                     ON CONFLICT(workbook_id,question_id) DO UPDATE SET
+                        note_id=excluded.note_id, revision=excluded.revision",
+                    params![local_id, question.id, note.id, question.revision],
+                )?;
+            }
+        }
+
+        // 3. Delete questions that were intentionally removed.
         let mut existing_questions = Vec::new();
         {
             let mut statement =
@@ -593,21 +612,34 @@ impl Storage {
             }
         }
 
-        for note in &workbook.notes {
-            transaction.execute(
-                "INSERT INTO notes(workbook_id,note_id,introduced,introduced_at)
-                 VALUES(?1,?2,0,NULL)
-                 ON CONFLICT(workbook_id,note_id) DO NOTHING",
-                params![local_id, note.id],
-            )?;
-            for question in &note.questions {
+        // 4. Delete notes that are no longer authored. Any question still in
+        //    them was already removed above, so this cascade cannot take a
+        //    question that was moved elsewhere.
+        let mut existing_notes = Vec::new();
+        {
+            let mut statement =
+                transaction.prepare("SELECT note_id FROM notes WHERE workbook_id=?1")?;
+            let rows = statement.query_map([local_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                existing_notes.push(row?);
+            }
+        }
+        for note_id in existing_notes {
+            if !new_notes.contains(note_id.as_str()) {
                 transaction.execute(
-                    "INSERT INTO questions(workbook_id,question_id,note_id,buried_until)
-                     VALUES(?1,?2,?3,NULL)
-                     ON CONFLICT(workbook_id,question_id) DO UPDATE SET note_id=excluded.note_id",
-                    params![local_id, question.id, note.id],
+                    "DELETE FROM notes WHERE workbook_id=?1 AND note_id=?2",
+                    params![local_id, note_id],
                 )?;
             }
+        }
+
+        // 5. A semantic question edit starts a new study target. Its old FSRS
+        //    state is discarded; attempts remain as history.
+        for question_id in reset_questions {
+            transaction.execute(
+                "DELETE FROM review_states WHERE workbook_id=?1 AND question_id=?2",
+                params![local_id, question_id],
+            )?;
         }
 
         transaction.execute("DELETE FROM assets WHERE workbook_id=?1", [local_id])?;
@@ -634,12 +666,9 @@ impl Storage {
         for note in &workbook.notes {
             for question in &note.questions {
                 for path in &question.topics {
-                    let mut parent: Option<String> = None;
-                    for name in parse_topic_path(path)? {
-                        let topic_id = ensure_topic(&transaction, &name, parent.as_deref(), now)?;
-                        parent = Some(topic_id);
-                    }
-                    if let Some(topic_id) = parent {
+                    if let Some(topic_id) =
+                        ensure_topic_path(&transaction, path, &workbook.topic_catalog, now)?
+                    {
                         transaction.execute(
                             "INSERT OR IGNORE INTO question_topics(workbook_id,question_id,topic_id)
                              VALUES(?1,?2,?3)",
@@ -885,6 +914,16 @@ impl Storage {
             return Err(StorageError::Conflict(
                 "子Topicがあるため削除できません。先に子Topicを移動してください".to_string(),
             ));
+        }
+        // A saved Goal/Exam scope stores topic IDs. Deleting a referenced topic
+        // would leave the scope pointing at nothing, so the safe default is to
+        // refuse and name the owner. The user can move the scope first.
+        let owners = topic_scope_references(connection, id)?;
+        if !owners.is_empty() {
+            return Err(StorageError::Conflict(format!(
+                "このTopicは{}で使われているため削除できません。先に条件を変更してください",
+                owners.join("、")
+            )));
         }
         let changed = connection.execute("DELETE FROM topics WHERE id=?1", [id])?;
         if changed == 0 {
@@ -1449,6 +1488,20 @@ impl Storage {
             )
             .optional()?;
         raw.map(map_stored_card).transpose()
+    }
+
+    /// Authored revision of a question. Attempts copy this value at answer
+    /// time so a later edit cannot retroactively change what was answered.
+    pub fn question_revision(&self, workbook_id: &str, question_id: &str) -> Result<i64> {
+        let revision: Option<i64> = self
+            .connection()?
+            .query_row(
+                "SELECT revision FROM questions WHERE workbook_id=?1 AND question_id=?2",
+                params![workbook_id, question_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(revision.unwrap_or(1))
     }
 
     pub fn review_states(&self) -> Result<Vec<(String, String, StoredCard)>> {
@@ -2079,8 +2132,9 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                    elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                    state_revision,short_term,assist_json,created_at
+                    elapsed_ms,rating,rating_source,question_revision,answer_json,
+                    before_state_json,after_state_json,state_revision,short_term,assist_json,
+                    created_at
              FROM attempts WHERE session_id=?1 ORDER BY answered_at, created_at, rowid",
         )?;
         let rows = statement.query_map([session_id], map_attempt)?;
@@ -2096,8 +2150,9 @@ impl Storage {
             .connection()?
             .query_row(
                 "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                        elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                        state_revision,short_term,assist_json,created_at
+                        elapsed_ms,rating,rating_source,question_revision,answer_json,
+                        before_state_json,after_state_json,state_revision,short_term,assist_json,
+                        created_at
                  FROM attempts WHERE id=?1",
                 [attempt_id],
                 map_attempt,
@@ -2115,8 +2170,9 @@ impl Storage {
             .connection()?
             .query_row(
                 "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                        elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                        state_revision,short_term,assist_json,created_at
+                        elapsed_ms,rating,rating_source,question_revision,answer_json,
+                        before_state_json,after_state_json,state_revision,short_term,assist_json,
+                        created_at
                  FROM attempts WHERE session_id=?1 AND question_id=?2
                  ORDER BY answered_at DESC, created_at DESC, rowid DESC LIMIT 1",
                 params![session_id, question_id],
@@ -2130,8 +2186,9 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id,session_id,workbook_id,note_id,question_id,answered_at,correct,unknown,hint,
-                    elapsed_ms,rating,rating_source,answer_json,before_state_json,after_state_json,
-                    state_revision,short_term,assist_json,created_at
+                    elapsed_ms,rating,rating_source,question_revision,answer_json,
+                    before_state_json,after_state_json,state_revision,short_term,assist_json,
+                    created_at
              FROM attempts WHERE answered_at>=?1 ORDER BY answered_at",
         )?;
         let rows = statement.query_map([format_ts(since)], map_attempt)?;
@@ -2801,6 +2858,7 @@ fn legacy_attempt_to_row(session_id: &str, attempt: &LegacyAttempt) -> AttemptRo
         elapsed_ms: attempt.elapsed_ms,
         rating: attempt.rating,
         rating_source: RatingSource::Manual,
+        question_revision: 1,
         answer_json: attempt.answer_json.clone(),
         before_state_json: attempt.before_state_json.clone(),
         after_state_json: attempt.after_state_json.clone(),
@@ -2930,9 +2988,9 @@ fn insert_session_workbook(
 fn insert_attempt(transaction: &rusqlite::Transaction<'_>, attempt: &AttemptRow) -> Result<()> {
     transaction.execute(
         "INSERT INTO attempts(id,session_id,workbook_id,note_id,question_id,answered_at,correct,
-                unknown,hint,elapsed_ms,rating,rating_source,answer_json,before_state_json,
-                after_state_json,state_revision,short_term,assist_json,created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                unknown,hint,elapsed_ms,rating,rating_source,question_revision,answer_json,
+                before_state_json,after_state_json,state_revision,short_term,assist_json,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             attempt.id,
             attempt.session_id,
@@ -2946,6 +3004,7 @@ fn insert_attempt(transaction: &rusqlite::Transaction<'_>, attempt: &AttemptRow)
             attempt.elapsed_ms,
             attempt.rating,
             attempt.rating_source.as_str(),
+            attempt.question_revision,
             attempt.answer_json,
             attempt.before_state_json,
             attempt.after_state_json,
@@ -3204,12 +3263,84 @@ fn map_topic(row: &rusqlite::Row<'_>) -> rusqlite::Result<Topic> {
 /// the topic when it does not exist under that parent. Returning the existing
 /// id is what makes topics shared across workbooks without being merged by
 /// name alone.
-fn ensure_topic(
+/// Resolves an authored topic path to one stable topic ID.
+///
+/// The optional catalog from the workbook JSON provides the IDs that were
+/// exported with the file. If a catalog ID still exists, it wins even when the
+/// topic has been renamed since the export. Files without a catalog keep the
+/// old path-based resolution.
+fn ensure_topic_path(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &str,
+    catalog: &[TopicCatalogEntry],
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let segments = parse_topic_path(path)?;
+    let chain = topic_catalog_chain(catalog, &segments);
+    let mut parent: Option<String> = None;
+    for (index, name) in segments.iter().enumerate() {
+        let entry = chain.as_ref().and_then(|chain| chain.get(index)).copied();
+        parent = Some(ensure_topic_entry(
+            transaction,
+            name,
+            parent.as_deref(),
+            entry,
+            now,
+        )?);
+    }
+    Ok(parent)
+}
+
+/// Finds one unambiguous root-to-leaf catalog chain matching the authored
+/// path. Multiple matches are rejected instead of guessed.
+fn topic_catalog_chain<'a>(
+    catalog: &'a [TopicCatalogEntry],
+    segments: &[String],
+) -> Option<Vec<&'a TopicCatalogEntry>> {
+    let first = segments.first()?;
+    let first_key = normalize_topic_name(first);
+    let mut roots = catalog
+        .iter()
+        .filter(|entry| entry.parent_id.is_none() && normalize_topic_name(&entry.name) == first_key)
+        .collect::<Vec<_>>();
+    if roots.len() != 1 {
+        return None;
+    }
+    let mut chain = vec![roots.remove(0)];
+    for segment in &segments[1..] {
+        let key = normalize_topic_name(segment);
+        let parent_id = chain.last()?.id.as_str();
+        let mut matches = catalog
+            .iter()
+            .filter(|entry| {
+                entry.parent_id.as_deref() == Some(parent_id)
+                    && normalize_topic_name(&entry.name) == key
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return None;
+        }
+        chain.push(matches.remove(0));
+    }
+    Some(chain)
+}
+
+fn ensure_topic_entry(
     transaction: &rusqlite::Transaction<'_>,
     name: &str,
     parent_id: Option<&str>,
+    entry: Option<&TopicCatalogEntry>,
     now: DateTime<Utc>,
 ) -> Result<String> {
+    if let Some(entry) = entry
+        && let Some(id) = transaction
+            .query_row("SELECT id FROM topics WHERE id=?1", [&entry.id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+    {
+        return Ok(id);
+    }
     let name_key = normalize_topic_name(name);
     let existing: Option<String> = transaction
         .query_row(
@@ -3222,13 +3353,16 @@ fn ensure_topic(
     if let Some(id) = existing {
         return Ok(id);
     }
-    let id = Uuid::new_v4().to_string();
+    let id = entry
+        .map(|entry| entry.id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let stored_name = entry.map(|entry| entry.name.as_str()).unwrap_or(name);
     transaction.execute(
         "INSERT INTO topics(id,name,name_key,parent_id,description,created_at,updated_at)
          VALUES(?1,?2,?3,?4,'',?5,?6)",
         params![
             id,
-            name,
+            stored_name,
             name_key,
             parent_id,
             format_ts(now),
@@ -3420,13 +3554,14 @@ fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
         rating: row.get::<_, i64>(10)? as u8,
         rating_source: RatingSource::parse(&row.get::<_, String>(11)?)
             .unwrap_or(RatingSource::Manual),
-        answer_json: row.get(12)?,
-        before_state_json: row.get(13)?,
-        after_state_json: row.get(14)?,
-        state_revision: row.get::<_, i64>(15)? as u64,
-        short_term: row.get::<_, i64>(16)? != 0,
-        assist_json: row.get(17)?,
-        created_at: parse_ts(&row.get::<_, String>(18)?).map_err(to_sql_error)?,
+        question_revision: row.get(12)?,
+        answer_json: row.get(13)?,
+        before_state_json: row.get(14)?,
+        after_state_json: row.get(15)?,
+        state_revision: row.get::<_, i64>(16)? as u64,
+        short_term: row.get::<_, i64>(17)? != 0,
+        assist_json: row.get(18)?,
+        created_at: parse_ts(&row.get::<_, String>(19)?).map_err(to_sql_error)?,
     })
 }
 
@@ -3596,8 +3731,69 @@ fn migrate_connection(connection: &mut Connection, backups: &Path, from: i64) ->
              ALTER TABLE sessions ADD COLUMN goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL;",
         )?;
     }
+    if from < 9 {
+        // Question revisions let an edit distinguish "fixed a typo" from
+        // "asks a different thing". Attempts record the revision that was
+        // actually shown, so old answers are never silently attributed to new
+        // content. Columns are added idempotently: a partially migrated file
+        // must not fail on an already-present column.
+        add_column_if_missing(
+            &transaction,
+            "questions",
+            "revision",
+            "revision INTEGER NOT NULL DEFAULT 1",
+        )?;
+        add_column_if_missing(
+            &transaction,
+            "attempts",
+            "question_revision",
+            "question_revision INTEGER NOT NULL DEFAULT 1",
+        )?;
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Goal and Exam titles whose saved scope includes or excludes `topic_id`.
+fn topic_scope_references(connection: &Connection, topic_id: &str) -> Result<Vec<String>> {
+    let mut owners = Vec::new();
+    for (table, label) in [("exams", "試験"), ("goals", "目標")] {
+        let mut statement = connection.prepare(&format!("SELECT title,scope_json FROM {table}"))?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (title, scope_json) = row?;
+            let scope: ExamScope = serde_json::from_str(&scope_json).map_err(|error| {
+                StorageError::Validation(format!("{label}「{title}」の条件が不正です: {error}"))
+            })?;
+            let includes = scope
+                .groups
+                .iter()
+                .any(|group| group.topics.iter().any(|id| id == topic_id));
+            if includes || scope.exclude_topics.iter().any(|id| id == topic_id) {
+                owners.push(format!("{label}「{title}」"));
+            }
+        }
+    }
+    Ok(owners)
+}
+
+fn add_column_if_missing(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let present: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
+        [column],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        transaction.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+    }
     Ok(())
 }
 

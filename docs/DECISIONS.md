@@ -203,7 +203,10 @@
 - 同じ親の下でNFKC・小文字化・空白圧縮した名前が一致する場合だけ衝突として拒否する
 - 別の親の同名Topicは別ID。階層なしも許可する
 - Question JSONの `topics` は `/` 区切りパス。Import時に解決し、Workbook横断でIDを共有する
+- Exportは任意の `topicCatalog` に安定ID・表示名・親IDを保存する。再ImportはIDを優先し、
+  改名後も同じTopicへ割り当てる。catalogのない旧JSONはパス解決のみで、推測統合はしない
 - 親Topicの選択は解決時に子孫へ展開する。保存時に子孫を凍結しない
+- Goal/Exam Scopeが参照するTopic（include/exclude）は削除を拒否し、参照元を提示する
 
 ## 22. ScopeはExamの条件モデルを一般化して再利用する
 
@@ -224,9 +227,14 @@
 
 ## 24. AuthoringはIDを維持して前方更新する
 
-- 既存教材の保存は `local_id` を維持し、Note/Questionを行単位で突合する
-- 変更のないQuestionは `review_states` を保持。削除時のみFKカスケードで状態を消す
-- AttemptはQuestionへのFKを持たないため、削除後も履歴として残る
+- 既存教材の保存は `local_id` を維持し、Note/QuestionをIDで突合する
+- Note移動は先に移動先NoteとQuestionをupsertし、削除は最後に行う。移動だけで
+  `review_states` を失わない
+- 解説・ヒント・Topicだけの変更はFSRS状態とRevisionを保持する
+- 問題文・正解・選択肢・形式・Flashcardの表裏など学習対象が変わる変更はRevisionを進め、
+  `review_states` を同一Transactionで削除する。保存前にUIが対象問題を提示する
+- 削除したQuestionだけがFKカスケードで状態を失う。AttemptはQuestionへのFKを持たず、
+  回答時の `question_revision` を保ったまま履歴として残る
 - 学習中Workbookの編集は拒否する
 - 保存前にDomain ValidationとLinter、既存教材は `pre-edit` バックアップ
 - ContentはMarkdown文字列とContent JSON（数式・画像・コード）の両方を編集できる

@@ -219,6 +219,22 @@
 - 既存のEnded Sessionが削除済みQuestionを参照する場合、履歴はAttempt集計のみで問題本文は表示しない（元からの設計）
 - 教材Exportの上限はImportと同じ10MB。大容量画像を含む教材は複数ファイルに分ける必要がある
 
+## 監査修正（2026-11-11）
 
+### 修正
+- F-01: Note移動時に先にNoteを削除して `notes → questions → review_states` をカスケードしていた。
+  Note作成 → Question移動 → 不要Question削除 → 不要Note削除の順に変更し、移動でFSRS状態を失わない
+- F-02: Questionの意味が変わる編集をRevision Policyで扱う。解説・ヒント・Topicのみは状態維持、
+  問題文・正解・選択肢・形式・Flashcardの表裏はRevisionを進めてFSRS状態をリセットする。
+  保存前にUIが対象問題を提示し、Attemptには回答時の `question_revision` を保存する
+- F-03: Goal/Exam Scope（include/exclude Topics）から参照中のTopic削除を拒否し、参照元を表示する
+- F-04: JSON Exportに任意の `topicCatalog`（安定ID・名前・親ID）を追加。再ImportはIDを優先し、
+  改名後も同じTopicへ割り当てる。catalogのない旧JSONはパス解決のみで推測統合しない
+- F-05: 時間予算選択が予算超過の候補で打ち切られず、残り時間に収まる後続候補を検討する
+- F-06: schema v5の実スキーマを使ったMigrationテストを追加（Exam/Session/Attempt/FSRS/画像、
+  integrity_check、再実行、部分移行のRollback、非DBファイルの拒否）
+- F-07: `docs/WORKBOOK-2.5-PROGRESS.md` のEOF空行を修正
 
-
+### Schema
+- v9: `questions.revision`（既定1）と `attempts.question_revision`（既定1）を追加
+- 既存データのFSRS-7、Attempt、Exam、Session、画像は変更しない

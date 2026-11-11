@@ -11,6 +11,7 @@ pub mod exam;
 pub mod goal;
 pub mod grading;
 pub mod question_format;
+pub mod revision;
 pub mod session;
 pub mod settings;
 pub mod topic;
@@ -40,6 +41,7 @@ pub use question_format::{
     NumericAnswerSpec, NumericLiteral, OrderingAnswerSpec, inspect_image, known_unit,
     normalize_unit, parse_numeric_answer, validate_relative_asset_path,
 };
+pub use revision::{QuestionChange, classify_question_change, resolved_revision};
 pub use session::{
     CardState, Mode, Phase, Rating, RatingSource, SessionItemStatus, SessionStatus, StoredCard,
 };
@@ -49,6 +51,6 @@ pub use topic::{
     normalize_topic_name, parse_topic_path, topic_path, validate_topic_name,
 };
 pub use workbook::{
-    ChoiceOption, MAX_JSON_BYTES, Note, Question, QuestionType, ValidationError, Workbook,
-    parse_workbook, parse_workbook_value,
+    ChoiceOption, MAX_JSON_BYTES, Note, Question, QuestionType, TopicCatalogEntry, ValidationError,
+    Workbook, parse_workbook, parse_workbook_value,
 };

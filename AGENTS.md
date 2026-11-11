@@ -41,6 +41,8 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 ## Scheduling Invariants
 
 - Commit FSRS state, Attempt, Session, item status, note introduction, and sibling bury in one transaction.
+- Moving a Question to another Note never drops its FSRS state. Create the target Note, upsert the Question, then delete removed rows.
+- A semantic Question edit (prompt, answer, options, format, Flashcard target) advances `questions.revision` and deletes that Question's `review_states` in the same transaction. Explanation/hint/topic edits keep state. Attempts keep the `question_revision` they were answered under.
 - Corrections update the current Attempt; never append a new Attempt.
 - Automatic rating is conservative: wrong/unknown → Again, hinted correct → Hard, unhinted correct → Good. Never auto-assign Easy. Ungraded questions fall back to manual.
 - Persist `attempts.rating_source` as automatic/manual. An automatic commit must be atomic with evaluation.
@@ -51,6 +53,8 @@ Use `workbook_scheduler::FixedClock` for all scheduling tests. Do not wait on re
 - Time budgets select an item list; they are never a hard timer. Do not auto-finish an in-progress answer or mark unfitted reviews complete. Unselected items stay due.
 - Scope and Goal planning reuse the existing planner and FSRS. Do not create a second memory model.
 - Selecting a parent Topic includes its descendants at resolution time. Never merge Topics by name alone; identity is the stable ID.
+- Export `topicCatalog` IDs and resolve them first on import, so a renamed Topic keeps its identity. Do not guess identity for JSON without a catalog.
+- Refuse to delete a Topic referenced by a Goal/Exam scope (included or excluded) and name the owner.
 
 ## Authoring Invariants
 

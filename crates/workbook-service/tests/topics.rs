@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};
 use tempfile::TempDir;
-use workbook_domain::{ExamScope, ExamScopeGroup, Mode, Phase};
+use workbook_domain::{ExamDraft, ExamScope, ExamScopeGroup, GoalDraft, Mode, Phase};
 use workbook_scheduler::FixedClock;
 use workbook_service::WorkbookService;
 
@@ -88,6 +88,39 @@ impl Harness {
             ]),
         );
         (a, b)
+    }
+
+    fn topic_scope(&self, topic_id: &str) -> ExamScope {
+        ExamScope {
+            groups: vec![ExamScopeGroup {
+                workbook_ids: Vec::new(),
+                tags: Vec::new(),
+                topics: vec![topic_id.to_string()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn goal_draft(&self, scope: ExamScope) -> GoalDraft {
+        GoalDraft {
+            title: "参照された目標".to_string(),
+            description: None,
+            target_date: None,
+            target_score: None,
+            daily_minutes: 30,
+            scope,
+        }
+    }
+
+    fn exam_draft(&self, scope: ExamScope) -> ExamDraft {
+        ExamDraft {
+            title: "参照された試験".to_string(),
+            description: None,
+            target_date: None,
+            target_score: None,
+            daily_minutes: 30,
+            scope,
+        }
     }
 
     fn math_scope(&self) -> ExamScope {
@@ -319,4 +352,266 @@ fn a_due_short_term_card_can_be_reviewed_inside_a_scope() {
     let review = harness.service.active_view().unwrap().unwrap();
     assert_eq!(review.mode, Mode::Review);
     assert!(review.progress.total >= 1);
+}
+
+#[test]
+fn deleting_a_topic_used_by_a_goal_is_refused_and_names_the_goal() {
+    let harness = Harness::new();
+    harness.import_two_books();
+    let grammar = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "英語 / 文法")
+        .unwrap();
+    let goal = harness
+        .service
+        .create_goal(harness.goal_draft(harness.topic_scope(&grammar.id)))
+        .unwrap();
+    let error = harness.service.delete_topic(&grammar.id).unwrap_err();
+    assert!(error.to_string().contains("目標「参照された目標」"));
+    // The failed delete changed nothing.
+    assert!(
+        harness
+            .service
+            .topics()
+            .unwrap()
+            .iter()
+            .any(|topic| topic.id == grammar.id)
+    );
+    assert_eq!(
+        harness
+            .service
+            .scope_preview(&harness.topic_scope(&grammar.id))
+            .unwrap()
+            .total,
+        1
+    );
+    harness.service.delete_goal(&goal).unwrap();
+    harness.service.delete_topic(&grammar.id).unwrap();
+}
+
+#[test]
+fn deleting_a_topic_used_by_an_exam_is_refused() {
+    let harness = Harness::new();
+    harness.import_two_books();
+    let quadratic = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 二次関数")
+        .unwrap();
+    let exam = harness
+        .service
+        .create_exam(harness.exam_draft(harness.topic_scope(&quadratic.id)))
+        .unwrap();
+    let error = harness.service.delete_topic(&quadratic.id).unwrap_err();
+    assert!(error.to_string().contains("試験「参照された試験」"));
+    harness.service.delete_exam(&exam).unwrap();
+    harness.service.delete_topic(&quadratic.id).unwrap();
+}
+
+#[test]
+fn an_excluded_topic_is_protected_from_deletion() {
+    let harness = Harness::new();
+    harness.import_two_books();
+    let linear = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .unwrap();
+    let math = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学")
+        .unwrap();
+    let mut scope = harness.topic_scope(&math.id);
+    scope.exclude_topics = vec![linear.id.clone()];
+    let goal = harness
+        .service
+        .create_goal(harness.goal_draft(scope))
+        .unwrap();
+    let error = harness.service.delete_topic(&linear.id).unwrap_err();
+    assert!(error.to_string().contains("目標「参照された目標」"));
+    // The topic and its two question assignments are intact.
+    let topic = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.id == linear.id)
+        .unwrap();
+    assert_eq!(topic.question_count, 2);
+    harness.service.delete_goal(&goal).unwrap();
+}
+
+#[test]
+fn reimporting_a_file_exported_before_a_rename_keeps_the_topic_id() {
+    let harness = Harness::new();
+    let (book, _) = harness.import_two_books();
+    let exported = harness.service.export_workbook_json(&book).unwrap();
+    let linear = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .unwrap();
+    let math = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学")
+        .unwrap();
+    harness
+        .service
+        .update_topic(&linear.id, "一次関数（改）", Some(&math.id), "")
+        .unwrap();
+    let reimported = harness.service.import_workbook_json(&exported).unwrap();
+    assert_ne!(reimported, book);
+    let topics = harness.service.topics().unwrap();
+    let renamed = topics
+        .iter()
+        .find(|topic| topic.id == linear.id)
+        .expect("renamed topic keeps its ID");
+    assert_eq!(renamed.path, "数学 / 一次関数（改）");
+    // Original q1, the reimported q1, and book B's q4 all share the ID.
+    assert_eq!(renamed.question_count, 3);
+    // The stale display name did not create a second topic.
+    assert!(!topics.iter().any(|topic| topic.path == "数学 / 一次関数"));
+    assert_eq!(
+        harness
+            .service
+            .scope_preview(&harness.math_scope())
+            .unwrap()
+            .total,
+        5
+    );
+}
+
+#[test]
+fn export_and_import_preserve_topic_ids_and_goal_scopes() {
+    let harness = Harness::new();
+    let (book, _) = harness.import_two_books();
+    let before = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .unwrap();
+    let scope = harness.topic_scope(&before.id);
+    let goal = harness
+        .service
+        .create_goal(harness.goal_draft(scope.clone()))
+        .unwrap();
+    let exported = harness.service.export_workbook_json(&book).unwrap();
+    let reimported = harness.service.import_workbook_json(&exported).unwrap();
+    assert_ne!(reimported, book);
+    let after = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.question_count, 3);
+    // The saved goal still resolves both copies without any ID rewrite.
+    assert_eq!(harness.service.scope_preview(&scope).unwrap().total, 3);
+    assert_eq!(harness.service.goal(&goal).unwrap().id, goal);
+}
+
+#[test]
+fn moving_a_topic_to_a_new_parent_keeps_its_id() {
+    let harness = Harness::new();
+    harness.import_two_books();
+    let linear = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .unwrap();
+    let english = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "英語")
+        .unwrap();
+    harness
+        .service
+        .update_topic(&linear.id, "一次関数", Some(&english.id), "")
+        .unwrap();
+    let moved = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.id == linear.id)
+        .unwrap();
+    assert_eq!(moved.path, "英語 / 一次関数");
+    assert_eq!(moved.question_count, 2);
+}
+
+#[test]
+fn a_legacy_file_without_a_topic_catalog_never_merges_by_guess() {
+    let harness = Harness::new();
+    let raw = serde_json::json!({
+        "format": "workbook",
+        "schemaVersion": 2,
+        "id": "legacy-path",
+        "revision": 1,
+        "title": "旧JSON",
+        "description": "",
+        "language": "ja",
+        "tags": [],
+        "notes": [{
+            "id": "n1",
+            "title": "単元",
+            "knowledgeCard": "カード",
+            "questions": [
+                {"id":"q1","revision":1,"type":"true_false","prompt":"一次関数","answer":true,"explanation":"e","topics":["数学/一次関数"]}
+            ]
+        }]
+    })
+    .to_string();
+    let first = harness.service.import_workbook_json(&raw).unwrap();
+    let original = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .unwrap();
+    let math = harness
+        .service
+        .topics()
+        .unwrap()
+        .into_iter()
+        .find(|topic| topic.path == "数学")
+        .unwrap();
+    harness
+        .service
+        .update_topic(&original.id, "一次関数（新）", Some(&math.id), "")
+        .unwrap();
+    // The old file has no stable IDs, so the old name cannot be proven to mean
+    // the renamed topic. A new topic is created instead of merging silently.
+    harness.service.import_workbook_json(&raw).unwrap();
+    let topics = harness.service.topics().unwrap();
+    let renamed = topics.iter().find(|topic| topic.id == original.id).unwrap();
+    let legacy = topics
+        .iter()
+        .find(|topic| topic.path == "数学 / 一次関数")
+        .expect("legacy path resolves without guessing");
+    assert_ne!(renamed.id, legacy.id);
+    assert!(harness.service.workbook(&first).is_ok());
 }

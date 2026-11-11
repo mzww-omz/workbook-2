@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
-use workbook_domain::{Mode, Phase};
+use workbook_domain::{Content, Mode, Phase, QuestionType};
 use workbook_scheduler::FixedClock;
 use workbook_service::WorkbookService;
 
@@ -34,6 +34,14 @@ impl Harness {
         let connection =
             rusqlite::Connection::open(self._dir.path().join("workbook.sqlite")).unwrap();
         connection.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn save(
+        &self,
+        book: &str,
+        model: &workbook_domain::Workbook,
+    ) -> workbook_service::SavedWorkbook {
+        self.service.save_workbook(Some(book), model, true).unwrap()
     }
 
     fn learn_one(&self, book: &str) {
@@ -84,8 +92,60 @@ fn workbook() -> serde_json::Value {
     })
 }
 
+fn two_note_workbook() -> serde_json::Value {
+    serde_json::json!({
+        "format": "workbook",
+        "schemaVersion": 2,
+        "id": "move-note",
+        "revision": 1,
+        "title": "Note移動",
+        "description": "",
+        "language": "ja",
+        "tags": [],
+        "notes": [
+            {
+                "id": "n1",
+                "title": "移動元",
+                "knowledgeCard": "カード",
+                "questions": [
+                    {"id":"q1","revision":1,"type":"true_false","prompt":"移動する問題","answer":true,"explanation":"解説"}
+                ]
+            },
+            {
+                "id": "n2",
+                "title": "移動先",
+                "knowledgeCard": "カード",
+                "questions": [
+                    {"id":"q2","revision":1,"type":"true_false","prompt":"残る問題","answer":true,"explanation":"解説"}
+                ]
+            }
+        ]
+    })
+}
+
+fn flashcard_workbook() -> serde_json::Value {
+    serde_json::json!({
+        "format": "workbook",
+        "schemaVersion": 2,
+        "id": "flashcards",
+        "revision": 1,
+        "title": "単語",
+        "description": "",
+        "language": "ja",
+        "tags": [],
+        "notes": [{
+            "id": "n1",
+            "title": "カード",
+            "knowledgeCard": "カード",
+            "questions": [
+                {"id":"f1","revision":1,"type":"flashcard","front":"apple","back":"りんご","explanation":"果物"}
+            ]
+        }]
+    })
+}
+
 #[test]
-fn editing_preserves_question_ids_fsrs_state_and_attempts() {
+fn editing_text_and_topics_preserves_question_ids_fsrs_state_and_attempts() {
     let harness = Harness::new();
     let book = harness.import(&workbook().to_string());
     harness.learn_one(&book);
@@ -98,18 +158,23 @@ fn editing_preserves_question_ids_fsrs_state_and_attempts() {
         .iter_mut()
         .find(|question| question.id == "q1")
         .unwrap();
-    question.prompt = Some(workbook_domain::Content::Text("更新した問題文".to_string()));
-    let saved = harness.service.save_workbook(Some(&book), &model).unwrap();
+    question.explanation = Content::Text("補足した解説".to_string());
+    question.hint = Some(Content::Text("改善したヒント".to_string()));
+    question.topics = vec!["数学/二次関数".to_string()];
+    let saved = harness.save(&book, &model);
     assert_eq!(saved.local_id, book);
     assert_eq!(saved.workbook.revision, 2);
+    assert_eq!(saved.workbook.notes[0].questions[0].revision, 1);
+    assert!(saved.reset_questions.is_empty());
     assert_eq!(harness.count("SELECT COUNT(*) FROM review_states"), 1);
     assert_eq!(harness.count("SELECT COUNT(*) FROM attempts"), attempts);
     let reloaded = harness.service.workbook(&book).unwrap();
     assert_eq!(reloaded.title, "編集後の教材");
     assert_eq!(
-        reloaded.notes[0].questions[0].prompt_text(),
-        "更新した問題文"
+        reloaded.notes[0].questions[0].explanation,
+        Content::Text("補足した解説".to_string())
     );
+    assert_eq!(reloaded.notes[0].questions[0].topics, ["数学/二次関数"]);
     assert!(
         std::fs::read_dir(harness._dir.path().join("backups"))
             .unwrap()
@@ -118,6 +183,84 @@ fn editing_preserves_question_ids_fsrs_state_and_attempts() {
                 .file_name()
                 .to_string_lossy()
                 .starts_with("pre-edit-"))
+    );
+}
+
+#[test]
+fn moving_a_learned_question_to_another_note_keeps_its_fsrs_state_and_attempts() {
+    let harness = Harness::new();
+    let book = harness.import(&two_note_workbook().to_string());
+    harness.learn_one(&book);
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
+        1
+    );
+    let attempts = harness.count("SELECT COUNT(*) FROM attempts");
+    let mut model = harness.service.workbook(&book).unwrap();
+    // q1 moves into n2. n1 is then removed entirely.
+    let question = model.notes[0].questions.remove(0);
+    assert_eq!(question.id, "q1");
+    model.notes.remove(0);
+    model.notes[0].questions.push(question);
+    let saved = harness.save(&book, &model);
+    assert!(saved.reset_questions.is_empty());
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
+        1
+    );
+    assert_eq!(harness.count("SELECT COUNT(*) FROM attempts"), attempts);
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM notes WHERE note_id='n1'"),
+        0
+    );
+    let note_id: String = {
+        let connection =
+            rusqlite::Connection::open(harness._dir.path().join("workbook.sqlite")).unwrap();
+        connection
+            .query_row(
+                "SELECT note_id FROM questions WHERE question_id='q1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(note_id, "n2");
+    let reloaded = harness.service.workbook(&book).unwrap();
+    assert_eq!(reloaded.notes.len(), 1);
+    assert_eq!(reloaded.notes[0].id, "n2");
+    assert!(
+        reloaded.notes[0]
+            .questions
+            .iter()
+            .any(|question| question.id == "q1")
+    );
+}
+
+#[test]
+fn moving_a_question_does_not_hide_a_semantic_edit() {
+    let harness = Harness::new();
+    let book = harness.import(&two_note_workbook().to_string());
+    harness.learn_one(&book);
+    let mut model = harness.service.workbook(&book).unwrap();
+    let mut question = model.notes[0].questions.remove(0);
+    question.answer = Some(serde_json::json!(false));
+    model.notes.remove(0);
+    model.notes[0].questions.push(question);
+    let plan = harness
+        .service
+        .preview_workbook_save(&book, &model)
+        .unwrap();
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].question_id, "q1");
+    let saved = harness.save(&book, &model);
+    assert_eq!(saved.reset_questions.len(), 1);
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
+        0
+    );
+    assert_eq!(
+        harness.count("SELECT revision FROM questions WHERE question_id='q1'"),
+        2
     );
 }
 
@@ -131,7 +274,7 @@ fn removing_a_question_deletes_its_fsrs_state_but_keeps_attempt_history() {
     model.notes[0]
         .questions
         .retain(|question| question.id != "q1");
-    harness.service.save_workbook(Some(&book), &model).unwrap();
+    harness.save(&book, &model);
     assert_eq!(
         harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
         0
@@ -144,12 +287,193 @@ fn removing_a_question_deletes_its_fsrs_state_but_keeps_attempt_history() {
 }
 
 #[test]
+fn changing_the_answer_requires_confirmation_and_resets_fsrs_state() {
+    let harness = Harness::new();
+    let book = harness.import(&workbook().to_string());
+    harness.learn_one(&book);
+    let attempts = harness.count("SELECT COUNT(*) FROM attempts");
+    assert_eq!(
+        harness.count("SELECT question_revision FROM attempts LIMIT 1"),
+        1
+    );
+    let mut model = harness.service.workbook(&book).unwrap();
+    let question = model.notes[0]
+        .questions
+        .iter_mut()
+        .find(|question| question.id == "q1")
+        .unwrap();
+    question.answer = Some(serde_json::json!(false));
+    let error = harness
+        .service
+        .save_workbook(Some(&book), &model, false)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        workbook_service::ServiceError::ResetRequired(_)
+    ));
+    // Nothing changed before confirmation.
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
+        1
+    );
+    let plan = harness
+        .service
+        .preview_workbook_save(&book, &model)
+        .unwrap();
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].question_id, "q1");
+    assert_eq!(plan[0].previous_revision, 1);
+    assert_eq!(plan[0].next_revision, 2);
+
+    let saved = harness.save(&book, &model);
+    assert_eq!(saved.reset_questions.len(), 1);
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
+        0
+    );
+    assert_eq!(harness.count("SELECT COUNT(*) FROM attempts"), attempts);
+    assert_eq!(
+        harness.count("SELECT question_revision FROM attempts LIMIT 1"),
+        1
+    );
+    assert_eq!(
+        harness.count("SELECT revision FROM questions WHERE question_id='q1'"),
+        2
+    );
+    let reloaded = harness.service.workbook(&book).unwrap();
+    let question = reloaded.notes[0]
+        .questions
+        .iter()
+        .find(|question| question.id == "q1")
+        .unwrap();
+    assert_eq!(question.revision, 2);
+    assert_eq!(question.answer, Some(serde_json::json!(false)));
+}
+
+#[test]
+fn changing_question_format_or_flashcard_target_resets_old_state() {
+    let harness = Harness::new();
+    let book = harness.import(&workbook().to_string());
+    harness.learn_one(&book);
+    let mut model = harness.service.workbook(&book).unwrap();
+    let question = model.notes[0]
+        .questions
+        .iter_mut()
+        .find(|question| question.id == "q1")
+        .unwrap();
+    question.kind = QuestionType::Flashcard;
+    question.prompt = None;
+    question.answer = None;
+    question.front = Some(Content::Text("表".to_string()));
+    question.back = Some(Content::Text("裏".to_string()));
+    let saved = harness.save(&book, &model);
+    assert_eq!(saved.reset_questions.len(), 1);
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
+        0
+    );
+
+    let flash_harness = Harness::new();
+    let flash_book = flash_harness.import(&flashcard_workbook().to_string());
+    flash_harness.learn_flashcard(&flash_book);
+    assert_eq!(
+        flash_harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='f1'"),
+        1
+    );
+    let mut model = flash_harness.service.workbook(&flash_book).unwrap();
+    model.notes[0].questions[0].back = Some(Content::Text("果物（英語）".to_string()));
+    let saved = flash_harness.save(&flash_book, &model);
+    assert_eq!(saved.reset_questions.len(), 1);
+    assert_eq!(
+        flash_harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='f1'"),
+        0
+    );
+}
+
+impl Harness {
+    fn learn_flashcard(&self, book: &str) {
+        self.service.start_session(Mode::New, Some(book)).unwrap();
+        let mut view = self.service.active_view().unwrap().unwrap();
+        if view.phase == Phase::Intro {
+            view = self
+                .service
+                .begin_question(&view.session_id, view.revision)
+                .unwrap();
+        }
+        let revealed = self
+            .service
+            .save_draft(&view.session_id, None, false, true, view.revision)
+            .unwrap();
+        let evaluated = self
+            .service
+            .evaluate_answer(
+                &revealed.session_id,
+                Some(&workbook_domain::Answer::Bool(true)),
+                false,
+                Some(true),
+                false,
+                revealed.revision,
+            )
+            .unwrap();
+        let committed = self
+            .service
+            .commit_rating(
+                &evaluated.session_id,
+                "flashcard-attempt-1",
+                workbook_domain::Rating::Good,
+                evaluated.revision,
+            )
+            .unwrap();
+        self.service
+            .finish(&committed.session_id, committed.revision)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_failed_edit_rolls_back_notes_questions_and_fsrs_state() {
+    let harness = Harness::new();
+    let book = harness.import(&workbook().to_string());
+    harness.learn_one(&book);
+    let attempts = harness.count("SELECT COUNT(*) FROM attempts");
+    {
+        let connection =
+            rusqlite::Connection::open(harness._dir.path().join("workbook.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_topic_assign BEFORE INSERT ON question_topics
+                 BEGIN SELECT RAISE(ABORT,'injected failure'); END;",
+            )
+            .unwrap();
+    }
+    let mut model = harness.service.workbook(&book).unwrap();
+    model.title = "失敗する編集".to_string();
+    model.notes[0].questions[0].prompt = Some(Content::Text("変更".to_string()));
+    let error = harness
+        .service
+        .save_workbook(Some(&book), &model, true)
+        .unwrap_err();
+    assert!(error.to_string().contains("SQLite") || error.to_string().contains("injected"));
+    let reloaded = harness.service.workbook(&book).unwrap();
+    assert_eq!(reloaded.title, "編集テスト");
+    assert_eq!(
+        harness.count("SELECT COUNT(*) FROM review_states WHERE question_id='q1'"),
+        1
+    );
+    assert_eq!(harness.count("SELECT COUNT(*) FROM attempts"), attempts);
+    assert_eq!(
+        harness.count("SELECT revision FROM questions WHERE question_id='q1'"),
+        1
+    );
+}
+
+#[test]
 fn creating_a_new_workbook_adds_it_to_the_library() {
     let harness = Harness::new();
     let mut model = workbook_domain::parse_workbook(&workbook().to_string()).unwrap();
     model.id = "new-book".to_string();
     model.title = "新しい教材".to_string();
-    let saved = harness.service.save_workbook(None, &model).unwrap();
+    let saved = harness.service.save_workbook(None, &model, false).unwrap();
     assert_eq!(harness.service.snapshot().unwrap().books.len(), 1);
     assert_eq!(
         harness.service.workbook(&saved.local_id).unwrap().title,
@@ -191,6 +515,11 @@ fn export_embeds_assets_as_base64_and_restores_topic_paths() {
         value["notes"][0]["questions"][0]["topics"][0],
         "数学/一次関数"
     );
+    assert!(value["topicCatalog"].as_array().is_some_and(|catalog| {
+        catalog
+            .iter()
+            .any(|entry| entry["name"] == "一次関数" && entry["id"].is_string())
+    }));
     // The exported JSON must be importable again with the same topic path.
     let reimported = harness.service.import_workbook_json(&exported).unwrap();
     assert_ne!(reimported, book);
@@ -278,7 +607,7 @@ fn editing_is_refused_while_that_workbook_has_an_active_session() {
     model.title = "学習中に変更".to_string();
     let error = harness
         .service
-        .save_workbook(Some(&book), &model)
+        .save_workbook(Some(&book), &model, false)
         .unwrap_err();
     assert!(error.to_string().contains("学習中"));
 }
@@ -296,7 +625,7 @@ fn editing_a_workbook_keeps_its_last_used_and_import_time() {
         .and_then(|item| item.last_used_at);
     let mut model = harness.service.workbook(&book).unwrap();
     model.title = "更新".to_string();
-    harness.service.save_workbook(Some(&book), &model).unwrap();
+    harness.save(&book, &model);
     let after = harness.service.snapshot().unwrap();
     let after_last = after
         .books

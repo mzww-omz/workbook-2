@@ -299,7 +299,7 @@ impl WorkbookApp {
                     .gap_2()
                     .child(format!("「{name}」を削除します。"))
                     .child("問題・学習履歴・FSRS状態は削除されません。このTopicへの割当だけが外れます。")
-                    .child("子Topicがある場合は削除できません。先に子Topicを移動してください。")
+                    .child("子Topicや、Goal・Examの条件から参照されている場合は削除できません。先に移動または条件を変更してください。")
                     .into_any_element(),
                 div()
                     .flex()
@@ -352,6 +352,62 @@ impl WorkbookApp {
                             .danger()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.confirm_delete_goal(id.clone(), cx);
+                            })),
+                    )
+                    .into_any_element(),
+            ),
+            Modal::ResetFsrs { questions } => (
+                "学習内容が変わった問題があります".to_string(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!(
+                        "{}問の問題文・正解・形式・選択肢などが変わっています。",
+                        questions.len()
+                    ))
+                    .child(
+                        "これらの問題は新しいQuestion Revisionとして扱い、以前のFSRS状態を引き継ぎません。回答履歴は削除されません。",
+                    )
+                    .child(
+                        questions
+                            .iter()
+                            .take(5)
+                            .map(|question| {
+                                format!(
+                                    "・{}（rev {} → {}）",
+                                    if question.prompt.is_empty() {
+                                        question.question_id.clone()
+                                    } else {
+                                        question.prompt.clone()
+                                    },
+                                    question.previous_revision,
+                                    question.next_revision
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                    .into_any_element(),
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("modal-reset-fsrs-cancel")
+                            .label("編集に戻る")
+                            .secondary()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = None;
+                                this.fsrs_reset_confirmed = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("modal-reset-fsrs-confirm")
+                            .label("リセットして保存")
+                            .danger()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_fsrs_reset(window, cx);
                             })),
                     )
                     .into_any_element(),

@@ -8,10 +8,11 @@ use workbook_domain::{
     Answer, AssetContent, AssetRef, AssistState, CardState, Content, Exam, ExamCatalogQuestion,
     ExamDraft, ExamScope, Goal, GoalDraft, GoalSource, GradeResult, GradeStatus, MAX_JSON_BYTES,
     MAX_TOTAL_ASSET_BYTES, MockOptions, Mode, NearMissReason, NearMissRecord, Phase,
-    PracticeOptions, PracticeStrategy, Question, QuestionType, Rating, RatingSource,
-    SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting, Workbook,
-    answer_is_blank, automatic_rating, encode_base64, expand_topic_ids, grade_answer_detailed,
-    inspect_image, parse_workbook, resolve_scope,
+    PracticeOptions, PracticeStrategy, Question, QuestionChange, QuestionType, Rating,
+    RatingSource, SessionItemStatus, SessionStatus, Settings, StudyCalendar, ThemeSetting,
+    TopicCatalogEntry, Workbook, answer_is_blank, automatic_rating, classify_question_change,
+    encode_base64, expand_topic_ids, grade_answer_detailed, inspect_image, parse_workbook,
+    resolve_scope, resolved_revision,
 };
 use workbook_import::{LegacyPlan, LegacyPreview};
 use workbook_scheduler::{
@@ -43,6 +44,8 @@ pub enum ServiceError {
     Conflict(String),
     #[error("見つかりません: {0}")]
     NotFound(String),
+    #[error("学習内容が変わる問題が{}件あります。保存内容を確認してください", .0.len())]
+    ResetRequired(Vec<QuestionRevisionPlan>),
 }
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
@@ -428,6 +431,19 @@ pub struct GoalTopicStat {
 pub struct SavedWorkbook {
     pub local_id: String,
     pub workbook: Workbook,
+    /// Questions whose study content changed during this save. Their previous
+    /// FSRS state was reset; attempts are preserved.
+    pub reset_questions: Vec<QuestionRevisionPlan>,
+}
+
+/// A question edit that changes what the learner is asked to remember.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionRevisionPlan {
+    pub note_id: String,
+    pub question_id: String,
+    pub prompt: String,
+    pub previous_revision: i64,
+    pub next_revision: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -702,41 +718,68 @@ impl WorkbookService {
 
     // ---- authoring ------------------------------------------------------
 
+    /// Reports question edits that would reset FSRS state for an existing
+    /// workbook. The UI shows this before saving. A new question, a note move,
+    /// an explanation edit, or a topic change produces no reset.
+    pub fn preview_workbook_save(
+        &self,
+        local_id: &str,
+        workbook: &Workbook,
+    ) -> Result<Vec<QuestionRevisionPlan>> {
+        workbook.validate()?;
+        let storage = self.storage()?;
+        let stored = storage.workbook(local_id)?;
+        Ok(plan_question_revisions(&stored, workbook))
+    }
+
     /// Saves a manually authored workbook. Existing workbooks keep their
     /// `local_id` and every unchanged Note/Question ID, so FSRS states and
-    /// attempts survive asset, text, and topic edits. A safety backup is made
-    /// before replacing an existing workbook.
+    /// attempts survive note moves, explanation, hint, asset, and topic edits.
+    /// A safety backup is made before replacing an existing workbook.
+    ///
+    /// A change to the study content of a question starts a new revision and
+    /// resets that question's FSRS state. Callers must pass `confirm_reset`
+    /// only after showing `preview_workbook_save` to the user.
     pub fn save_workbook(
         &self,
         local_id: Option<&str>,
         workbook: &Workbook,
+        confirm_reset: bool,
     ) -> Result<SavedWorkbook> {
         workbook.validate()?;
         let mut storage = self.storage()?;
         let mut workbook = workbook.clone();
         let assets = resolve_assets_for_save(&storage, local_id, &workbook)?;
         let now = self.clock.now();
-        if let Some(local_id) = local_id {
-            if storage.has_active_session_for_workbook(local_id)? {
-                return Err(ServiceError::Conflict(
-                    "この教材の学習中は編集できません。先にSessionを終了してください".to_string(),
-                ));
-            }
-            let stored = storage.workbook(local_id)?;
-            workbook.revision = stored.revision.saturating_add(1).max(workbook.revision);
-            self.write_action_backup(&storage, "pre-edit")?;
-            storage.update_workbook_content(local_id, &workbook, &assets, now)?;
-            Ok(SavedWorkbook {
-                local_id: local_id.to_string(),
-                workbook,
-            })
-        } else {
+        let Some(local_id) = local_id else {
             let new_id = storage.import_workbook(&workbook, &assets, now)?;
-            Ok(SavedWorkbook {
+            return Ok(SavedWorkbook {
                 local_id: new_id,
                 workbook,
-            })
+                reset_questions: Vec::new(),
+            });
+        };
+        if storage.has_active_session_for_workbook(local_id)? {
+            return Err(ServiceError::Conflict(
+                "この教材の学習中は編集できません。先にSessionを終了してください".to_string(),
+            ));
         }
+        let stored = storage.workbook(local_id)?;
+        let resets = plan_question_revisions(&stored, &workbook);
+        if !resets.is_empty() && !confirm_reset {
+            return Err(ServiceError::ResetRequired(resets));
+        }
+        apply_question_revisions(&stored, &mut workbook, &resets);
+        workbook.revision = stored.revision.saturating_add(1).max(workbook.revision);
+        let reset_ids: BTreeSet<String> =
+            resets.iter().map(|plan| plan.question_id.clone()).collect();
+        self.write_action_backup(&storage, "pre-edit")?;
+        storage.update_workbook_content(local_id, &workbook, &assets, &reset_ids, now)?;
+        Ok(SavedWorkbook {
+            local_id: local_id.to_string(),
+            workbook,
+            reset_questions: resets,
+        })
     }
 
     /// Creates an independent copy. Question IDs inside the copy are unchanged,
@@ -2263,6 +2306,7 @@ impl WorkbookService {
         let assist_json = bundle.session.assist_json.clone();
         let before_json = before.as_ref().map(serde_json::to_string).transpose()?;
         let after_json = card.as_ref().map(serde_json::to_string).transpose()?;
+        let question_revision = storage.question_revision(&item.workbook_id, &item.question_id)?;
         let attempt = AttemptRow {
             id: attempt_id.to_string(),
             session_id: bundle.session.id.clone(),
@@ -2276,6 +2320,7 @@ impl WorkbookService {
             elapsed_ms: bundle.session.question_elapsed_ms,
             rating: rating.value(),
             rating_source,
+            question_revision,
             answer_json,
             before_state_json: before_json,
             after_state_json: after_json,
@@ -3959,6 +4004,68 @@ fn shuffle_candidates(candidates: &mut [SessionCandidate], seed: u64) {
     }
 }
 
+fn plan_question_revisions(stored: &Workbook, next: &Workbook) -> Vec<QuestionRevisionPlan> {
+    // Match by question ID alone: a question may have moved to another note,
+    // and that must not hide a change to its answer or prompt.
+    let previous: BTreeMap<&str, &Question> = stored
+        .all_questions()
+        .map(|(_, question)| (question.id.as_str(), question))
+        .collect();
+    let mut plans = Vec::new();
+    for note in &next.notes {
+        for question in &note.questions {
+            let Some(old) = previous.get(question.id.as_str()) else {
+                continue;
+            };
+            if classify_question_change(old, question) != QuestionChange::StudyContent {
+                continue;
+            }
+            let prompt = question.prompt_text();
+            let prompt = if prompt.chars().count() > 80 {
+                format!("{}…", prompt.chars().take(80).collect::<String>())
+            } else {
+                prompt
+            };
+            plans.push(QuestionRevisionPlan {
+                note_id: note.id.clone(),
+                question_id: question.id.clone(),
+                prompt,
+                previous_revision: old.revision,
+                next_revision: resolved_revision(old, question, QuestionChange::StudyContent),
+            });
+        }
+    }
+    plans
+}
+
+/// Applies the planned revisions and keeps display-only edits on the existing
+/// revision. Questions that moved notes are matched by ID, not by note.
+fn apply_question_revisions(
+    stored: &Workbook,
+    next: &mut Workbook,
+    plans: &[QuestionRevisionPlan],
+) {
+    let mut previous: BTreeMap<String, i64> = BTreeMap::new();
+    for (_, question) in stored.all_questions() {
+        previous.insert(question.id.clone(), question.revision);
+    }
+    let planned: BTreeMap<&str, i64> = plans
+        .iter()
+        .map(|plan| (plan.question_id.as_str(), plan.next_revision))
+        .collect();
+    for note in &mut next.notes {
+        for question in &mut note.questions {
+            let Some(old_revision) = previous.get(&question.id).copied() else {
+                continue;
+            };
+            question.revision = planned
+                .get(question.id.as_str())
+                .copied()
+                .unwrap_or(old_revision);
+        }
+    }
+}
+
 fn hydrate_workbook_topics(
     storage: &Storage,
     local_id: &str,
@@ -3987,7 +4094,51 @@ fn hydrate_workbook_topics(
             question.topics.dedup();
         }
     }
+    workbook.topic_catalog = topic_catalog_entries(storage, &topics, local_id)?;
     Ok(())
+}
+
+/// Exports the stable topic IDs used by this workbook, including ancestors.
+/// A re-import after a topic rename resolves these IDs instead of creating a
+/// second topic from the old display name.
+fn topic_catalog_entries(
+    storage: &Storage,
+    topics: &[workbook_domain::Topic],
+    local_id: &str,
+) -> Result<Vec<TopicCatalogEntry>> {
+    let by_id: BTreeMap<&str, &workbook_domain::Topic> = topics
+        .iter()
+        .map(|topic| (topic.id.as_str(), topic))
+        .collect();
+    let mut used = BTreeSet::new();
+    for (workbook_id, _question_id, topic_id) in storage.question_topics()? {
+        if workbook_id != local_id {
+            continue;
+        }
+        let mut current = Some(topic_id.as_str());
+        while let Some(id) = current {
+            if !used.insert(id.to_string()) {
+                break;
+            }
+            current = by_id.get(id).and_then(|topic| topic.parent_id.as_deref());
+        }
+    }
+    let mut entries = used
+        .into_iter()
+        .filter_map(|id| by_id.get(id.as_str()).map(|topic| (*topic).clone()))
+        .map(|topic| TopicCatalogEntry {
+            id: topic.id,
+            name: topic.name,
+            parent_id: topic.parent_id,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        workbook_domain::topic_path(topics, &a.id)
+            .unwrap_or_default()
+            .cmp(&workbook_domain::topic_path(topics, &b.id).unwrap_or_default())
+            .then(a.id.cmp(&b.id))
+    });
+    Ok(entries)
 }
 
 fn resolve_assets_for_save(

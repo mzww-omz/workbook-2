@@ -475,6 +475,30 @@ fn format_number(value: f64) -> String {
     }
 }
 
+/// Optional stable Topic identity inside a workbook JSON.
+///
+/// Authored `Question.topics` remain human-readable paths. This catalog adds
+/// the stable SQLite topic ID for every level of the path, so re-importing a
+/// file after renaming a topic attaches questions to the same topic instead of
+/// creating a new one. Older files simply omit it and keep path-based
+/// resolution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TopicCatalogEntry {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+}
+
+impl TopicCatalogEntry {
+    fn validate(&self, path: &str) -> Result<(), ValidationError> {
+        validate_id(&self.id, &format!("{path}.id"))?;
+        crate::topic::validate_topic_name(&self.name, &format!("{path}.name"))?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Note {
@@ -498,6 +522,12 @@ pub struct Workbook {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assets: Vec<AssetRef>,
+    #[serde(
+        rename = "topicCatalog",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub topic_catalog: Vec<TopicCatalogEntry>,
     pub notes: Vec<Note>,
 }
 
@@ -604,6 +634,54 @@ impl Workbook {
                     format!("{path}.data"),
                     "埋め込み画像が大きすぎます",
                 ));
+            }
+        }
+        let mut catalog_ids = BTreeSet::new();
+        let mut catalog_siblings = BTreeSet::new();
+        for (index, entry) in self.topic_catalog.iter().enumerate() {
+            let path = format!("topicCatalog[{index}]");
+            entry.validate(&path)?;
+            if !catalog_ids.insert(entry.id.as_str()) {
+                return Err(ValidationError::new(
+                    format!("{path}.id"),
+                    "Topic IDが重複しています",
+                ));
+            }
+            let key = (
+                entry.parent_id.clone().unwrap_or_default(),
+                crate::topic::normalize_topic_name(&entry.name),
+            );
+            if !catalog_siblings.insert(key) {
+                return Err(ValidationError::new(
+                    format!("{path}.name"),
+                    "同じ親の下に同名のTopicがあります",
+                ));
+            }
+        }
+        for (index, entry) in self.topic_catalog.iter().enumerate() {
+            if let Some(parent) = entry.parent_id.as_deref()
+                && !catalog_ids.contains(parent)
+            {
+                return Err(ValidationError::new(
+                    format!("topicCatalog[{index}].parentId"),
+                    "親TopicがtopicCatalogにありません",
+                ));
+            }
+            let mut current = Some(entry.id.as_str());
+            let mut depth = 0usize;
+            while let Some(id) = current {
+                depth += 1;
+                if depth > crate::topic::MAX_TOPIC_DEPTH {
+                    return Err(ValidationError::new(
+                        "topicCatalog",
+                        "Topicの階層が深すぎます",
+                    ));
+                }
+                current = self
+                    .topic_catalog
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .and_then(|candidate| candidate.parent_id.as_deref());
             }
         }
         if self.notes.is_empty() {
