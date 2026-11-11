@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use tempfile::tempdir;
 use workbook_domain::StudyCalendar;
 use workbook_scheduler::{Clock, FixedClock};
-use workbook_service::{SAMPLE_WORKBOOK_JSON, WorkbookService};
+use workbook_service::{SAMPLE_WORKBOOK_JSON, SAMPLE_WORKBOOK_V2_JSON, WorkbookService};
 use workbook_storage::Storage;
 
 const TOPIC_SCHEMA: &str = r#"CREATE TABLE topics(
@@ -566,4 +566,282 @@ fn version_four_backup_without_daily_minutes_is_validated_and_upgraded() {
         .unwrap();
     assert_eq!(version, workbook_storage::SCHEMA_VERSION);
     storage.close().unwrap();
+}
+
+// ---- real v5 schema migration -------------------------------------------
+
+const REAL_V5_SCHEMA: &str = include_str!("fixtures/schema_v5.sql");
+
+fn create_real_v5_database(path: &std::path::Path) -> (String, Vec<u8>) {
+    use rusqlite::params;
+    let workbook = workbook_domain::parse_workbook(SAMPLE_WORKBOOK_V2_JSON).unwrap();
+    let assets = workbook.embedded_assets().unwrap();
+    let question = &workbook.notes[0].questions[0];
+    let note = &workbook.notes[0];
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection.execute_batch(REAL_V5_SCHEMA).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA application_id=1463962418;
+             PRAGMA user_version=5;
+             INSERT INTO meta(key,value) VALUES('app','workbook-2');",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workbooks(local_id,source_id,source_revision,title,content_json,
+                    imported_at,last_used_at)
+             VALUES('v5-book',?1,1,?2,?3,'2026-01-01T00:00:00.000Z',NULL)",
+            params![workbook.id, workbook.title, workbook.to_json()],
+        )
+        .unwrap();
+    for note in &workbook.notes {
+        connection
+            .execute(
+                "INSERT INTO notes(workbook_id,note_id,introduced,introduced_at)
+                 VALUES('v5-book',?1,1,'2026-01-01T00:00:00.000Z')",
+                [&note.id],
+            )
+            .unwrap();
+        for question in &note.questions {
+            connection
+                .execute(
+                    "INSERT INTO questions(workbook_id,question_id,note_id,buried_until)
+                     VALUES('v5-book',?1,?2,NULL)",
+                    params![question.id, note.id],
+                )
+                .unwrap();
+        }
+    }
+    for asset in &assets {
+        connection
+            .execute(
+                "INSERT INTO assets(workbook_id,asset_id,media_type,alt,width,height,bytes)
+                 VALUES('v5-book',?1,?2,?3,?4,?5,?6)",
+                params![
+                    asset.id,
+                    asset.media_type,
+                    asset.alt,
+                    asset.width,
+                    asset.height,
+                    asset.bytes
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO review_states(workbook_id,question_id,state,stability,stability_fast,
+                    difficulty,due_at,last_review_at,reps,lapses,scheduled_days,learning_step,
+                    algorithm,policy_version,revision)
+             VALUES('v5-book',?1,2,5.5,5.5,4.5,'2026-02-01T00:00:00.000Z',
+                    '2026-01-01T00:00:00.000Z',3,1,30.0,0,'FSRS-7','workbook2-step-v1',4)",
+            [&question.id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO exams(id,title,description,target_date,target_score,daily_minutes,
+                    scope_json,created_at,updated_at,archived_at)
+             VALUES('exam-v5','V5試験',NULL,'2026-03-01',80.0,45,
+                    '{\"groups\":[{\"workbookIds\":[\"v5-book\"]}]}',
+                    '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z',NULL)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(id,mode,status,started_at,ended_at,phase,exam_id)
+             VALUES('s-v5','review','ended','2026-01-01T00:00:00.000Z',
+                    '2026-01-01T00:05:00.000Z','overall_result','exam-v5')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO attempts(id,session_id,workbook_id,note_id,question_id,answered_at,
+                    correct,unknown,hint,elapsed_ms,rating,rating_source,answer_json,
+                    before_state_json,after_state_json,state_revision,short_term,assist_json,
+                    created_at)
+             VALUES('a-v5','s-v5','v5-book',?1,?2,'2026-01-01T00:01:00.000Z',1,0,0,12000,3,
+                    'automatic','{\"value\":true}',NULL,NULL,3,0,NULL,
+                    '2026-01-01T00:01:00.000Z')",
+            params![note.id, question.id],
+        )
+        .unwrap();
+    (question.id.clone(), assets[0].bytes.clone())
+}
+
+fn v5_migration_backups(directory: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(directory.join("backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("pre-migration-v5-") && name.ends_with(".sqlite"))
+        .collect()
+}
+
+#[test]
+fn a_real_v5_database_migrates_with_all_learning_data_and_assets_intact() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    let (question_id, asset_bytes) = create_real_v5_database(&path);
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+    }
+    let storage = Storage::open(dir.path()).unwrap();
+    assert_eq!(storage.workbooks().unwrap().len(), 1);
+    assert_eq!(storage.workbooks().unwrap()[0].local_id, "v5-book");
+    let card = storage
+        .review_state("v5-book", &question_id)
+        .unwrap()
+        .expect("FSRS state is preserved");
+    assert!((card.stability - 5.5).abs() < 1e-4);
+    assert_eq!(card.reps, 3);
+    assert_eq!(card.lapses, 1);
+    let attempts = storage.attempts_for_session("s-v5").unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].question_id, question_id);
+    assert_eq!(attempts[0].question_revision, 1);
+    assert_eq!(
+        attempts[0].rating_source,
+        workbook_domain::RatingSource::Automatic
+    );
+    let exams = storage.exams(true).unwrap();
+    assert_eq!(exams.len(), 1);
+    assert_eq!(exams[0].daily_minutes, 45);
+    let session = storage.session_bundle("s-v5").unwrap().session;
+    assert_eq!(session.exam_id.as_deref(), Some("exam-v5"));
+    let assets = storage.assets_for_workbook("v5-book").unwrap();
+    assert!(!assets.is_empty());
+    assert_eq!(assets[0].bytes, asset_bytes);
+    assert_eq!(storage.integrity().unwrap(), "ok");
+    let questions: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM questions WHERE workbook_id='v5-book' AND revision=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        questions,
+        storage.workbook("v5-book").unwrap().question_count() as i64
+    );
+    let fk: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk, 0);
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
+    let backups = v5_migration_backups(dir.path());
+    assert_eq!(backups.len(), 1, "backups after first open: {backups:?}");
+    let backup = dir.path().join("backups").join(&backups[0]);
+    Storage::validate_backup(&backup).unwrap();
+    drop(storage);
+
+    // Reopening an already migrated file is a no-op and creates no second
+    // migration backup.
+    let storage = Storage::open(dir.path()).unwrap();
+    let backups = v5_migration_backups(dir.path());
+    assert_eq!(backups.len(), 1, "backups after reopen: {backups:?}");
+    assert!(
+        storage
+            .review_state("v5-book", &question_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn a_v5_file_with_an_incompatible_column_is_rejected_without_partial_migration() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workbook.sqlite");
+    let (question_id, _) = create_real_v5_database(&path);
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        // Simulate a partially upgraded file: a v8 column exists while the
+        // version still says 5. The v8 step must fail, and the whole
+        // transaction must roll back the v6/v7 steps that ran before it.
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions ADD COLUMN goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL;",
+            )
+            .unwrap();
+    }
+    let error = match Storage::open(dir.path()) {
+        Ok(_) => panic!("a partially migrated database must not open"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("SQLite") || error.to_string().contains("goal_id"));
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 5);
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+               AND name IN ('topics','question_topics','goals')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0);
+    let time_budget: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='time_budget_seconds'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(time_budget, 0);
+    let card: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM review_states WHERE question_id=?1",
+            [&question_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(card, 1);
+}
+
+#[test]
+fn a_non_database_file_is_rejected() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("workbook.sqlite"), b"not a sqlite database").unwrap();
+    assert!(Storage::open(dir.path()).is_err());
+}
+
+#[test]
+fn a_real_v5_backup_can_be_restored_and_is_migrated() {
+    let source = tempdir().unwrap();
+    let old = source.path().join("old.sqlite");
+    let (question_id, _) = create_real_v5_database(&old);
+    let target = tempdir().unwrap();
+    let mut storage = Storage::open(target.path()).unwrap();
+    storage.restore_from(&old).unwrap();
+    let card = storage
+        .review_state("v5-book", &question_id)
+        .unwrap()
+        .expect("restored FSRS state");
+    assert_eq!(card.reps, 3);
+    assert_eq!(storage.attempts_for_session("s-v5").unwrap().len(), 1);
+    assert_eq!(storage.exams(true).unwrap().len(), 1);
+    assert_eq!(storage.integrity().unwrap(), "ok");
+    drop(storage);
+    let version: i64 = rusqlite::Connection::open(target.path().join("workbook.sqlite"))
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, workbook_storage::SCHEMA_VERSION);
 }
