@@ -80,10 +80,15 @@ fn normalized_estimate(value: f64, kind: &str) -> f64 {
 /// cannot accidentally put Learn Ahead before due reviews.
 pub fn select_within_budget(questions: &[BudgetQuestion], budget_seconds: u32) -> BudgetSelection {
     if budget_seconds == 0 {
+        let distinct = questions
+            .iter()
+            .map(|question| (&question.workbook_id, &question.question_id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         return BudgetSelection {
             selected: Vec::new(),
             estimated_seconds: 0,
-            deferred: questions.len(),
+            deferred: distinct,
             overshoot: false,
         };
     }
@@ -111,26 +116,30 @@ pub fn select_within_budget(questions: &[BudgetQuestion], budget_seconds: u32) -
 
     let mut selected = Vec::new();
     let mut used = 0.0f64;
-    let mut overshoot = false;
+    // Walk the full priority order. A question that does not fit is skipped,
+    // not treated as the end of the list: a shorter lower-priority question
+    // may still use the remaining time. Selected questions always stay in
+    // priority order.
     for question in ordered.iter() {
-        let fits = used + question.estimated_seconds <= budget;
-        if selected.is_empty() {
-            // Always make a 3-minute session usable even if the only
-            // candidate is a long matching question. The UI shows the target
-            // and never force-finishes mid-answer.
-            overshoot = !fits;
+        if used + question.estimated_seconds <= budget {
             used += question.estimated_seconds;
             selected.push(question.clone());
-            continue;
         }
-        if !fits {
-            break;
-        }
-        used += question.estimated_seconds;
-        selected.push(question.clone());
+    }
+    let mut overshoot = false;
+    if selected.is_empty()
+        && let Some(first) = ordered.first()
+    {
+        // Always make a 3-minute session usable even if every candidate is
+        // longer than the budget. The UI shows the target and never
+        // force-finishes mid-answer. Higher-priority candidates were all
+        // considered first; none fitted.
+        overshoot = true;
+        used = first.estimated_seconds;
+        selected.push(first.clone());
     }
     BudgetSelection {
-        deferred: questions.len().saturating_sub(selected.len()),
+        deferred: ordered.len().saturating_sub(selected.len()),
         estimated_seconds: used.round() as u32,
         selected,
         overshoot,
@@ -294,6 +303,108 @@ mod tests {
         question.kind = "short_text".to_string();
         let selection = select_within_budget(&[question], 600);
         assert_eq!(selection.estimated_seconds, 45);
+    }
+
+    #[test]
+    fn a_long_candidate_does_not_end_the_search() {
+        let questions = vec![
+            question("eighty", BudgetCategory::DueReview, Some(now()), 80.0, 0),
+            question(
+                "one-twenty",
+                BudgetCategory::DueReview,
+                Some(now()),
+                120.0,
+                1,
+            ),
+            question("twenty", BudgetCategory::DueReview, Some(now()), 20.0, 2),
+        ];
+        let selection = select_within_budget(&questions, 180);
+        assert_eq!(ids(&selection), ["eighty", "twenty"]);
+        assert_eq!(selection.estimated_seconds, 100);
+        assert_eq!(selection.deferred, 1);
+        assert!(!selection.overshoot);
+    }
+
+    #[test]
+    fn a_long_higher_priority_card_does_not_block_a_shorter_lower_priority_one() {
+        let questions = vec![
+            question(
+                "long-review",
+                BudgetCategory::DueReview,
+                Some(now()),
+                240.0,
+                0,
+            ),
+            question("short-new", BudgetCategory::New, None, 20.0, 1),
+        ];
+        let selection = select_within_budget(&questions, 180);
+        assert_eq!(ids(&selection), ["short-new"]);
+        assert!(!selection.overshoot);
+        assert_eq!(selection.deferred, 1);
+    }
+
+    #[test]
+    fn the_short_term_priority_is_still_first_when_it_fits() {
+        let questions = vec![
+            question("new", BudgetCategory::New, None, 20.0, 0),
+            question("ahead", BudgetCategory::LearnAhead, Some(now()), 20.0, 1),
+            question(
+                "short",
+                BudgetCategory::ShortTermDue,
+                Some(now() + Duration::minutes(5)),
+                160.0,
+                2,
+            ),
+        ];
+        let selection = select_within_budget(&questions, 190);
+        assert_eq!(ids(&selection), ["short", "new"]);
+    }
+
+    #[test]
+    fn overshoot_happens_only_when_no_candidate_fits() {
+        let questions = vec![
+            question("a", BudgetCategory::DueReview, Some(now()), 200.0, 0),
+            question("b", BudgetCategory::New, None, 20.0, 1),
+        ];
+        let selection = select_within_budget(&questions, 180);
+        assert_eq!(ids(&selection), ["b"]);
+        assert!(!selection.overshoot);
+
+        let only_long = vec![question(
+            "long",
+            BudgetCategory::DueReview,
+            Some(now()),
+            200.0,
+            0,
+        )];
+        let selection = select_within_budget(&only_long, 180);
+        assert_eq!(ids(&selection), ["long"]);
+        assert!(selection.overshoot);
+    }
+
+    #[test]
+    fn the_boundary_is_inclusive_and_deterministic() {
+        let questions = vec![
+            question("a", BudgetCategory::DueReview, Some(now()), 60.0, 0),
+            question("b", BudgetCategory::DueReview, Some(now()), 120.0, 1),
+            question("c", BudgetCategory::DueReview, Some(now()), 30.0, 2),
+        ];
+        let first = select_within_budget(&questions, 180);
+        let second = select_within_budget(&questions, 180);
+        assert_eq!(first, second);
+        assert_eq!(ids(&first), ["a", "b"]);
+        assert_eq!(first.estimated_seconds, 180);
+        let just_under = select_within_budget(&questions, 179);
+        assert_eq!(ids(&just_under), ["a", "c"]);
+        assert_eq!(just_under.estimated_seconds, 90);
+    }
+
+    #[test]
+    fn duplicate_candidates_are_removed_before_counting_deferred() {
+        let question = question("q", BudgetCategory::DueReview, Some(now()), 20.0, 0);
+        let selection = select_within_budget(&[question.clone(), question.clone(), question], 20);
+        assert_eq!(selection.selected.len(), 1);
+        assert_eq!(selection.deferred, 0);
     }
 
     #[test]
